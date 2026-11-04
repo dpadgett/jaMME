@@ -818,7 +818,7 @@
     }
 
     // Configure player.js to prewarm in background muted without auto-playing 1.51ef9.dm_26
-    const ASSET_VERSION = '20261104b';
+    const ASSET_VERSION = '20261104c';
     window.JKDemoConfig = Object.assign(
       {
         preload: true,
@@ -827,6 +827,7 @@
         muted: true,
         scriptUrl: `/jkplayer/openjk.js?v=${ASSET_VERSION}`,
         wasmUrl: `/jkplayer/openjk.wasm?v=${ASSET_VERSION}`,
+        autoexecUrl: '/jkplayer/autoexec.cfg',
       },
       window.JKDemoConfig || {}
     );

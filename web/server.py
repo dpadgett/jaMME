@@ -305,6 +305,8 @@ class OpenJKRequestHandler(BaseHTTPRequestHandler):
             "/player.js": ("player.js", "application/javascript; charset=utf-8"),
             "/openjk.js": ("openjk.js", "application/javascript; charset=utf-8"),
             "/openjk.wasm": ("openjk.wasm", "application/wasm"),
+            "/autoexec.cfg": ("autoexec.cfg", "text/plain; charset=utf-8"),
+            "/jkplayer/autoexec.cfg": ("autoexec.cfg", "text/plain; charset=utf-8"),
         }
         if path in static_map:
             fname, content_type = static_map[path]

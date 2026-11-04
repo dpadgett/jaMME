@@ -1706,6 +1706,84 @@
     return true;
   }
 
+  const DEFAULT_AUTOEXEC_CFG = [
+    '// Fallback autoexec.cfg',
+    'set cg_draw2D "1"',
+    'set cg_simpleItems "1"',
+    'set cg_fov "80"',
+    'set cg_fovAspectAdjust "1"',
+    'set cg_shadows "1"',
+    'set r_dynamiclight "1"',
+    'set r_drawfog "0"',
+    'set r_noportals "1"',
+    'set r_picmip "0"',
+    'set r_lodbias "0"',
+    'set r_subdivisions "4"',
+    'set r_detailtextures "1"',
+    'set r_textureMode "GL_LINEAR_MIPMAP_NEAREST"',
+    '',
+  ].join('\n');
+
+  function writeConfigToFS(fileName, content) {
+    const mod = window.Module;
+    if (!mod || !mod.FS) return false;
+    const FS = mod.FS;
+    const dirs = ['/base', 'base'];
+    for (const d of dirs) {
+      try {
+        FS.mkdir(d);
+      } catch (_) {}
+    }
+    const bytes =
+      content instanceof Uint8Array
+        ? content
+        : new TextEncoder().encode(String(content || ''));
+    const paths = ['/base/' + fileName, 'base/' + fileName, '/' + fileName, fileName];
+    for (const p of paths) {
+      try {
+        FS.writeFile(p, bytes);
+      } catch (_) {}
+    }
+    return true;
+  }
+
+  async function fetchAutoexecConfig(wasmDir) {
+    const cfg = window.JKDemoConfig || {};
+    const candidates = [];
+    if (typeof cfg.autoexecUrl === 'string' && cfg.autoexecUrl) {
+      candidates.push(cfg.autoexecUrl);
+    }
+    if (wasmDir) {
+      const dirCandidate = wasmDir + 'autoexec.cfg';
+      if (!candidates.includes(dirCandidate)) candidates.push(dirCandidate);
+    }
+    if (!candidates.includes('/jkplayer/autoexec.cfg')) {
+      candidates.push('/jkplayer/autoexec.cfg');
+    }
+    if (!candidates.includes('/autoexec.cfg')) {
+      candidates.push('/autoexec.cfg');
+    }
+    for (const url of candidates) {
+      try {
+        const resp = await fetch(url, { cache: 'no-cache' });
+        if (resp && resp.ok) {
+          const text = await resp.text();
+          if (text && !/^\s*<!doctype html/i.test(text) && !/^\s*<html/i.test(text)) {
+            return text;
+          }
+        }
+      } catch (_) {}
+    }
+    return DEFAULT_AUTOEXEC_CFG;
+  }
+
+  async function reloadAutoexec() {
+    const text = await fetchAutoexecConfig();
+    writeConfigToFS('autoexec.cfg', text);
+    execCommand('exec autoexec.cfg');
+    return text;
+  }
+
   // =========================================================================
   // IndexedDB + localStorage + In-Memory Asset & Demo Cache
   // =========================================================================
@@ -2668,7 +2746,10 @@
         state.metrics.firstActiveFrameMs = 0;
         state.metrics.demoLoadDurationMs = 0;
 
-        const demoData = await fetchAndValidateDemoBytes(nameOrUrl);
+        const [demoData, latestAutoexec] = await Promise.all([
+          fetchAndValidateDemoBytes(nameOrUrl),
+          fetchAutoexecConfig(),
+        ]);
         if (!demoData) {
           return false;
         }
@@ -2697,6 +2778,10 @@
           await new Promise((r) => setTimeout(r, 25));
         }
 
+        if (latestAutoexec) {
+          writeConfigToFS('autoexec.cfg', latestAutoexec);
+          execCommand('execq autoexec.cfg');
+        }
         writeDemoToFS(demoData.fileName, demoData.bytes);
         decPending();
         const prevStatus = getStatus();
@@ -3039,6 +3124,7 @@
     execCommand,
     sendCommand: execCommand,
     exec: execCommand,
+    reloadAutoexec,
     loadDemo,
     playDemo,
     restartDemo,
@@ -3241,9 +3327,18 @@
 
     const canvas = document.getElementById('jk-canvas');
     const initialDims = resize();
-    const [bootDemoData] = await Promise.all([
+    const DEFAULT_ASSET_VERSION = '20261104c';
+    const cfg = window.JKDemoConfig || {};
+    const rawScriptUrl = typeof cfg.scriptUrl === 'string' && cfg.scriptUrl ? cfg.scriptUrl : `/openjk.js?v=${DEFAULT_ASSET_VERSION}`;
+    const scriptUrl = rawScriptUrl.includes('?') ? rawScriptUrl : `${rawScriptUrl}?v=${DEFAULT_ASSET_VERSION}`;
+    const scriptPathOnly = scriptUrl.split('?')[0];
+    const scriptQuery = scriptUrl.includes('?') ? scriptUrl.slice(scriptUrl.indexOf('?')) : `?v=${DEFAULT_ASSET_VERSION}`;
+    const wasmDir = scriptPathOnly.includes('/') ? scriptPathOnly.slice(0, scriptPathOnly.lastIndexOf('/') + 1) : '/';
+
+    const [bootDemoData, , autoexecText] = await Promise.all([
       state.preloadOnly ? Promise.resolve(null) : fetchAndValidateDemoBytes(state.lastDemoSource || state.demoName),
       hydrateCacheFromIndexedDB(),
+      fetchAutoexecConfig(wasmDir),
     ]);
     const bootShortName = bootDemoData ? bootDemoData.shortName : stripDemoExt(state.demoName);
 
@@ -3281,20 +3376,8 @@
       '+set', 'r_mode', '-1',
       '+set', 'r_customwidth', String(initialDims.width || 640),
       '+set', 'r_customheight', String(initialDims.height || 360),
-      '+set', 'cg_fovAspectAdjust', '1',
       '+set', 'r_ext_multitexture', willUseSoftwareWebGL ? '0' : '1',
-      '+set', 'r_picmip', willUseSoftwareWebGL ? '2' : '0',
       '+set', 'r_vertexLight', willUseSoftwareWebGL ? '1' : '0',
-      '+set', 'r_lodbias', willUseSoftwareWebGL ? '2' : '0',
-      '+set', 'r_subdivisions', willUseSoftwareWebGL ? '20' : '4',
-      '+set', 'r_detailtextures', willUseSoftwareWebGL ? '0' : '1',
-      '+set', 'r_textureMode', 'GL_LINEAR_MIPMAP_NEAREST',
-      '+set', 'cg_draw2D', '1',
-      '+set', 'cg_simpleItems', '1',
-      '+set', 'cg_shadows', willUseSoftwareWebGL ? '0' : '1',
-      '+set', 'r_dynamiclight', willUseSoftwareWebGL ? '0' : '1',
-      '+set', 'r_drawfog', '0',
-      '+set', 'r_noportals', '1',
       '+set', 'in_InteractiveMode', '0',
       '+set', 'in_nograb', '1',
       '+set', 'timescale', String(state.speed),
@@ -3302,19 +3385,22 @@
       '+set', 's_volume', String(state.muted ? 0.0 : state.volume),
     ];
 
+    if (willUseSoftwareWebGL) {
+      engineArgs.push(
+        '+set', 'r_picmip', '2',
+        '+set', 'r_lodbias', '2',
+        '+set', 'r_subdivisions', '20',
+        '+set', 'r_detailtextures', '0',
+        '+set', 'cg_shadows', '0',
+        '+set', 'r_dynamiclight', '0'
+      );
+    }
+
     if (!state.preloadOnly) {
       const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
       state.metrics.demoLoadStartMs = Math.round(nowMs * 100) / 100;
       engineArgs.push('+demo', bootShortName);
     }
-
-    const DEFAULT_ASSET_VERSION = '20261104b';
-    const cfg = window.JKDemoConfig || {};
-    const rawScriptUrl = typeof cfg.scriptUrl === 'string' && cfg.scriptUrl ? cfg.scriptUrl : `/openjk.js?v=${DEFAULT_ASSET_VERSION}`;
-    const scriptUrl = rawScriptUrl.includes('?') ? rawScriptUrl : `${rawScriptUrl}?v=${DEFAULT_ASSET_VERSION}`;
-    const scriptPathOnly = scriptUrl.split('?')[0];
-    const scriptQuery = scriptUrl.includes('?') ? scriptUrl.slice(scriptUrl.indexOf('?')) : `?v=${DEFAULT_ASSET_VERSION}`;
-    const wasmDir = scriptPathOnly.includes('/') ? scriptPathOnly.slice(0, scriptPathOnly.lastIndexOf('/') + 1) : '/';
 
     window.Module = {
       canvas: canvas,
@@ -3328,6 +3414,7 @@
       },
       preRun: [
         function () {
+          writeConfigToFS('autoexec.cfg', autoexecText);
           if (bootDemoData) {
             writeDemoToFS(bootDemoData.fileName, bootDemoData.bytes);
           }
