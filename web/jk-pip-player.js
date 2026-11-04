@@ -818,7 +818,7 @@
     }
 
     // Configure player.js to prewarm in background muted without auto-playing 1.51ef9.dm_26
-    const ASSET_VERSION = '20261104a';
+    const ASSET_VERSION = '20261104b';
     window.JKDemoConfig = Object.assign(
       {
         preload: true,

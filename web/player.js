@@ -2472,17 +2472,36 @@
       }
     }
 
-    // Always ensure _humanoid.gla (assets1.pk3 chunks 195..225) is in the prefetch target set
+    // Always ensure _humanoid.gla, kyle, and common MP weapons/effects/sounds are in the prefetch target set
     const byArchive = new Map();
     const addTarget = (pk3Name, cIdx) => {
       if (pk3ChunkCache.has(pk3Name + ':' + cIdx)) return;
       if (!byArchive.has(pk3Name)) byArchive.set(pk3Name, new Set());
       byArchive.get(pk3Name).add(cIdx);
     };
+    const addTargetRanges = (pk3Name, ranges) => {
+      for (const r of ranges) {
+        if (Array.isArray(r)) {
+          for (let c = r[0]; c <= r[1]; c++) addTarget(pk3Name, c);
+        } else {
+          addTarget(pk3Name, r);
+        }
+      }
+    };
 
-    for (let c = 195; c <= 225; c++) {
-      addTarget('assets1.pk3', c);
-    }
+    addTargetRanges('assets0.pk3', [2, [537, 549], 1694]);
+    addTargetRanges('assets1.pk3', [
+      [2, 4], 7, [34, 35], 48, 59, [62, 65], [72, 73], [75, 77], 80, [83, 84],
+      [147, 148], [152, 154], 175, [195, 225], [254, 256], 258, 313, 371,
+      [479, 481], [493, 494], [522, 523], [530, 531], 533, 535, [537, 538],
+      [541, 542], [613, 614], [618, 619], [623, 624], 634, 706, [712, 713],
+      785, [787, 789], 802, [814, 815], 1008, 1026, [1048, 1050], 1059,
+      [1076, 1077], [1179, 1183], 1185, [1187, 1189], [1192, 1199], [1201, 1209],
+      [1342, 1343], [1345, 1354], 1356, [1359, 1360], 1366, 1371, [1374, 1376],
+      1378, [1592, 1593], [1625, 1629], [1824, 1825], [1845, 1846], [2085, 2088],
+      [2318, 2351], [2459, 2480], [2485, 2487],
+    ]);
+    addTargetRanges('assets2.pk3', [4]);
     for (const key of hotChunkSet) {
       const sep = key.lastIndexOf(':');
       if (sep <= 0) continue;
@@ -2548,6 +2567,9 @@
         state.ready = true;
         const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
         state.metrics.prewarmCompleteMs = Math.round(nowMs * 100) / 100;
+        prefetchCommonChunksAsync().then(() => {
+          flushIdbWriteQueue();
+        }).catch(() => {});
         flushIdbWriteQueue();
         try {
           window.dispatchEvent(
@@ -3286,7 +3308,7 @@
       engineArgs.push('+demo', bootShortName);
     }
 
-    const DEFAULT_ASSET_VERSION = '20261104a';
+    const DEFAULT_ASSET_VERSION = '20261104b';
     const cfg = window.JKDemoConfig || {};
     const rawScriptUrl = typeof cfg.scriptUrl === 'string' && cfg.scriptUrl ? cfg.scriptUrl : `/openjk.js?v=${DEFAULT_ASSET_VERSION}`;
     const scriptUrl = rawScriptUrl.includes('?') ? rawScriptUrl : `${rawScriptUrl}?v=${DEFAULT_ASSET_VERSION}`;

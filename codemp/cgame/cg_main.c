@@ -1929,17 +1929,17 @@ Ghoul2 Insert End
 
 	for ( i = 1 ; i < bg_numItems ; i++ ) {
 		if ( items[ i ] == '1' || com_buildScript.integer ) {
-#ifdef __EMSCRIPTEN__
-			if ( bg_itemlist[i].giType == IT_TEAM ) {
-				CG_LoadingItem( i );
-				CG_RegisterItemVisuals( i );
-			}
-#else
 			CG_LoadingItem( i );
 			CG_RegisterItemVisuals( i );
-#endif
 		}
 	}
+#ifdef __EMSCRIPTEN__
+	for ( i = WP_STUN_BATON ; i <= WP_CONCUSSION ; i++ ) {
+		if ( !(cgs.wDisable & (1 << i)) ) {
+			CG_RegisterWeapon( i );
+		}
+	}
+#endif
 
 	cg.loadLCARSStage = 6;
 

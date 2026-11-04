@@ -27,6 +27,10 @@ CG_RegisterItemVisuals
 The server says this item is used on this level
 =================
 */
+#ifdef __EMSCRIPTEN__
+static void CG_EnsureG2WeaponInstance(int weapon);
+#endif
+
 void CG_RegisterItemVisuals( int itemNum ) {
 	itemInfo_t		*itemInfo;
 	gitem_t			*item;
@@ -60,6 +64,13 @@ void CG_RegisterItemVisuals( int itemNum ) {
 	else
 	{
 		itemInfo->icon = 0;
+	}
+
+	if ( item->giType == IT_WEAPON ) {
+		CG_RegisterWeapon( item->giTag );
+#ifdef __EMSCRIPTEN__
+		CG_EnsureG2WeaponInstance( item->giTag );
+#endif
 	}
 
 #ifdef __EMSCRIPTEN__
@@ -101,12 +112,6 @@ Ghoul2 Insert Start
 /*
 Ghoul2 Insert End
 */
-
-#ifndef __EMSCRIPTEN__
-	if ( item->giType == IT_WEAPON ) {
-		CG_RegisterWeapon( item->giTag );
-	}
-#endif
 
 	//
 	// powerups have an accompanying ring or sphere
