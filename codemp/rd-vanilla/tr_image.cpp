@@ -2046,16 +2046,23 @@ TGADone:
 	}
 }
 
+#include <setjmp.h>
+
+typedef struct r_jpg_error_mgr_s {
+	struct jpeg_error_mgr pub;
+	jmp_buf setjmp_buffer;
+} r_jpg_error_mgr_t;
+
 static void R_JPGErrorExit(j_common_ptr cinfo)
 {
 	char buffer[JMSG_LENGTH_MAX];
+	r_jpg_error_mgr_t *myerr = (r_jpg_error_mgr_t *)cinfo->err;
 
 	(*cinfo->err->format_message) (cinfo, buffer);
 
-	/* Let the memory manager delete any temp files before we die */
-	jpeg_destroy(cinfo);
+	Com_Printf("%s\n", buffer);
 
-	Com_Printf("%s", buffer);
+	longjmp(myerr->setjmp_buffer, 1);
 }
 
 static void R_JPGOutputMessage(j_common_ptr cinfo)
@@ -2086,13 +2093,13 @@ static void LoadJPG( const char *filename, unsigned char **pic, int *width, int 
 	* Note that this struct must live as long as the main JPEG parameter
 	* struct, to avoid dangling-pointer problems.
 	*/
-	struct jpeg_error_mgr jerr;
+	r_jpg_error_mgr_t jerr;
 	/* More stuff */
 	JSAMPARRAY buffer;		/* Output row buffer */
 	unsigned int row_stride;  /* physical row width in output buffer */
 	unsigned int pixelcount, memcount;
 	unsigned int sindex, dindex;
-	byte *out;
+	byte *out = NULL;
 	union {
 		byte *b;
 		void *v;
@@ -2116,9 +2123,18 @@ static void LoadJPG( const char *filename, unsigned char **pic, int *width, int 
 	* This routine fills in the contents of struct jerr, and returns jerr's
 	* address which we place into the link field in cinfo.
 	*/
-	cinfo.err = jpeg_std_error(&jerr);
-	cinfo.err->error_exit = R_JPGErrorExit;
-	cinfo.err->output_message = R_JPGOutputMessage;
+	cinfo.err = jpeg_std_error(&jerr.pub);
+	jerr.pub.error_exit = R_JPGErrorExit;
+	jerr.pub.output_message = R_JPGOutputMessage;
+
+	if (setjmp(jerr.setjmp_buffer)) {
+		jpeg_destroy_decompress(&cinfo);
+		if (out) {
+			Z_Free(out);
+		}
+		ri.FS_FreeFile(fbuffer.v);
+		return;
+	}
 
 	/* Now we can initialize the JPEG decompression object. */
 	jpeg_create_decompress(&cinfo);

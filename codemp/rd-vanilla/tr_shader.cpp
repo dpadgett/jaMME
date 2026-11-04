@@ -3665,6 +3665,102 @@ char *R_FindShaderText( const char *shadername ) {
 	return FindShaderInShaderText( shadername );
 }
 
+#ifdef __EMSCRIPTEN__
+extern "C" void R_WasmCollectShaderFiles( const char *shaderName, const char *extraShaderText, void (*addFileCb)(const char *qpath) ) {
+	if ( !shaderName || !shaderName[0] || !addFileCb ) {
+		return;
+	}
+	char strippedName[MAX_QPATH];
+	COM_StripExtension( shaderName, strippedName, sizeof( strippedName ) );
+	if ( !strippedName[0] ) {
+		return;
+	}
+	addFileCb( strippedName );
+
+	const char *p = NULL;
+	if ( extraShaderText && extraShaderText[0] ) {
+		const char *scan = extraShaderText;
+		while ( 1 ) {
+			char *tok = COM_ParseExt( &scan, qtrue );
+			if ( !tok[0] ) {
+				break;
+			}
+			if ( !Q_stricmp( tok, strippedName ) ) {
+				p = scan;
+				break;
+			}
+			SkipBracedSection( &scan );
+		}
+	}
+	if ( !p ) {
+		p = R_FindShaderText( strippedName );
+	}
+	if ( !p ) {
+		return;
+	}
+
+	char *token = COM_ParseExt( &p, qtrue );
+	if ( token[0] != '{' ) {
+		return;
+	}
+	int depth = 1;
+	while ( depth > 0 ) {
+		token = COM_ParseExt( &p, qtrue );
+		if ( !token[0] ) {
+			break;
+		}
+		if ( token[0] == '{' && token[1] == '\0' ) {
+			depth++;
+			continue;
+		}
+		if ( token[0] == '}' && token[1] == '\0' ) {
+			depth--;
+			continue;
+		}
+		if ( !Q_stricmpn( token, "qer", 3 ) || !Q_stricmpn( token, "q3map", 5 ) ) {
+			SkipRestOfLine( &p );
+			continue;
+		}
+		if ( !Q_stricmp( token, "map" ) || !Q_stricmp( token, "clampmap" ) || !Q_stricmp( token, "specularmap" ) ) {
+			token = COM_ParseExt( &p, qfalse );
+			if ( token[0] && token[0] != '$' && token[0] != '*' ) {
+				char imgName[MAX_QPATH];
+				COM_StripExtension( token, imgName, sizeof( imgName ) );
+				if ( imgName[0] ) {
+					addFileCb( imgName );
+				}
+			}
+		} else if ( !Q_stricmp( token, "animMap" ) || !Q_stricmp( token, "clampanimMap" ) || !Q_stricmp( token, "oneshotanimMap" ) ) {
+			token = COM_ParseExt( &p, qfalse ); // frequency
+			while ( 1 ) {
+				token = COM_ParseExt( &p, qfalse );
+				if ( !token[0] ) {
+					break;
+				}
+				if ( token[0] != '$' && token[0] != '*' ) {
+					char imgName[MAX_QPATH];
+					COM_StripExtension( token, imgName, sizeof( imgName ) );
+					if ( imgName[0] ) {
+						addFileCb( imgName );
+					}
+				}
+			}
+		} else if ( !Q_stricmp( token, "skyparms" ) ) {
+			token = COM_ParseExt( &p, qfalse );
+			if ( token[0] && strcmp( token, "-" ) ) {
+				static const char *suf[6] = { "rt", "lf", "bk", "ft", "up", "dn" };
+				for ( int i = 0; i < 6; i++ ) {
+					char skyPath[MAX_QPATH];
+					Com_sprintf( skyPath, sizeof( skyPath ), "%s_%s", token, suf[i] );
+					addFileCb( skyPath );
+				}
+			}
+			SkipRestOfLine( &p );
+		}
+	}
+}
+#endif
+
 /*
 ==================
 R_FindShaderByName

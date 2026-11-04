@@ -220,16 +220,54 @@
       }
       #jk-pip-status-overlay {
         position: absolute;
-        left: 8px;
-        top: 8px;
-        padding: 3px 8px;
-        border-radius: 4px;
-        background: rgba(13, 17, 23, 0.82);
-        border: 1px solid rgba(48, 54, 61, 0.85);
-        color: #58a6ff;
+        left: 12px;
+        right: 12px;
+        top: 12px;
+        max-width: 340px;
+        padding: 8px 10px;
+        border-radius: 6px;
+        background: rgba(13, 17, 23, 0.90);
+        border: 1px solid rgba(56, 139, 253, 0.45);
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+        color: #e6edf3;
         font-size: 11px;
         pointer-events: none;
         display: none;
+        z-index: 5;
+      }
+      .jk-pip-status-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 5px;
+      }
+      #jk-pip-status-text {
+        color: #e6edf3;
+        font-weight: 500;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #jk-pip-status-pct {
+        color: #58a6ff;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        flex-shrink: 0;
+      }
+      .jk-pip-progress-track {
+        width: 100%;
+        height: 4px;
+        background: rgba(48, 54, 61, 0.9);
+        border-radius: 2px;
+        overflow: hidden;
+      }
+      #jk-pip-progress-bar {
+        width: 4%;
+        height: 100%;
+        background: linear-gradient(90deg, #1f6feb, #58a6ff);
+        border-radius: 2px;
+        transition: width 0.12s ease-out;
       }
       #jk-pip-controls {
         display: flex;
@@ -424,7 +462,15 @@
       </div>
       <div id="jk-pip-viewport">
         <canvas id="jk-canvas" width="640" height="360" tabindex="-1"></canvas>
-        <div id="jk-pip-status-overlay">Loading demo...</div>
+        <div id="jk-pip-status-overlay">
+          <div class="jk-pip-status-row">
+            <span id="jk-pip-status-text">Loading demo...</span>
+            <span id="jk-pip-status-pct">0%</span>
+          </div>
+          <div class="jk-pip-progress-track">
+            <div id="jk-pip-progress-bar"></div>
+          </div>
+        </div>
       </div>
       <div id="jk-pip-controls">
         <div class="jk-pip-timeline-row">
@@ -700,6 +746,36 @@
         applyCardGeometry();
       }
     });
+
+    window.addEventListener('jkdemo:progress', (e) => {
+      const detail = e && e.detail ? e.detail : null;
+      if (!detail) return;
+      renderOverlayProgress(detail.message || 'Loading demo...', detail.percent || 0, detail.stage);
+    });
+  }
+
+  function renderOverlayProgress(message, percent, stage) {
+    const overlay = document.getElementById('jk-pip-status-overlay');
+    if (!overlay) return;
+    if (stage === 'ready') {
+      overlay.style.display = 'none';
+      return;
+    }
+    const textEl = document.getElementById('jk-pip-status-text');
+    const pctEl = document.getElementById('jk-pip-status-pct');
+    const barEl = document.getElementById('jk-pip-progress-bar');
+    const clampedPct = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+    if (textEl) {
+      textEl.textContent = message || 'Loading demo...';
+    } else {
+      overlay.textContent = message || 'Loading demo...';
+    }
+    if (pctEl) {
+      pctEl.textContent = clampedPct > 0 ? clampedPct + '%' : '';
+    }
+    if (barEl) {
+      barEl.style.width = Math.max(4, clampedPct) + '%';
+    }
   }
 
   function getPlayer() {
@@ -818,7 +894,7 @@
     }
 
     // Configure player.js to prewarm in background muted without auto-playing 1.51ef9.dm_26
-    const ASSET_VERSION = '20261104c';
+    const ASSET_VERSION = '20261104g';
     window.JKDemoConfig = Object.assign(
       {
         preload: true,
@@ -1067,8 +1143,17 @@
 
     const overlay = document.getElementById('jk-pip-status-overlay');
     if (overlay) {
-      overlay.textContent = 'Loading demo...';
       overlay.style.display = 'block';
+      const existingPlayer = getPlayer();
+      const st =
+        existingPlayer && typeof existingPlayer.getStatus === 'function'
+          ? existingPlayer.getStatus()
+          : null;
+      if (!existingPlayer || !st || !st.engineStarted) {
+        renderOverlayProgress('Loading 3D engine...', 5, 'engine');
+      } else {
+        renderOverlayProgress('Downloading demo...', 4, 'demo');
+      }
     }
 
     try {
@@ -1097,15 +1182,21 @@
         const st = typeof player.getStatus === 'function' ? player.getStatus() : {};
         titleEl.textContent = st.demoName || pipState.currentDemoTitle || 'JKA Demo';
       }
+      if (overlay) {
+        if (ok) {
+          overlay.style.display = 'none';
+        } else {
+          renderOverlayProgress('Load interrupted — tap Play to retry', 0, 'error');
+        }
+      }
       updateControlState();
       return Boolean(ok);
     } catch (err) {
       console.error('[JKPiPPlayer] Failed to load demo:', err);
-      return false;
-    } finally {
       if (overlay) {
-        overlay.style.display = 'none';
+        renderOverlayProgress('Load error — tap Play to retry', 0, 'error');
       }
+      return false;
     }
   }
 

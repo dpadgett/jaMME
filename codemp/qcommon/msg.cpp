@@ -44,12 +44,13 @@ void MSG_initHuffman();
 void MSG_Init( msg_t *buf, byte *data, int length ) {
 	if (!g_nOverrideChecked)
 	{
+#if !defined(__EMSCRIPTEN__) && !defined(DM26TOMME_BUILD)
 		//Check for netf overrides
 		MSG_CheckNETFPSFOverrides(qfalse);
 		
 		//Then for psf overrides
 		MSG_CheckNETFPSFOverrides(qtrue);
-
+#endif
 		g_nOverrideChecked = true;
 	}
 
@@ -66,12 +67,13 @@ void MSG_Init( msg_t *buf, byte *data, int length ) {
 void MSG_InitOOB( msg_t *buf, byte *data, int length ) {
 	if (!g_nOverrideChecked)
 	{
+#if !defined(__EMSCRIPTEN__) && !defined(DM26TOMME_BUILD)
 		//Check for netf overrides
 		MSG_CheckNETFPSFOverrides(qfalse);
 		
 		//Then for psf overrides
 		MSG_CheckNETFPSFOverrides(qtrue);
-
+#endif
 		g_nOverrideChecked = true;
 	}
 
@@ -117,6 +119,7 @@ bit functions
 */
 
 int	overflows;
+qboolean g_msgRawBitstream = qfalse;
 
 // negative bit values include signs
 void MSG_WriteBits( msg_t *msg, int value, int bits ) {
@@ -177,6 +180,42 @@ void MSG_WriteBits( msg_t *msg, int value, int bits ) {
 		} else {
 			Com_Error(ERR_DROP, "can't write %d bits\n", bits);
 		}
+	} else if (g_msgRawBitstream) {
+		int bit = msg->bit;
+		byte *fout = msg->data;
+		value &= (0xffffffff>>(32-bits));
+		if (bits&7) {
+			int nbits = bits&7;
+			for(i=0;i<nbits;i++) {
+				if ((bit&7) == 0) {
+					fout[bit>>3] = 0;
+				}
+				fout[bit>>3] |= ((value&1) << (bit&7));
+				value = (value>>1);
+				bit++;
+			}
+			bits = bits - nbits;
+		}
+		if (bits) {
+			int shift = bit & 7;
+			int byteIdx = bit >> 3;
+			if (shift == 0) {
+				for(i=0;i<bits;i+=8) {
+					fout[byteIdx++] = (byte)(value & 0xff);
+					value = (value>>8);
+				}
+			} else {
+				for(i=0;i<bits;i+=8) {
+					byte b = (byte)(value & 0xff);
+					fout[byteIdx] |= (byte)(b << shift);
+					fout[++byteIdx] = (byte)(b >> (8 - shift));
+					value = (value>>8);
+				}
+			}
+			bit += bits;
+		}
+		msg->bit = bit;
+		msg->cursize = (bit>>3)+1;
 	} else {
 		value &= (0xffffffff>>(32-bits));
 		if (bits&7) {
@@ -244,6 +283,46 @@ int MSG_ReadBits( msg_t *msg, int bits ) {
 		} else {
 			Com_Error(ERR_DROP, "can't read %d bits\n", bits);
 		}
+	} else if (g_msgRawBitstream) {
+		int bit = msg->bit;
+		int maxBit = msg->cursize << 3;
+		const byte *fin = msg->data;
+		nbits = 0;
+		if (bits&7) {
+			nbits = bits&7;
+			if (bit + nbits > maxBit) {
+				msg->readcount = msg->cursize + 1;
+				return 0;
+			}
+			for(i=0;i<nbits;i++) {
+				value |= (((fin[bit>>3] >> (bit&7)) & 0x1)<<i);
+				bit++;
+			}
+			bits = bits - nbits;
+		}
+		if (bits) {
+			if (bit + bits > maxBit) {
+				msg->bit = maxBit + 1;
+				msg->readcount = msg->cursize + 1;
+				return 0;
+			}
+			int shift = bit & 7;
+			int byteIdx = bit >> 3;
+			if (shift == 0) {
+				for(i=0;i<bits;i+=8) {
+					value |= (int)((unsigned int)fin[byteIdx++] << (i+nbits));
+				}
+			} else {
+				for(i=0;i<bits;i+=8) {
+					unsigned int getByte = (unsigned int)((fin[byteIdx] >> shift) | ((fin[byteIdx + 1] << (8 - shift)) & 0xff));
+					byteIdx++;
+					value |= (int)(getByte << (i+nbits));
+				}
+			}
+			bit += bits;
+		}
+		msg->bit = bit;
+		msg->readcount = (bit>>3)+1;
 	} else {
 		int bit = msg->bit;
 		int maxBit = msg->cursize << 3;
@@ -1125,6 +1204,16 @@ void MSG_WriteDeltaEntity( msg_t *msg, struct entityState_s *from, struct entity
 	// build the change vector as bytes so it is endien independent
 	// TODO: OPTIMIZE: How about we do this in reverse order so we can
 	// just break out at the first changed field we find?
+#if defined(__EMSCRIPTEN__) || defined(DM26TOMME_BUILD)
+	for ( i = numFields - 1, field = &entityStateFields[numFields - 1] ; i >= 0 ; i--, field-- ) {
+		fromF = (int *)( (byte *)from + field->offset );
+		toF = (int *)( (byte *)to + field->offset );
+		if ( *fromF != *toF ) {
+			lc = i + 1;
+			break;
+		}
+	}
+#else
 	for ( i = 0, field = entityStateFields ; i < numFields ; i++, field++ ) {
 		fromF = (int *)( (byte *)from + field->offset );
 		toF = (int *)( (byte *)to + field->offset );
@@ -1135,6 +1224,7 @@ void MSG_WriteDeltaEntity( msg_t *msg, struct entityState_s *from, struct entity
 #endif
 		}
 	}
+#endif
 
 	if ( lc == 0 ) {
 		// nothing at all changed

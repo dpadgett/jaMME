@@ -10,6 +10,21 @@
 demo_t demo;
 static entityState_t	demoNullEntityState;
 static playerState_t	demoNullPlayerState;
+static entityState_t	s_mmeEntityBaselines[MAX_GENTITIES];
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+extern qboolean g_msgRawBitstream;
+static qboolean s_mmeStreamActive = qfalse;
+static int s_mmeStreamFileSize = 0;
+
+EM_JS(int, wasm_js_mme_read, (int pos, void *dst, int len), {
+	if (typeof window !== 'undefined' && typeof window.__jkMmeRead === 'function') {
+		return window.__jkMmeRead(pos, dst, len) | 0;
+	}
+	return 0;
+});
+#endif
 
 static const char *demoHeader = JK_VERSION " Demo";
 
@@ -133,6 +148,9 @@ static void demoFrameUnpack( msg_t *msg, demoFrame_t *oldFrame, demoFrame_t *new
 	newFrame->commandUsed = MSG_ReadLong( msg );
 	MSG_ReadData( msg, newFrame->commandData, newFrame->commandUsed );
 	/* Extract the entity baselines */
+	if ( *firstPack ) {
+		Com_Memset( s_mmeEntityBaselines, 0, sizeof( s_mmeEntityBaselines ) );
+	}
 	while ( *firstPack ) {
 		byte cmd = MSG_ReadByte( msg );
 		if (cmd == svc_EOF)
@@ -144,6 +162,7 @@ static void demoFrameUnpack( msg_t *msg, demoFrame_t *oldFrame, demoFrame_t *new
 			} else {
 				entityState_t *newEntity = &newFrame->entityBaselines[num];
 				MSG_ReadDeltaEntity( msg, &demoNullEntityState, newEntity, num );
+				s_mmeEntityBaselines[num] = *newEntity;
 			}
 		} else {
 			Com_Error( ERR_DROP, "Unknown block %d while unpacking demo frame.\n", cmd );
@@ -158,12 +177,19 @@ static void demoFramePack( msg_t *msg, const demoFrame_t *newFrame, const demoFr
 	MSG_WriteBits( msg, oldFrame ? 0 : 1, 1 );
 	MSG_WriteLong( msg, newFrame->serverTime );
 	/* Add the config strings */
-	for (i = 0;i<MAX_CONFIGSTRINGS;i++) {
-		const char *oldString = !oldFrame ? "" : &oldFrame->string.data[oldFrame->string.offsets[i]];
-		const char *newString = newFrame->string.data + newFrame->string.offsets[i];
-		if (strcmp( oldString, newString)) {
-			MSG_WriteShort( msg, i );
-			MSG_WriteBigString( msg, newString );
+	if ( !oldFrame || oldFrame->string.used != newFrame->string.used
+		|| memcmp( oldFrame->string.offsets, newFrame->string.offsets, sizeof( oldFrame->string.offsets ) )
+		|| memcmp( oldFrame->string.data, newFrame->string.data, newFrame->string.used ) ) {
+		for (i = 0;i<MAX_CONFIGSTRINGS;i++) {
+			if ( (!oldFrame || !oldFrame->string.offsets[i]) && !newFrame->string.offsets[i] ) {
+				continue;
+			}
+			const char *oldString = !oldFrame ? "" : &oldFrame->string.data[oldFrame->string.offsets[i]];
+			const char *newString = newFrame->string.data + newFrame->string.offsets[i];
+			if (strcmp( oldString, newString)) {
+				MSG_WriteShort( msg, i );
+				MSG_WriteBigString( msg, newString );
+			}
 		}
 	}
 	MSG_WriteShort( msg, MAX_CONFIGSTRINGS );
@@ -202,7 +228,13 @@ static void demoFramePack( msg_t *msg, const demoFrame_t *newFrame, const demoFr
 				oldEntity = &demoNullEntityState;
 			}
 		}
-		MSG_WriteDeltaEntity( msg, (entityState_t *)oldEntity, (entityState_t *)newEntity, qtrue );
+		if ( !oldEntity && !newEntity ) {
+			continue;
+		}
+		if ( oldEntity && newEntity && oldEntity != &demoNullEntityState && !memcmp( oldEntity, newEntity, sizeof( entityState_t ) ) ) {
+			continue;
+		}
+		MSG_WriteDeltaEntity( msg, (entityState_t *)oldEntity, (entityState_t *)newEntity, (qboolean)(oldEntity == &demoNullEntityState) );
 	}
 	MSG_WriteBits( msg, (MAX_GENTITIES-1), GENTITYNUM_BITS );
 	/* Add the area mask */
@@ -293,43 +325,251 @@ static void demoFrameInterpolate( demoFrame_t frames[], int frameCount, int inde
 	}
 }
 
-void demoConvert( const char *oldName, const char *newBaseName, qboolean smoothen ) {
-	fileHandle_t	oldHandle = 0;
-	fileHandle_t	newHandle = 0;
-	int				temp;
+typedef struct {
+	qboolean	valid;
+	char		fileName[MAX_OSPATH];
+	int			fileSize;
+	int			totalFrames;
+	int			startTime;
+	int			endTime;
+	int			fileIndexCount;
+	struct {
+		int		pos, time, frame;
+	} fileIndex[DEMO_MAX_INDEX];
+} cachedMmeIndex_t;
+
+static cachedMmeIndex_t s_cachedMmeIndex;
+
+extern "C" qboolean demoIsMmeStreamActive( void ) {
+#ifdef __EMSCRIPTEN__
+	return s_mmeStreamActive;
+#else
+	return qfalse;
+#endif
+}
+
+extern "C" void demoSetMmeStream( qboolean active, const char *fileName, int fileSize, int startTime, int endTime, int totalFrames, int indexCount, const int *indexTriples ) {
+#ifdef __EMSCRIPTEN__
+	s_mmeStreamActive = active;
+	s_mmeStreamFileSize = fileSize;
+	if ( active && fileSize > 0 ) {
+		s_cachedMmeIndex.valid = qtrue;
+		Q_strncpyz( s_cachedMmeIndex.fileName, ( fileName && fileName[0] ) ? fileName : "mmedemos/current.0.mme", sizeof( s_cachedMmeIndex.fileName ) );
+		s_cachedMmeIndex.fileSize = fileSize;
+		s_cachedMmeIndex.startTime = startTime;
+		s_cachedMmeIndex.endTime = endTime;
+		s_cachedMmeIndex.totalFrames = totalFrames;
+		if ( indexCount < 0 ) indexCount = 0;
+		if ( indexCount > DEMO_MAX_INDEX ) indexCount = DEMO_MAX_INDEX;
+		s_cachedMmeIndex.fileIndexCount = indexCount;
+		if ( indexTriples ) {
+			for ( int i = 0; i < indexCount; i++ ) {
+				s_cachedMmeIndex.fileIndex[i].pos = indexTriples[i * 3 + 0];
+				s_cachedMmeIndex.fileIndex[i].time = indexTriples[i * 3 + 1];
+				s_cachedMmeIndex.fileIndex[i].frame = indexTriples[i * 3 + 2];
+			}
+		}
+	} else {
+		s_cachedMmeIndex.valid = qfalse;
+	}
+#else
+	(void)active; (void)fileName; (void)fileSize; (void)startTime; (void)endTime; (void)totalFrames; (void)indexCount; (void)indexTriples;
+#endif
+}
+
+extern "C" qboolean demoReadStreamInitialGamestate( gameState_t *outGs ) {
+#ifdef __EMSCRIPTEN__
+	if ( !s_mmeStreamActive || !outGs ) {
+		return qfalse;
+	}
+	int hdrLen = (int)strlen( demoHeader );
+	if ( wasm_js_mme_read( 0, demo.buffer, hdrLen ) != hdrLen ) {
+		return qfalse;
+	}
+	if ( Q_strncmp( (const char *)demo.buffer, demoHeader, hdrLen ) ) {
+		return qfalse;
+	}
+	int blockSize = 0;
+	if ( wasm_js_mme_read( hdrLen, &blockSize, 4 ) != 4 ) {
+		return qfalse;
+	}
+	blockSize = LittleLong( blockSize );
+	if ( blockSize <= 0 || blockSize > (int)sizeof( demo.buffer ) ) {
+		return qfalse;
+	}
+	if ( wasm_js_mme_read( hdrLen + 4, demo.buffer, blockSize ) != blockSize ) {
+		return qfalse;
+	}
+	Com_Memset( outGs, 0, sizeof( *outGs ) );
+	outGs->dataCount = 1;
+	msg_t msg;
+	MSG_Init( &msg, demo.buffer, sizeof( demo.buffer ) );
+	MSG_BeginReading( &msg );
+	msg.cursize = blockSize;
+	g_msgRawBitstream = qtrue;
+	(void)MSG_ReadBits( &msg, 1 );
+	(void)MSG_ReadLong( &msg );
+	while ( 1 ) {
+		int num = MSG_ReadShort( &msg );
+		if ( num < 0 || num >= MAX_CONFIGSTRINGS ) {
+			break;
+		}
+		char *csStr = MSG_ReadBigString( &msg );
+		if ( csStr && csStr[0] ) {
+			int len = (int)strlen( csStr );
+			if ( outGs->dataCount + len + 1 < MAX_GAMESTATE_CHARS ) {
+				outGs->stringOffsets[num] = outGs->dataCount;
+				Com_Memcpy( outGs->stringData + outGs->dataCount, csStr, (size_t)len + 1 );
+				outGs->dataCount += len + 1;
+			}
+		}
+	}
+	g_msgRawBitstream = qfalse;
+	return qtrue;
+#else
+	(void)outGs;
+	return qfalse;
+#endif
+}
+
+typedef struct {
+	qboolean		active;
+	fileHandle_t	oldHandle;
+	fileHandle_t	newHandle;
 	int				oldSize;
-	int				msgSequence = 0;
-	msg_t			oldMsg;
-	byte			oldData[ MAX_MSGLEN ];
-	int				oldTime, nextTime, fullTime;
+	int				initialSize;
+	int				msgSequence;
+	int				oldTime;
+	int				fullTime;
 	int				clientNum;
-	demoFrame_t		*workFrame;
-	int				parseEntitiesNum = 0;
+	int				parseEntitiesNum;
 	demoConvert_t	*convert;
 	char			bigConfigString[BIG_INFO_STRING];
 	int				bigConfigNumber;
+	int				levelCount;
+	char			newBaseName[MAX_OSPATH];
+	char			newName[MAX_OSPATH];
+	qboolean		smoothen;
+} demoConvertState_t;
+
+static demoConvertState_t s_demoConvertState;
+
+extern qboolean g_msgRawBitstream;
+
+static void demoConvertEmitFrame( fileHandle_t newHandle, const demoFrame_t *newFrame, const demoFrame_t *oldFrame, qboolean trackCache ) {
+	msg_t writeMsg;
+	int temp;
+	MSG_Init( &writeMsg, demo.buffer, sizeof( demo.buffer ) );
+	MSG_Clear( &writeMsg );
+	MSG_Bitstream( &writeMsg );
+#ifdef __EMSCRIPTEN__
+	g_msgRawBitstream = qtrue;
+#endif
+	demoFramePack( &writeMsg, newFrame, oldFrame, &demo.firstPack );
+#ifdef __EMSCRIPTEN__
+	g_msgRawBitstream = qfalse;
+#endif
+	if ( trackCache ) {
+		if ( !s_cachedMmeIndex.startTime ) {
+			s_cachedMmeIndex.startTime = newFrame->serverTime;
+		}
+		if ( !oldFrame && s_cachedMmeIndex.fileIndexCount < DEMO_MAX_INDEX ) {
+			s_cachedMmeIndex.fileIndex[s_cachedMmeIndex.fileIndexCount].pos = s_cachedMmeIndex.fileSize;
+			s_cachedMmeIndex.fileIndex[s_cachedMmeIndex.fileIndexCount].frame = s_cachedMmeIndex.totalFrames;
+			s_cachedMmeIndex.fileIndex[s_cachedMmeIndex.fileIndexCount].time = newFrame->serverTime;
+			s_cachedMmeIndex.fileIndexCount++;
+		}
+		s_cachedMmeIndex.endTime = newFrame->serverTime;
+		s_cachedMmeIndex.fileSize += 4 + writeMsg.cursize;
+		s_cachedMmeIndex.totalFrames++;
+	}
+	temp = LittleLong( writeMsg.cursize );
+	FS_Write( &temp, 4, newHandle );
+	FS_Write( writeMsg.data, writeMsg.cursize, newHandle );
+}
+
+static void demoConvertCleanup( void ) {
+	if ( s_demoConvertState.oldHandle ) {
+		FS_FCloseFile( s_demoConvertState.oldHandle );
+		s_demoConvertState.oldHandle = 0;
+	}
+	if ( s_demoConvertState.newHandle ) {
+		FS_FCloseFile( s_demoConvertState.newHandle );
+		s_demoConvertState.newHandle = 0;
+	}
+	if ( s_demoConvertState.convert ) {
+		Z_Free( s_demoConvertState.convert );
+		s_demoConvertState.convert = 0;
+	}
+	s_demoConvertState.active = qfalse;
+}
+
+qboolean demoConvertBegin( const char *oldName, const char *newBaseName, qboolean smoothen ) {
+	demoConvertCleanup();
+	Com_Memset( &s_demoConvertState, 0, sizeof( s_demoConvertState ) );
+	Com_Memset( &s_cachedMmeIndex, 0, sizeof( s_cachedMmeIndex ) );
+
+	s_demoConvertState.oldSize = FS_FOpenFileRead( oldName, &s_demoConvertState.oldHandle, qtrue );
+	if ( !s_demoConvertState.oldHandle ) {
+		Com_Printf( "Failed to open %s for conversion.\n", oldName );
+		return qfalse;
+	}
+	s_demoConvertState.initialSize = s_demoConvertState.oldSize;
+	s_demoConvertState.smoothen = smoothen;
+	Q_strncpyz( s_demoConvertState.newBaseName, newBaseName, sizeof( s_demoConvertState.newBaseName ) );
+	demo.firstPack = qtrue;
+	s_demoConvertState.convert = (demoConvert_t *)Z_Malloc( sizeof( demoConvert_t ), TAG_GENERAL );
+	memset( s_demoConvertState.convert, 0, sizeof( demoConvert_t ) );
+	s_demoConvertState.active = qtrue;
+	Com_SetLoadingMsg( "Converting the demo..." );
+	return qtrue;
+}
+
+void demoConvertGetProgress( int *outDoneBytes, int *outTotalBytes ) {
+	int total = s_demoConvertState.initialSize;
+	int rem = s_demoConvertState.oldSize;
+	if ( rem < 0 ) rem = 0;
+	if ( rem > total ) rem = total;
+	if ( outDoneBytes ) *outDoneBytes = total - rem;
+	if ( outTotalBytes ) *outTotalBytes = total;
+}
+
+int demoConvertStep( int maxBytes ) {
+	if ( !s_demoConvertState.active ) {
+		return 0;
+	}
+	fileHandle_t	oldHandle = s_demoConvertState.oldHandle;
+	fileHandle_t	&newHandle = s_demoConvertState.newHandle;
+	int				&oldSize = s_demoConvertState.oldSize;
+	int				&msgSequence = s_demoConvertState.msgSequence;
+	int				&oldTime = s_demoConvertState.oldTime;
+	int				&fullTime = s_demoConvertState.fullTime;
+	int				&clientNum = s_demoConvertState.clientNum;
+	int				&parseEntitiesNum = s_demoConvertState.parseEntitiesNum;
+	demoConvert_t	*convert = s_demoConvertState.convert;
+	char			*bigConfigString = s_demoConvertState.bigConfigString;
+	int				&bigConfigNumber = s_demoConvertState.bigConfigNumber;
+	int				&levelCount = s_demoConvertState.levelCount;
+	const char		*newBaseName = s_demoConvertState.newBaseName;
+	char			*newName = s_demoConvertState.newName;
+	qboolean		smoothen = s_demoConvertState.smoothen;
+
+	int				temp;
+	msg_t			oldMsg;
+	byte			oldData[ MAX_MSGLEN ];
+	int				nextTime;
+	demoFrame_t		*workFrame;
 	const char		*s;
 	clSnapshot_t	*oldSnap = 0;
 	clSnapshot_t	*newSnap;
-	int				levelCount = 0;
-	char			newName[MAX_OSPATH];
 	short			rmgDataSize = 0;
 	short			flatDataSize = 0;
 	short			automapCount = 0;
 	int				i = 0;
+	int				bytesProcessed = 0;
 
-	oldSize = FS_FOpenFileRead( oldName, &oldHandle, qtrue );
-	if (!oldHandle) {
-		Com_Printf("Failed to open %s for conversion.\n", oldName);
-		return;
-	}
-	demo.firstPack = qtrue;
-	/* Alloc some memory */
-	convert = (demoConvert_t *)Z_Malloc( sizeof( demoConvert_t), TAG_GENERAL ); //what tag do we need?
-	memset( convert, 0, sizeof(demoConvert_t));
-	Com_SetLoadingMsg("Converting the demo...");
-	/* Initialize the first workframe's strings */
-	while (oldSize > 0) {
+	while ( oldSize > 0 ) {
+		int startOldSize = oldSize;
 		MSG_Init( &oldMsg, oldData, sizeof( oldData ) );
 		/* Read the sequence number */
 		if (FS_Read( &convert->messageNum, 4, oldHandle) != 4)
@@ -342,8 +582,10 @@ void demoConvert( const char *oldName, const char *newBaseName, qboolean smoothe
 		oldSize -= 4;
 		oldMsg.cursize = LittleLong( oldMsg.cursize );
 		/* Negative size signals end of demo */
-		if (oldMsg.cursize < 0)
+		if (oldMsg.cursize < 0) {
+			oldSize = 0;
 			break;
+		}
 		if ( oldMsg.cursize > oldMsg.maxsize ) 
 			goto conversionerror;
 		/* Read the actual message */
@@ -386,15 +628,15 @@ void demoConvert( const char *oldName, const char *newBaseName, qboolean smoothe
 	
 				if ( !Q_stricmp( Cmd_Argv(0), "bcs0" ) ) {
 					bigConfigNumber = atoi( Cmd_Argv(1) );
-					Q_strncpyz( bigConfigString, Cmd_Argv(2), sizeof( bigConfigString ));
+					Q_strncpyz( bigConfigString, Cmd_Argv(2), BIG_INFO_STRING );
 					break;
 				}
 				if ( !Q_stricmp( Cmd_Argv(0), "bcs1" ) ) {
-					Q_strcat( bigConfigString, sizeof( bigConfigString ), Cmd_Argv(2));
+					Q_strcat( bigConfigString, BIG_INFO_STRING, Cmd_Argv(2));
 					break;
 				}
 				if ( !Q_stricmp( Cmd_Argv(0), "bcs2" ) ) {
-					Q_strcat( bigConfigString, sizeof( bigConfigString ), Cmd_Argv(2));
+					Q_strcat( bigConfigString, BIG_INFO_STRING, Cmd_Argv(2));
 					demoFrameAddString( &workFrame->string, bigConfigNumber, bigConfigString );
 					break;
 				}
@@ -425,29 +667,25 @@ void demoConvert( const char *oldName, const char *newBaseName, qboolean smoothe
 						flushStart = 0;
 					for (flushIdx = flushStart; flushIdx < convert->frameIndex; flushIdx++) {
 						const demoFrame_t *newFrame = &convert->frames[ flushIdx % DEMOCONVERTFRAMES ];
-						msg_t writeMsg;
-						MSG_Init( &writeMsg, demo.buffer, sizeof (demo.buffer));
-						MSG_Clear( &writeMsg );
-						MSG_Bitstream( &writeMsg );
+						const demoFrame_t *oldFrame = 0;
 						if ( newFrame->serverTime > fullTime || flushIdx <= 0 ) {
 							fullTime = newFrame->serverTime + 2000;
-							demoFramePack( &writeMsg, newFrame, 0, &demo.firstPack );
 						} else {
-							const demoFrame_t *oldFrame = &convert->frames[ ( flushIdx - 1 ) % DEMOCONVERTFRAMES ];
-							demoFramePack( &writeMsg, newFrame, oldFrame, &demo.firstPack );
+							oldFrame = &convert->frames[ ( flushIdx - 1 ) % DEMOCONVERTFRAMES ];
 						}
-						temp = LittleLong( writeMsg.cursize );
-						FS_Write( &temp, 4, newHandle );
-						FS_Write( writeMsg.data, writeMsg.cursize, newHandle );
+						demoConvertEmitFrame( newHandle, newFrame, oldFrame, (qboolean)(levelCount == 1) );
+					}
+					if ( levelCount == 1 ) {
+						s_cachedMmeIndex.valid = qtrue;
 					}
 					FS_FCloseFile( newHandle );
 					newHandle = 0;
 				}
 				if (levelCount) {
 					demo.firstPack = qtrue;
-					Com_sprintf( newName, sizeof( newName ), "%s.%d.mme", newBaseName, levelCount );
+					Com_sprintf( newName, MAX_OSPATH, "%s.%d.mme", newBaseName, levelCount );
 				} else {
-					Com_sprintf( newName, sizeof( newName ), "%s.mme", newBaseName );
+					Com_sprintf( newName, MAX_OSPATH, "%s.mme", newBaseName );
 				}
 				fullTime = -1;
 				clientNum = -1;
@@ -460,9 +698,15 @@ void demoConvert( const char *oldName, const char *newBaseName, qboolean smoothe
 					Com_Printf("Failed to open %s for target conversion target.\n", newName);
 					goto conversionerror;
 				} else {
-					FS_Write ( demoHeader, strlen( demoHeader ), newHandle );
+					int hdrLen = (int)strlen( demoHeader );
+					FS_Write ( demoHeader, hdrLen, newHandle );
+					if ( levelCount == 1 ) {
+						Com_Memset( &s_cachedMmeIndex, 0, sizeof( s_cachedMmeIndex ) );
+						Q_strncpyz( s_cachedMmeIndex.fileName, newName, sizeof( s_cachedMmeIndex.fileName ) );
+						s_cachedMmeIndex.fileSize = hdrLen;
+					}
 				}
-				Com_sprintf( newName, sizeof( newName ), "%s.txt", newBaseName );
+				Com_sprintf( newName, MAX_OSPATH, "%s.txt", newBaseName );
 				workFrame = &convert->frames[ convert->frameIndex % DEMOCONVERTFRAMES ];
 				msgSequence = MSG_ReadLong( &oldMsg );
 				while( 1 ) {
@@ -593,7 +837,6 @@ void demoConvert( const char *oldName, const char *newBaseName, qboolean smoothe
 						newnum = MSG_ReadBits( &oldMsg, GENTITYNUM_BITS );
 					} else if (oldnum > newnum) {
 						MSG_ReadDeltaEntity( &oldMsg, &convert->entityBaselines[newnum], newstate , newnum );
-						memcpy(&workFrame->entityBaselines[newnum], &convert->entityBaselines[newnum], sizeof(entityState_t));
 						if ( newstate->number != MAX_GENTITIES-1)
 							workFrame->entityData[ newstate->number ] = 1;
 						newnum = MSG_ReadBits( &oldMsg, GENTITYNUM_BITS );
@@ -634,27 +877,17 @@ void demoConvert( const char *oldName, const char *newBaseName, qboolean smoothe
 					/* Which frame from the cache to save */
 					writeIndex = convert->frameIndex - (DEMOCONVERTFRAMES/2);
 					if (writeIndex >= 0) {
-						const demoFrame_t *newFrame;
-						msg_t writeMsg;
-						// init the message
-						MSG_Init( &writeMsg, demo.buffer, sizeof (demo.buffer));
-						MSG_Clear( &writeMsg );
-						MSG_Bitstream( &writeMsg );
-						newFrame = &convert->frames[ writeIndex  % DEMOCONVERTFRAMES];
+						const demoFrame_t *newFrame = &convert->frames[ writeIndex % DEMOCONVERTFRAMES ];
+						const demoFrame_t *oldFrame = 0;
 						if ( smoothen )
 							demoFrameInterpolate( convert->frames, DEMOCONVERTFRAMES, writeIndex );
 						if ( nextTime > fullTime || writeIndex <= 0 ) {
 							/* Plan the next time for a full write */
 							fullTime = nextTime + 2000;
-							demoFramePack( &writeMsg, newFrame, 0, &demo.firstPack );
 						} else {
-							const demoFrame_t *oldFrame = &convert->frames[ ( writeIndex -1 ) % DEMOCONVERTFRAMES];
-							demoFramePack( &writeMsg, newFrame, oldFrame, &demo.firstPack );
+							oldFrame = &convert->frames[ ( writeIndex - 1 ) % DEMOCONVERTFRAMES ];
 						}
-						/* Write away the new data in the msg queue */
-						temp = LittleLong( writeMsg.cursize );
-						FS_Write (&temp, 4, newHandle );
-						FS_Write ( writeMsg.data , writeMsg.cursize, newHandle );
+						demoConvertEmitFrame( newHandle, newFrame, oldFrame, (qboolean)(levelCount == 1) );
 					}
 
 					/* Clean up the upcoming frame for all new changes */
@@ -696,6 +929,10 @@ void demoConvert( const char *oldName, const char *newBaseName, qboolean smoothe
 				break;
 			}
 		}
+		bytesProcessed += ( startOldSize - oldSize );
+		if ( maxBytes > 0 && bytesProcessed >= maxBytes && oldSize > 0 ) {
+			return 1;
+		}
 	}
 	if (newHandle && convert->frameIndex > 0) {
 		int flushStart = convert->frameIndex - (DEMOCONVERTFRAMES/2);
@@ -704,27 +941,30 @@ void demoConvert( const char *oldName, const char *newBaseName, qboolean smoothe
 			flushStart = 0;
 		for (flushIdx = flushStart; flushIdx < convert->frameIndex; flushIdx++) {
 			const demoFrame_t *newFrame = &convert->frames[ flushIdx % DEMOCONVERTFRAMES ];
-			msg_t writeMsg;
-			MSG_Init( &writeMsg, demo.buffer, sizeof (demo.buffer));
-			MSG_Clear( &writeMsg );
-			MSG_Bitstream( &writeMsg );
+			const demoFrame_t *oldFrame = 0;
 			if ( newFrame->serverTime > fullTime || flushIdx <= 0 ) {
 				fullTime = newFrame->serverTime + 2000;
-				demoFramePack( &writeMsg, newFrame, 0, &demo.firstPack );
 			} else {
-				const demoFrame_t *oldFrame = &convert->frames[ ( flushIdx - 1 ) % DEMOCONVERTFRAMES ];
-				demoFramePack( &writeMsg, newFrame, oldFrame, &demo.firstPack );
+				oldFrame = &convert->frames[ ( flushIdx - 1 ) % DEMOCONVERTFRAMES ];
 			}
-			temp = LittleLong( writeMsg.cursize );
-			FS_Write( &temp, 4, newHandle );
-			FS_Write( writeMsg.data, writeMsg.cursize, newHandle );
+			demoConvertEmitFrame( newHandle, newFrame, oldFrame, (qboolean)(levelCount == 1) );
+		}
+		if ( levelCount == 1 ) {
+			s_cachedMmeIndex.valid = qtrue;
 		}
 	}
+	demoConvertCleanup();
+	return 0;
 conversionerror:
-	FS_FCloseFile( oldHandle );
-	FS_FCloseFile( newHandle );
-	Z_Free( convert );
-	return;
+	s_cachedMmeIndex.valid = qfalse;
+	demoConvertCleanup();
+	return -1;
+}
+
+void demoConvert( const char *oldName, const char *newBaseName, qboolean smoothen ) {
+	if ( demoConvertBegin( oldName, newBaseName, smoothen ) ) {
+		while ( demoConvertStep( 0x7fffffff ) > 0 ) {}
+	}
 }
 
 void demoCommandSmoothingEnable(qboolean enable) {
@@ -768,6 +1008,8 @@ static void demoPlaySynch( demoPlay_t *play, demoFrame_t *frame) {
 	int startCount = play->commandCount;
 	int totalLen = 0;
 	for (i = 0;i<MAX_CONFIGSTRINGS;i++) {
+		if ( !cl.gameState.stringOffsets[i] && !frame->string.offsets[i] )
+			continue;
 		char *oldString = cl.gameState.stringData + cl.gameState.stringOffsets[i];
 		char *newString = frame->string.data + frame->string.offsets[i];
 		if (!strcmp( oldString, newString ))
@@ -815,11 +1057,28 @@ static void demoPlayForwardFrame( demoPlay_t *play ) {
 		return;
 	}
 	play->lastFrame = qfalse;
-	play->filePos += 4;
-	FS_Read( &blockSize, 4, play->fileHandle );
-	blockSize = LittleLong( blockSize );
-	FS_Read( demo.buffer, blockSize, play->fileHandle );
-	play->filePos += blockSize;
+#ifdef __EMSCRIPTEN__
+	if ( s_mmeStreamActive ) {
+		if ( wasm_js_mme_read( play->filePos, &blockSize, 4 ) != 4 ) {
+			play->lastFrame = qtrue;
+			return;
+		}
+		play->filePos += 4;
+		blockSize = LittleLong( blockSize );
+		if ( blockSize <= 0 || blockSize > (int)sizeof( demo.buffer ) || wasm_js_mme_read( play->filePos, demo.buffer, blockSize ) != blockSize ) {
+			play->lastFrame = qtrue;
+			return;
+		}
+		play->filePos += blockSize;
+	} else
+#endif
+	{
+		play->filePos += 4;
+		FS_Read( &blockSize, 4, play->fileHandle );
+		blockSize = LittleLong( blockSize );
+		FS_Read( demo.buffer, blockSize, play->fileHandle );
+		play->filePos += blockSize;
+	}
 	MSG_Init( &msg, demo.buffer, sizeof(demo.buffer) );
 	MSG_BeginReading( &msg );
 	msg.cursize = blockSize;
@@ -831,7 +1090,13 @@ static void demoPlayForwardFrame( demoPlay_t *play ) {
 		play->frame = play->nextFrame;
 		play->nextFrame = copyFrame;
 	}
+#ifdef __EMSCRIPTEN__
+	g_msgRawBitstream = qtrue;
+#endif
 	demoFrameUnpack( &msg, play->frame, play->nextFrame, &demo.firstPack );
+#ifdef __EMSCRIPTEN__
+	g_msgRawBitstream = qfalse;
+#endif
 	play->frameNumber++;
 }
 
@@ -858,8 +1123,15 @@ static void demoPlaySetIndex( demoPlay_t *play, int index ) {
 		trap_FS_Read( demoBuffer, toRead, play->fileHandle );
 	}
 #else
+#ifdef __EMSCRIPTEN__
+	if ( !s_mmeStreamActive ) {
+		FS_Seek( play->fileHandle, wantPos, FS_SEEK_SET );
+	}
+	play->filePos = wantPos;
+#else
 	FS_Seek( play->fileHandle, wantPos, FS_SEEK_SET );
 	play->filePos = wantPos;
+#endif
 #endif
 
 	if (demo.commandSmoothing)
@@ -978,22 +1250,37 @@ static demoPlay_t *demoPlayOpen( const char* fileName ) {
 	int i;
 
 	msg_t msg;
-	fileSize = FS_FOpenFileRead( fileName, &fileHandle, qtrue );
-	if (fileHandle<=0) {
-		Com_Printf("Failed to open demo file %s \n", fileName );
-		return 0;
+#ifdef __EMSCRIPTEN__
+	if ( s_mmeStreamActive && s_mmeStreamFileSize > 0 ) {
+		fileHandle = 0;
+		fileSize = s_mmeStreamFileSize;
+		filePos = strlen( demoHeader );
+		i = wasm_js_mme_read( 0, &demo.buffer, filePos );
+		if ( i != filePos || Q_strncmp( (char *)demo.buffer, demoHeader, filePos ) ) {
+			Com_Printf( "streamed demo file %s is wrong version\n", fileName );
+			return 0;
+		}
+		demo.nextNum = 0;
+	} else
+#endif
+	{
+		fileSize = FS_FOpenFileRead( fileName, &fileHandle, qtrue );
+		if (fileHandle<=0) {
+			Com_Printf("Failed to open demo file %s \n", fileName );
+			return 0;
+		}
+		filePos = strlen( demoHeader );
+		i = FS_Read( &demo.buffer, filePos, fileHandle );
+		if ( i != filePos || Q_strncmp( (char *)demo.buffer, demoHeader, filePos )) {
+			Com_Printf("demo file %s is wrong version\n", fileName );
+			FS_FCloseFile( fileHandle );
+			return 0;
+		}
+		demo.nextNum = demoFindNext(mme_demoFileName->string);
 	}
-	filePos = strlen( demoHeader );
-	i = FS_Read( &demo.buffer, filePos, fileHandle );
-	if ( i != filePos || Q_strncmp( (char *)demo.buffer, demoHeader, filePos )) {
-		Com_Printf("demo file %s is wrong version\n", fileName );
-		FS_FCloseFile( fileHandle );
-		return 0;
-	}
-	demo.nextNum = demoFindNext(mme_demoFileName->string);
 	if ( filePos == fileSize) {
 		Com_Printf("demo file %s is empty\n", fileName );
-		FS_FCloseFile( fileHandle );
+		if ( fileHandle > 0 ) FS_FCloseFile( fileHandle );
 		return 0;
 	}
 	Com_SetLoadingMsg("Opening the demo...");
@@ -1007,37 +1294,60 @@ static demoPlay_t *demoPlayOpen( const char* fileName ) {
 		play->commandStart[i] = i;
 	play->commandFree = DEMO_PLAY_CMDS;
 
-	for ( ; filePos<fileSize; ) {
-		int blockSize, isFull, serverTime;
-		FS_Read( &blockSize, 4, fileHandle );
-		blockSize = LittleLong( blockSize );
-		if (blockSize > sizeof(demo.buffer)) {
-			Com_Printf( "Block too large to be read in.\n");
-			goto errorreturn;
+	if ( s_cachedMmeIndex.valid
+		&& ( s_mmeStreamActive || !Q_stricmp( s_cachedMmeIndex.fileName, fileName ) )
+		&& s_cachedMmeIndex.fileSize == fileSize
+		&& s_cachedMmeIndex.totalFrames > 0 ) {
+		play->startTime = s_cachedMmeIndex.startTime;
+		play->endTime = s_cachedMmeIndex.endTime;
+		play->totalFrames = s_cachedMmeIndex.totalFrames;
+		play->fileIndexCount = s_cachedMmeIndex.fileIndexCount;
+		if ( play->fileIndexCount > 0 ) {
+			Com_Memcpy( play->fileIndex, s_cachedMmeIndex.fileIndex, play->fileIndexCount * sizeof( play->fileIndex[0] ) );
 		}
-		if ( blockSize + filePos > fileSize) {
-			Com_Printf( "Block would read past the end of the file.\n");
-			goto errorreturn;
-		}
-		FS_Read( demo.buffer, blockSize, fileHandle );
-		MSG_Init( &msg, demo.buffer, sizeof(demo.buffer) );
-		MSG_BeginReading( &msg );
-		msg.cursize = blockSize;	
-		isFull = MSG_ReadBits( &msg, 1 );
-		serverTime = MSG_ReadLong( &msg );
-		if (!play->startTime)
-			play->startTime = serverTime;
-		if (isFull) {
-			if (play->fileIndexCount < DEMO_MAX_INDEX) {
-				play->fileIndex[play->fileIndexCount].pos = filePos;
-				play->fileIndex[play->fileIndexCount].frame = play->totalFrames;
-				play->fileIndex[play->fileIndexCount].time = serverTime;
-				play->fileIndexCount++;
+	} else {
+		for ( ; filePos<fileSize; ) {
+			int blockSize, isFull, serverTime;
+			FS_Read( &blockSize, 4, fileHandle );
+			blockSize = LittleLong( blockSize );
+			if (blockSize > sizeof(demo.buffer)) {
+				Com_Printf( "Block too large to be read in.\n");
+				goto errorreturn;
 			}
+			if ( blockSize + filePos > fileSize) {
+				Com_Printf( "Block would read past the end of the file.\n");
+				goto errorreturn;
+			}
+			int hdrSize = ( blockSize < 16 ) ? blockSize : 16;
+			FS_Read( demo.buffer, hdrSize, fileHandle );
+			if ( blockSize > hdrSize ) {
+				FS_Seek( fileHandle, blockSize - hdrSize, FS_SEEK_CUR );
+			}
+			MSG_Init( &msg, demo.buffer, sizeof(demo.buffer) );
+			MSG_BeginReading( &msg );
+			msg.cursize = hdrSize;	
+#ifdef __EMSCRIPTEN__
+			g_msgRawBitstream = qtrue;
+#endif
+			isFull = MSG_ReadBits( &msg, 1 );
+			serverTime = MSG_ReadLong( &msg );
+#ifdef __EMSCRIPTEN__
+			g_msgRawBitstream = qfalse;
+#endif
+			if (!play->startTime)
+				play->startTime = serverTime;
+			if (isFull) {
+				if (play->fileIndexCount < DEMO_MAX_INDEX) {
+					play->fileIndex[play->fileIndexCount].pos = filePos;
+					play->fileIndex[play->fileIndexCount].frame = play->totalFrames;
+					play->fileIndex[play->fileIndexCount].time = serverTime;
+					play->fileIndexCount++;
+				}
+			}
+			play->endTime = serverTime;
+			filePos += 4 + blockSize;
+			play->totalFrames++;
 		}
-		play->endTime = serverTime;
-		filePos += 4 + blockSize;
-		play->totalFrames++;
 	}
 	play->fileHandle = fileHandle;
 	demo.firstPack = qtrue;
@@ -1051,12 +1361,14 @@ static demoPlay_t *demoPlayOpen( const char* fileName ) {
 	return play;
 errorreturn:
 	Z_Free( play );
-	FS_FCloseFile( fileHandle );
+	if ( fileHandle > 0 ) FS_FCloseFile( fileHandle );
 	return 0;
 }
 
 static void demoPlayStop(demoPlay_t *play) {
-	FS_FCloseFile( play->fileHandle );
+	if ( play->fileHandle > 0 ) {
+		FS_FCloseFile( play->fileHandle );
+	}
 	if ((mme_demoRemove->integer || demo.del) && FS_FileExists(play->fileName)) {
 		FS_FileErase(play->fileName);
 	}
@@ -1078,10 +1390,15 @@ qboolean demoGetDefaultState(int index, entityState_t *state) {
 	demoPlay_t *play = demo.play.handle;
 	if (index < 0 || index >= MAX_GENTITIES)
 		return qfalse;
-	if (!(play->frame->entityBaselines[index].eFlags & EF_PERMANENT))
-		return qfalse;
-	*state = play->frame->entityBaselines[index];
-	return qtrue;
+	if (play && (play->frame->entityBaselines[index].eFlags & EF_PERMANENT)) {
+		*state = play->frame->entityBaselines[index];
+		return qtrue;
+	}
+	if (s_mmeEntityBaselines[index].eFlags & EF_PERMANENT) {
+		*state = s_mmeEntityBaselines[index];
+		return qtrue;
+	}
+	return qfalse;
 }
 
 extern void CL_ConfigstringModified( void );
@@ -1197,7 +1514,9 @@ void CL_DemoSetCGameTime( void ) {
 
 void CL_DemoShutDown( void ) {
 	if ( demo.play.handle ) {
-		FS_FCloseFile( demo.play.handle->fileHandle );
+		if ( demo.play.handle->fileHandle > 0 ) {
+			FS_FCloseFile( demo.play.handle->fileHandle );
+		}
 		Z_Free( demo.play.handle );
 		demo.play.handle = 0;
 	}
@@ -1327,7 +1646,7 @@ static void demoPrecache( void ) {
 	demoPlaySetIndex(play, 0);
 }
 
-qboolean demoPlay( const char *fileName, qboolean del ) {
+qboolean demoPlayBegin( const char *fileName, qboolean del ) {
 	demo.play.handle = demoPlayOpen( fileName );
 	if (demo.play.handle) {
 		demoPlay_t *play = demo.play.handle;
@@ -1371,9 +1690,16 @@ qboolean demoPlay( const char *fileName, qboolean del ) {
 			demoPrecache();
 		}
 		demo.precaching = qfalse;
+		demo.del = del;
+		return qtrue;
+	}
+	return qfalse;
+}
+
+qboolean demoPlay( const char *fileName, qboolean del ) {
+	if ( demoPlayBegin( fileName, del ) ) {
 		CL_InitCGame();
 		cls.state = CA_ACTIVE;
-		demo.del = del;
 		return qtrue;
 	} else if (demo.nextNum) {
 		return qtrue;

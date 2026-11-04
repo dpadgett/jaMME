@@ -204,7 +204,7 @@ qboolean SNDDMA_Init(void)
 	else
 	{
 #ifdef __EMSCRIPTEN__
-		desired.samples = 512;
+		desired.samples = 1024;
 #else
 		// just pick a sane default.
 		if (desired.freq <= 11025)
@@ -297,6 +297,20 @@ int SNDDMA_GetDMAPos(void) {
 			int advance = (dt * dma.speed * dma.channels) / 1000;
 			advance &= ~(dma.channels - 1);
 			if (advance > 0) {
+				if (dma.buffer && dmasize > 0) {
+					int bytesPerSample = dma.samplebits / 8;
+					int bytePos = dmapos * bytesPerSample;
+					int byteLen = advance * bytesPerSample;
+					if (byteLen >= dmasize) {
+						memset(dma.buffer, 0, dmasize);
+					} else if (bytePos + byteLen <= dmasize) {
+						memset(dma.buffer + bytePos, 0, byteLen);
+					} else {
+						int len1 = dmasize - bytePos;
+						memset(dma.buffer + bytePos, 0, len1);
+						memset(dma.buffer, 0, byteLen - len1);
+					}
+				}
 				dmapos = (dmapos + advance) % dma.samples;
 				s_lastDmaUpdateMs = now;
 			}

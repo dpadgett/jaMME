@@ -103,6 +103,11 @@ void S_DMA_Update( float scale ) {
 	if (lastRead > lastWrite) {
 		bufDone = 0;
 		dmaWrite = thisPos;
+#ifdef __EMSCRIPTEN__
+		if (dma.buffer) {
+			Snd_Memset(dma.buffer, (dma.samplebits == 8) ? 0x80 : 0, dma.samples * dma.samplebits / 8);
+		}
+#endif
 //		Com_Printf("OMG Buffer underrun\n");
 	} else {
 		bufDone = lastWrite - lastRead;
@@ -119,13 +124,9 @@ void S_DMA_Update( float scale ) {
 		sane = 200;
 	}
 	ma = s_mixahead->value * dma.speed;
-	op = dma.speed * (0.015f + sane * 0.0015f);
+	op = dma.speed * (0.065f + sane * 0.002f);
 	if (op < ma) {
 		ma = op;
-	}
-	if (bufDone > (int)(ma + dma.speed * 0.025f)) {
-		bufDone = (int)ma;
-		dmaWrite = (thisPos + bufDone) % bufSize;
 	}
 	count = (int)ma - bufDone;
 	if (count < 0) {

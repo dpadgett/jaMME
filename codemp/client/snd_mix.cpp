@@ -107,6 +107,14 @@ takeNext:
 	return allocSound;
 }
 
+#ifdef __EMSCRIPTEN__
+extern "C" int JK_DemoIsPlaying( void );
+extern "C" qboolean FS_WasmIsFileCached( const char *qpath );
+extern "C" void FS_WasmPrefetchFileAsync( const char *qpath );
+extern int sfxEntryCount;
+static int s_prewarmSoundCursor = 1;
+#endif
+
 const mixSound_t *S_MixGetSound( sfxHandle_t sfxHandle ) {
 	sfxEntry_t *entry;
 	mixSound_t *sound;
@@ -120,6 +128,12 @@ const mixSound_t *S_MixGetSound( sfxHandle_t sfxHandle ) {
 	}
 
 	entry = sfxEntries + sfxHandle;
+#ifdef __EMSCRIPTEN__
+	if ( JK_DemoIsPlaying() && entry->name[0] && !FS_WasmIsFileCached( entry->name ) ) {
+		FS_WasmPrefetchFileAsync( entry->name );
+		return &mixEmptySound;
+	}
+#endif
 	openSound = S_SoundOpen( entry->name );
 	if (!openSound) {
 		return mixSounds[sfxHandle] = &mixEmptySound;
@@ -532,6 +546,12 @@ void S_MixBackground( mixBackground_t *background, int speed, int count, int *ou
 
 	speed = (MIX_SPEED << MIX_SHIFT) / dma.speed;
 	if ( s_background.playing ) {
+		if ( !s_background.override && (!s_musicVolume || s_musicVolume->value <= 0.0f) ) {
+			if ( count > 0 ) {
+				Com_Memset( output, 0, count * sizeof(int) * 2 );
+			}
+			return;
+		}
 		/* Do we need a reload */
 		if ( s_background.reload ) {
 			/* Already playing, check if we already have the right one open */
@@ -683,3 +703,25 @@ void S_MixInit( void ) {
 	mixAllocSounds->size = allocSize;
 	mixAllocSounds->lastUsed = 0;
 }
+
+#ifdef __EMSCRIPTEN__
+extern "C" void S_ResetPrewarmSounds( void ) {
+	s_prewarmSoundCursor = 1;
+}
+
+extern "C" int S_PrewarmRegisteredSounds( int maxTimeMs, int *outDone, int *outTotal ) {
+	int startMs = Sys_Milliseconds();
+	while ( s_prewarmSoundCursor < sfxEntryCount ) {
+		int idx = s_prewarmSoundCursor++;
+		if ( !mixSounds[idx] && sfxEntries[idx].name[0] && FS_WasmIsFileCached( sfxEntries[idx].name ) ) {
+			S_MixGetSound( idx );
+			if ( maxTimeMs > 0 && ( Sys_Milliseconds() - startMs ) >= maxTimeMs && s_prewarmSoundCursor < sfxEntryCount ) {
+				break;
+			}
+		}
+	}
+	if ( outDone ) *outDone = s_prewarmSoundCursor;
+	if ( outTotal ) *outTotal = ( sfxEntryCount > 1 ) ? sfxEntryCount : 1;
+	return ( s_prewarmSoundCursor < sfxEntryCount ) ? 1 : 0;
+}
+#endif

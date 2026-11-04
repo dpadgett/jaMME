@@ -338,6 +338,12 @@ void S_StartSound(const vec3_t origin, int entityNum, int entchannel, unsigned c
 	if ( !s_soundStarted || s_soundInitMuted ) {
 		return;
 	}
+#ifdef __EMSCRIPTEN__
+	extern qboolean g_jkDemoSeeking;
+	if ( g_jkDemoSeeking ) {
+		return;
+	}
+#endif
 	if ( !origin && ( entityNum < 0 || entityNum > MAX_GENTITIES ) ) {
 		Com_Error( ERR_DROP, "S_StartSound: bad entitynum %i", entityNum );
 	}
@@ -399,6 +405,8 @@ void S_ClearSoundBuffer( void ) {
 	}
 
 	s_playScale = 1.0f;
+	s_channelQueueCount = 0;
+	s_loopQueueCount = 0;
 	// stop looping sounds
 	Com_Memset(s_entitySounds, 0, sizeof(s_entitySounds));
 	VectorClear(s_listenOrigin);
@@ -456,6 +464,12 @@ void S_AddLoopingSound( const void *parent, const vec3_t origin, const vec3_t ve
 	if ( !s_soundStarted || s_soundInitMuted ) {
 		return;
 	}
+#ifdef __EMSCRIPTEN__
+	extern qboolean g_jkDemoSeeking;
+	if ( g_jkDemoSeeking ) {
+		return;
+	}
+#endif
 
 	if ( sfxHandle <= 0 || sfxHandle >= sfxEntryCount) {
 		Com_DPrintf( "S_AddLoopingSound: Illegal sfxhandle %d\n", sfxHandle );
@@ -573,7 +587,9 @@ void S_Update( void ) {
 
 	s_channelQueueCount = 0;
 	s_loopQueueCount = 0;
-	s_background.reload = qfalse;
+	if ( s_background.override || (s_musicVolume && s_musicVolume->value > 0.0f) ) {
+		s_background.reload = qfalse;
+	}
 	s_underWater = qfalse;
 }
 

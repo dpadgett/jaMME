@@ -80,10 +80,18 @@ EM_JS(int, wasm_js_fetch_manifest, (char *buf, int maxLen), {
 			} catch (e0) {}
 		}
 		if (!data) {
-			var xhr = new XMLHttpRequest();
-			xhr.open('GET', '/base/manifest.json', false);
-			xhr.send(null);
-			if (xhr.status < 200 || xhr.status >= 300) return 0;
+			var xhr = null;
+			for (var attempt = 0; attempt < 3; attempt++) {
+				try {
+					xhr = new XMLHttpRequest();
+					xhr.open('GET', '/base/manifest.json', false);
+					xhr.send(null);
+					if (xhr.status >= 200 && xhr.status < 300 && xhr.responseText) break;
+				} catch (eRetry) {
+					xhr = null;
+				}
+			}
+			if (!xhr || xhr.status < 200 || xhr.status >= 300) return 0;
 			data = JSON.parse(xhr.responseText);
 			if (typeof window !== 'undefined') window.__jkPk3Manifest = data;
 			if (typeof localStorage !== 'undefined') {
@@ -141,13 +149,26 @@ EM_JS(int, wasm_js_get_cached_chunk, (const char *namePtr, int chunkIdx, unsigne
 EM_JS(int, wasm_js_fetch_range, (const char *namePtr, int start, int end, unsigned char *dst), {
 	try {
 		var name = UTF8ToString(namePtr);
-		var xhr = new XMLHttpRequest();
-		xhr.open('GET', '/base/' + name, false);
-		xhr.setRequestHeader('Range', 'bytes=' + start + '-' + end);
-		xhr.overrideMimeType('text/plain; charset=x-user-defined');
-		xhr.send(null);
-		if (xhr.status !== 200 && xhr.status !== 206) {
-			console.error('Range fetch failed for', name, start, end, xhr.status);
+		var xhr = null;
+		var lastErr = null;
+		for (var attempt = 0; attempt < 3; attempt++) {
+			try {
+				xhr = new XMLHttpRequest();
+				xhr.open('GET', '/base/' + name, false);
+				xhr.setRequestHeader('Range', 'bytes=' + start + '-' + end);
+				xhr.overrideMimeType('text/plain; charset=x-user-defined');
+				xhr.send(null);
+				if (xhr.status === 200 || xhr.status === 206) {
+					lastErr = null;
+					break;
+				}
+			} catch (eAttempt) {
+				lastErr = eAttempt;
+				xhr = null;
+			}
+		}
+		if (!xhr || (xhr.status !== 200 && xhr.status !== 206)) {
+			console.error('Range fetch failed for', name, start, end, xhr ? xhr.status : lastErr);
 			return -1;
 		}
 		var text = xhr.responseText || "";
@@ -2200,7 +2221,14 @@ long FS_ReadFile( const char *qpath, void **buffer ) {
 
 //	Z_Label(buf, qpath);
 
-	FS_Read (buf, len, h);
+	int readLen = FS_Read (buf, len, h);
+	if ( readLen < 0 ) {
+		Com_Printf( S_COLOR_YELLOW "WARNING: FS_ReadFile failed to read %s (err=%d)\n", qpath, readLen );
+		FS_FCloseFile( h );
+		Z_Free( buf );
+		*buffer = NULL;
+		return -1;
+	}
 
 	// guarantee that it will have a trailing 0 for string operations
 	buf[len] = 0;
@@ -3198,30 +3226,43 @@ extern "C" int FS_GetLoadedPackCount( void ) {
 }
 
 #ifdef __EMSCRIPTEN__
-static void WasmPK3_EnsureCentralDirLoaded( WasmPk3Archive *arch ) {
+static qboolean g_wasmPlanningMode = qfalse;
+static WasmPk3Archive *g_wasmPendingMountArchives[32];
+static int g_numWasmPendingMountArchives = 0;
+
+static qboolean WasmPK3_EnsureCentralDirLoaded( WasmPk3Archive *arch ) {
 	if ( !arch || arch->size == 0 ) {
-		return;
+		return qfalse;
 	}
 	if ( !arch->chunks ) {
 		arch->num_chunks = (arch->size + WASM_PK3_CHUNK_SIZE - 1) / WASM_PK3_CHUNK_SIZE;
 		arch->chunks = (unsigned char **)calloc( arch->num_chunks, sizeof(unsigned char *) );
 	}
 	if ( !arch->cd_data && arch->cd_size > 0 ) {
-		arch->cd_data = (unsigned char *)malloc( arch->cd_size );
-		if ( arch->cd_data ) {
-			int cached = wasm_js_get_cached_cd( arch->name, (int)arch->cd_offset, (int)(arch->size - 1), arch->cd_data );
+		unsigned char *buf = (unsigned char *)malloc( arch->cd_size );
+		if ( buf ) {
+			int cached = wasm_js_get_cached_cd( arch->name, (int)arch->cd_offset, (int)(arch->size - 1), buf );
 			if ( cached > 0 ) {
+				arch->cd_data = buf;
 				g_jkPk3BytesTransferred += cached;
 				g_jkPk3RangeRequests += 1;
+			} else if ( g_wasmPlanningMode ) {
+				free( buf );
+				return qfalse;
 			} else {
-				int fetched = wasm_js_fetch_range( arch->name, (int)arch->cd_offset, (int)(arch->size - 1), arch->cd_data );
+				int fetched = wasm_js_fetch_range( arch->name, (int)arch->cd_offset, (int)(arch->size - 1), buf );
 				if ( fetched > 0 ) {
+					arch->cd_data = buf;
 					g_jkPk3BytesTransferred += fetched;
 					g_jkPk3RangeRequests += 1;
+				} else {
+					free( buf );
+					return qfalse;
 				}
 			}
 		}
 	}
+	return arch->cd_data ? qtrue : qfalse;
 }
 
 static void WasmPK3_InitManifest( const char *gameName ) {
@@ -3296,7 +3337,7 @@ static void WasmPK3_InitManifest( const char *gameName ) {
 								Q_strncpyz( arch->maps, fields[7], sizeof(arch->maps) );
 							}
 							if ( arch->base_init ) {
-								WasmPK3_EnsureCentralDirLoaded( arch );
+								(void)WasmPK3_EnsureCentralDirLoaded( arch );
 							}
 						}
 					}
@@ -3410,7 +3451,21 @@ static qboolean WasmPK3_MountArchive( WasmPk3Archive *arch ) {
 		}
 	}
 
-	WasmPK3_EnsureCentralDirLoaded( arch );
+	if ( !WasmPK3_EnsureCentralDirLoaded( arch ) ) {
+		if ( g_wasmPlanningMode && g_numWasmPendingMountArchives < 32 ) {
+			qboolean exists = qfalse;
+			for ( int i = 0; i < g_numWasmPendingMountArchives; i++ ) {
+				if ( g_wasmPendingMountArchives[i] == arch ) {
+					exists = qtrue;
+					break;
+				}
+			}
+			if ( !exists ) {
+				g_wasmPendingMountArchives[g_numWasmPendingMountArchives++] = arch;
+			}
+		}
+		return qfalse;
+	}
 	const char *gameDir = (fs_gamedir[0] ? fs_gamedir : BASEGAME);
 	char *ospath = FS_BuildOSPath( fs_basepath->string, gameDir, arch->name );
 	FS_CreatePath( ospath );
@@ -3628,6 +3683,493 @@ extern "C" void FS_WasmPrepareDemoPaks(
 			}
 		}
 	}
+}
+
+extern "C" void R_WasmCollectShaderFiles( const char *shaderName, const char *extraShaderText, void (*addFileCb)(const char *qpath) );
+
+static unsigned char *s_planNeedChunks[MAX_WASM_PK3_ARCHIVES];
+
+static void WasmPK3_EnsurePlanBitmaps( WasmPk3Archive *arch ) {
+	if ( !arch || arch->size == 0 ) return;
+	if ( !arch->chunks ) {
+		arch->num_chunks = (arch->size + WASM_PK3_CHUNK_SIZE - 1) / WASM_PK3_CHUNK_SIZE;
+		arch->chunks = (unsigned char **)calloc( arch->num_chunks, sizeof(unsigned char *) );
+	}
+	int idx = (int)(arch - g_wasmPk3Archives);
+	if ( idx >= 0 && idx < MAX_WASM_PK3_ARCHIVES && !s_planNeedChunks[idx] && arch->num_chunks > 0 ) {
+		s_planNeedChunks[idx] = (unsigned char *)calloc( arch->num_chunks, 1 );
+	}
+}
+
+static void WasmPK3_MarkArchiveChunkRange( WasmPk3Archive *arch, unsigned long cStart, unsigned long cEnd ) {
+	if ( !arch || arch->num_chunks == 0 ) return;
+	WasmPK3_EnsurePlanBitmaps( arch );
+	int idx = (int)(arch - g_wasmPk3Archives);
+	if ( idx < 0 || idx >= MAX_WASM_PK3_ARCHIVES || !s_planNeedChunks[idx] ) return;
+	if ( cEnd >= arch->num_chunks ) cEnd = arch->num_chunks - 1;
+	for ( unsigned long c = cStart; c <= cEnd; c++ ) {
+		if ( !arch->chunks[c] && !wasm_js_has_cached_chunk( arch->name, (int)c ) ) {
+			s_planNeedChunks[idx][c] = 1;
+		}
+	}
+}
+
+static qboolean WasmPK3_GetPakFileChunks( pack_t *pak, fileInPack_t *pakFile, WasmPk3Archive **outArch, unsigned long *outStart, unsigned long *outEnd ) {
+	if ( !pak || !pakFile || !pak->handle ) return qfalse;
+	WasmPk3Archive *arch = WasmPK3_FindArchive( pak->pakFilename );
+	if ( !arch || arch->size == 0 ) return qfalse;
+	WasmPK3_EnsurePlanBitmaps( arch );
+	if ( arch->num_chunks == 0 ) return qfalse;
+	unz_s *z = (unz_s *)pak->handle;
+	unz_s saved = *z;
+	int err = unzSetOffset( pak->handle, pakFile->pos );
+	unsigned long startByte = z->cur_file_info_internal.offset_curfile + z->byte_before_the_zipfile;
+	unsigned long endByte = startByte + 30 + z->cur_file_info.size_filename + z->cur_file_info.size_file_extra + z->cur_file_info.compressed_size + 64;
+	*z = saved;
+	if ( err != UNZ_OK ) return qfalse;
+	if ( endByte >= arch->size ) endByte = arch->size - 1;
+	*outArch = arch;
+	*outStart = startByte / WASM_PK3_CHUNK_SIZE;
+	*outEnd = endByte / WASM_PK3_CHUNK_SIZE;
+	if ( *outEnd >= arch->num_chunks ) *outEnd = arch->num_chunks - 1;
+	return qtrue;
+}
+
+static qboolean WasmPK3_IsPakFileCached( pack_t *pak, fileInPack_t *pakFile ) {
+	WasmPk3Archive *arch = NULL;
+	unsigned long cStart = 0, cEnd = 0;
+	if ( !WasmPK3_GetPakFileChunks( pak, pakFile, &arch, &cStart, &cEnd ) ) {
+		return qfalse;
+	}
+	for ( unsigned long c = cStart; c <= cEnd; c++ ) {
+		if ( !arch->chunks[c] && !wasm_js_has_cached_chunk( arch->name, (int)c ) ) {
+			return qfalse;
+		}
+	}
+	return qtrue;
+}
+
+EM_JS(void, wasm_js_prefetch_chunk_async, (const char *namePtr, int chunkIdx, int archSize), {
+	try {
+		if (typeof window !== 'undefined' && typeof window.__jkPk3PrefetchChunkAsync === 'function') {
+			window.__jkPk3PrefetchChunkAsync(UTF8ToString(namePtr), chunkIdx, archSize);
+		}
+	} catch (e) {}
+});
+
+extern "C" qboolean FS_WasmIsFileCached( const char *qpath ) {
+	if ( !qpath || !qpath[0] ) return qtrue;
+	while ( *qpath == '/' || *qpath == '\\' ) qpath++;
+	if ( !*qpath ) return qtrue;
+	for ( searchpath_t *search = fs_searchpaths; search; search = search->next ) {
+		if ( !search->pack ) continue;
+		long hash = FS_HashFileName( qpath, search->pack->hashSize );
+		for ( fileInPack_t *pf = search->pack->hashTable[hash]; pf; pf = pf->next ) {
+			if ( !FS_FilenameCompare( pf->name, qpath ) ) {
+				return WasmPK3_IsPakFileCached( search->pack, pf );
+			}
+		}
+	}
+	return qtrue;
+}
+
+extern "C" void FS_WasmPrefetchFileAsync( const char *qpath ) {
+	if ( !qpath || !qpath[0] ) return;
+	while ( *qpath == '/' || *qpath == '\\' ) qpath++;
+	if ( !*qpath ) return;
+	for ( searchpath_t *search = fs_searchpaths; search; search = search->next ) {
+		if ( !search->pack ) continue;
+		long hash = FS_HashFileName( qpath, search->pack->hashSize );
+		for ( fileInPack_t *pf = search->pack->hashTable[hash]; pf; pf = pf->next ) {
+			if ( !FS_FilenameCompare( pf->name, qpath ) ) {
+				WasmPk3Archive *arch = NULL;
+				unsigned long cStart = 0, cEnd = 0;
+				if ( WasmPK3_GetPakFileChunks( search->pack, pf, &arch, &cStart, &cEnd ) ) {
+					for ( unsigned long c = cStart; c <= cEnd; c++ ) {
+						if ( !arch->chunks[c] && !wasm_js_has_cached_chunk( arch->name, (int)c ) ) {
+							wasm_js_prefetch_chunk_async( arch->name, (int)c, (int)arch->size );
+						}
+					}
+				}
+				return;
+			}
+		}
+	}
+}
+
+static qboolean WasmPK3_MarkExactFile( const char *qpath, pack_t **outPak, fileInPack_t **outPakFile ) {
+	if ( outPak ) *outPak = NULL;
+	if ( outPakFile ) *outPakFile = NULL;
+	if ( !qpath || !qpath[0] ) return qfalse;
+	while ( *qpath == '/' || *qpath == '\\' ) qpath++;
+	if ( !*qpath ) return qfalse;
+	for ( searchpath_t *search = fs_searchpaths; search; search = search->next ) {
+		if ( !search->pack ) continue;
+		long hash = FS_HashFileName( qpath, search->pack->hashSize );
+		for ( fileInPack_t *pf = search->pack->hashTable[hash]; pf; pf = pf->next ) {
+			if ( !FS_FilenameCompare( pf->name, qpath ) ) {
+				if ( outPak ) *outPak = search->pack;
+				if ( outPakFile ) *outPakFile = pf;
+				WasmPk3Archive *arch = NULL;
+				unsigned long cStart = 0, cEnd = 0;
+				if ( WasmPK3_GetPakFileChunks( search->pack, pf, &arch, &cStart, &cEnd ) ) {
+					WasmPK3_MarkArchiveChunkRange( arch, cStart, cEnd );
+				}
+				return qtrue;
+			}
+		}
+	}
+	return qfalse;
+}
+
+static void WasmPK3_MarkImageOrSoundOrFile( const char *qpath ) {
+	if ( !qpath || !qpath[0] ) return;
+	while ( *qpath == '/' || *qpath == '\\' ) qpath++;
+	if ( !*qpath ) return;
+	if ( WasmPK3_MarkExactFile( qpath, NULL, NULL ) ) {
+		return;
+	}
+	char base[MAX_QPATH];
+	COM_StripExtension( qpath, base, sizeof( base ) );
+	if ( !base[0] ) return;
+	static const char *exts[] = { ".jpg", ".tga", ".png", ".wav", ".mp3", ".md3", ".glm", ".efx", NULL };
+	for ( int i = 0; exts[i]; i++ ) {
+		char cand[MAX_QPATH];
+		Com_sprintf( cand, sizeof( cand ), "%s%s", base, exts[i] );
+		if ( WasmPK3_MarkExactFile( cand, NULL, NULL ) ) {
+			return;
+		}
+	}
+}
+
+static void WasmPK3_MarkPrefixInMountedPaks( const char *prefix ) {
+	if ( !prefix || !prefix[0] ) return;
+	size_t plen = strlen( prefix );
+	for ( searchpath_t *sp = fs_searchpaths; sp; sp = sp->next ) {
+		if ( !sp->pack || !sp->pack->buildBuffer ) continue;
+		for ( int i = 0; i < sp->pack->numfiles; i++ ) {
+			fileInPack_t *pf = &sp->pack->buildBuffer[i];
+			if ( pf->name && !Q_stricmpn( pf->name, prefix, (int)plen ) ) {
+				WasmPk3Archive *arch = NULL;
+				unsigned long cStart = 0, cEnd = 0;
+				if ( WasmPK3_GetPakFileChunks( sp->pack, pf, &arch, &cStart, &cEnd ) ) {
+					WasmPK3_MarkArchiveChunkRange( arch, cStart, cEnd );
+				}
+			}
+		}
+	}
+}
+
+static void WasmPK3_CollectModelFiles( const char *modelName, const char *extraShaderText ) {
+	if ( !modelName || !modelName[0] || modelName[0] == '*' || modelName[0] == '$' || modelName[0] == '@' ) {
+		return;
+	}
+	char cleanModel[MAX_QPATH];
+	Q_strncpyz( cleanModel, modelName, sizeof( cleanModel ) );
+	char * star = strchr( cleanModel, '*' );
+	if ( star ) *star = '\0';
+	pack_t *modPak = NULL;
+	fileInPack_t *modPf = NULL;
+	WasmPK3_MarkExactFile( cleanModel, &modPak, &modPf );
+	if ( !Q_stricmpn( cleanModel, "models/map_objects/", 19 ) || !Q_stricmpn( cleanModel, "models/mapobjects/", 18 ) ) {
+		char dirPrefix[MAX_QPATH];
+		Q_strncpyz( dirPrefix, cleanModel, sizeof( dirPrefix ) );
+		char *lastSlash = strrchr( dirPrefix, '/' );
+		if ( lastSlash ) {
+			*(lastSlash + 1) = '\0';
+			WasmPK3_MarkPrefixInMountedPaks( dirPrefix );
+		}
+	}
+	if ( modPak && modPf && WasmPK3_IsPakFileCached( modPak, modPf ) && Q_stristr( cleanModel, ".md3" ) ) {
+		void *modBuf = NULL;
+		int modLen = FS_ReadFile( cleanModel, &modBuf );
+		if ( modBuf && modLen >= (int)sizeof(md3Header_t) ) {
+			md3Header_t *hdr = (md3Header_t *)modBuf;
+			if ( LittleLong( hdr->ident ) == MD3_IDENT ) {
+				int numSurfs = LittleLong( hdr->numSurfaces );
+				int ofsSurf = LittleLong( hdr->ofsSurfaces );
+				for ( int s = 0; s < numSurfs && ofsSurf > 0 && ofsSurf + (int)sizeof(md3Surface_t) <= modLen; s++ ) {
+					md3Surface_t *surf = (md3Surface_t *)((byte *)modBuf + ofsSurf);
+					int numShaders = LittleLong( surf->numShaders );
+					int ofsShaders = LittleLong( surf->ofsShaders );
+					if ( ofsShaders > 0 && ofsSurf + ofsShaders + numShaders * (int)sizeof(md3Shader_t) <= modLen ) {
+						md3Shader_t *sh = (md3Shader_t *)((byte *)surf + ofsShaders);
+						for ( int k = 0; k < numShaders; k++ ) {
+							if ( sh[k].name[0] ) {
+								R_WasmCollectShaderFiles( sh[k].name, extraShaderText, WasmPK3_MarkImageOrSoundOrFile );
+							}
+						}
+					}
+					int step = LittleLong( surf->ofsEnd );
+					if ( step <= 0 ) break;
+					ofsSurf += step;
+				}
+			}
+		}
+		if ( modBuf ) {
+			FS_FreeFile( modBuf );
+		}
+	}
+}
+
+extern "C" const char *FS_WasmPlanDemoChunks(
+	const char *referencedSums,
+	const char *referencedNames,
+	const char *loadedSums,
+	const char *loadedNames,
+	const char *mapName,
+	const gameState_t *gs
+) {
+	static char s_planJson[65536];
+	Com_Memset( s_planNeedChunks, 0, sizeof( s_planNeedChunks ) );
+	g_numWasmPendingMountArchives = 0;
+	g_wasmPlanningMode = qtrue;
+	FS_WasmPrepareDemoPaks( referencedSums, referencedNames, loadedSums, loadedNames, mapName );
+	g_wasmPlanningMode = qfalse;
+
+	// 1. Mark any pending (not yet mounted) custom archives or mounted custom (!base_init) archives
+	for ( int i = 0; i < g_numWasmPendingMountArchives; i++ ) {
+		WasmPk3Archive *arch = g_wasmPendingMountArchives[i];
+		if ( !arch || arch->size == 0 ) continue;
+		WasmPK3_EnsurePlanBitmaps( arch );
+		if ( arch->size <= 24 * 1024 * 1024 ) {
+			WasmPK3_MarkArchiveChunkRange( arch, 0, arch->num_chunks - 1 );
+		} else {
+			unsigned long cdChunk = arch->cd_offset / WASM_PK3_CHUNK_SIZE;
+			WasmPK3_MarkArchiveChunkRange( arch, cdChunk, arch->num_chunks - 1 );
+		}
+	}
+	for ( searchpath_t *sp = fs_searchpaths; sp; sp = sp->next ) {
+		if ( !sp->pack ) continue;
+		WasmPk3Archive *arch = WasmPK3_FindArchive( sp->pack->pakFilename );
+		if ( arch && !arch->base_init ) {
+			WasmPK3_EnsurePlanBitmaps( arch );
+			if ( arch->size <= 24 * 1024 * 1024 ) {
+				WasmPK3_MarkArchiveChunkRange( arch, 0, arch->num_chunks - 1 );
+			} else if ( sp->pack->buildBuffer ) {
+				for ( int i = 0; i < sp->pack->numfiles; i++ ) {
+					fileInPack_t *pf = &sp->pack->buildBuffer[i];
+					if ( pf->name && !Q_stricmpn( pf->name, "shaders/", 8 ) ) {
+						unsigned long cStart = 0, cEnd = 0;
+						WasmPk3Archive *a = NULL;
+						if ( WasmPK3_GetPakFileChunks( sp->pack, pf, &a, &cStart, &cEnd ) ) {
+							WasmPK3_MarkArchiveChunkRange( a, cStart, cEnd );
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Collect cached custom .shader text from non-base mounted PK3s
+	char *extraShaderText = NULL;
+	size_t extraShaderLen = 0;
+	for ( searchpath_t *sp = fs_searchpaths; sp; sp = sp->next ) {
+		if ( !sp->pack || !sp->pack->buildBuffer ) continue;
+		WasmPk3Archive *arch = WasmPK3_FindArchive( sp->pack->pakFilename );
+		if ( !arch || arch->base_init ) continue;
+		for ( int i = 0; i < sp->pack->numfiles; i++ ) {
+			fileInPack_t *pf = &sp->pack->buildBuffer[i];
+			if ( pf->name && !Q_stricmpn( pf->name, "shaders/", 8 ) && Q_stristr( pf->name, ".shader" ) ) {
+				if ( WasmPK3_IsPakFileCached( sp->pack, pf ) ) {
+					void *shBuf = NULL;
+					int shLen = FS_ReadFile( pf->name, &shBuf );
+					if ( shBuf && shLen > 0 ) {
+						char *grown = (char *)realloc( extraShaderText, extraShaderLen + (size_t)shLen + 2 );
+						if ( grown ) {
+							extraShaderText = grown;
+							memcpy( extraShaderText + extraShaderLen, shBuf, (size_t)shLen );
+							extraShaderLen += (size_t)shLen;
+							extraShaderText[extraShaderLen++] = '\n';
+							extraShaderText[extraShaderLen] = '\0';
+						}
+					}
+					if ( shBuf ) FS_FreeFile( shBuf );
+				}
+			}
+		}
+	}
+
+	// 3. Map BSP, lightmaps, levelshot, and BSP lumps (LUMP_SHADERS, LUMP_FOGS, LUMP_ENTITIES)
+	qboolean bspReady = (g_numWasmPendingMountArchives == 0) ? qtrue : qfalse;
+	if ( mapName && mapName[0] ) {
+		WasmPK3_MarkImageOrSoundOrFile( va( "levelshots/%s", mapName ) );
+		WasmPK3_MarkPrefixInMountedPaks( va( "maps/%s/", mapName ) );
+		char bspPath[MAX_QPATH];
+		Com_sprintf( bspPath, sizeof( bspPath ), "maps/%s.bsp", mapName );
+		pack_t *bspPak = NULL;
+		fileInPack_t *bspPf = NULL;
+		WasmPK3_MarkExactFile( bspPath, &bspPak, &bspPf );
+		if ( !bspPak || !bspPf || !WasmPK3_IsPakFileCached( bspPak, bspPf ) ) {
+			bspReady = qfalse;
+		} else {
+			void *bspBuf = NULL;
+			int bspLen = FS_ReadFile( bspPath, &bspBuf );
+			if ( bspBuf && bspLen >= (int)sizeof(dheader_t) ) {
+				dheader_t *hdr = (dheader_t *)bspBuf;
+				int shOfs = LittleLong( hdr->lumps[LUMP_SHADERS].fileofs );
+				int shLen = LittleLong( hdr->lumps[LUMP_SHADERS].filelen );
+				if ( shOfs >= 0 && shLen > 0 && shOfs + shLen <= bspLen ) {
+					dshader_t *dsh = (dshader_t *)((byte *)bspBuf + shOfs);
+					int shCount = shLen / (int)sizeof(dshader_t);
+					for ( int i = 0; i < shCount; i++ ) {
+						R_WasmCollectShaderFiles( dsh[i].shader, extraShaderText, WasmPK3_MarkImageOrSoundOrFile );
+					}
+				}
+				int fogOfs = LittleLong( hdr->lumps[LUMP_FOGS].fileofs );
+				int fogLen = LittleLong( hdr->lumps[LUMP_FOGS].filelen );
+				if ( fogOfs >= 0 && fogLen > 0 && fogOfs + fogLen <= bspLen ) {
+					dfog_t *dfog = (dfog_t *)((byte *)bspBuf + fogOfs);
+					int fogCount = fogLen / (int)sizeof(dfog_t);
+					for ( int i = 0; i < fogCount; i++ ) {
+						R_WasmCollectShaderFiles( dfog[i].shader, extraShaderText, WasmPK3_MarkImageOrSoundOrFile );
+					}
+				}
+				int entOfs = LittleLong( hdr->lumps[LUMP_ENTITIES].fileofs );
+				int entLen = LittleLong( hdr->lumps[LUMP_ENTITIES].filelen );
+				if ( entOfs >= 0 && entLen > 0 && entOfs + entLen <= bspLen ) {
+					char *entCopy = (char *)malloc( (size_t)entLen + 1 );
+					if ( entCopy ) {
+						memcpy( entCopy, (const char *)bspBuf + entOfs, (size_t)entLen );
+						entCopy[entLen] = '\0';
+						const char *p = entCopy;
+						while ( 1 ) {
+							char *tok = COM_ParseExt( &p, qtrue );
+							if ( !tok[0] ) break;
+							if ( tok[0] == '{' ) {
+								while ( 1 ) {
+									char key[MAX_QPATH];
+									tok = COM_ParseExt( &p, qtrue );
+									if ( !tok[0] || tok[0] == '}' ) break;
+									Q_strncpyz( key, tok, sizeof( key ) );
+									tok = COM_ParseExt( &p, qfalse );
+									if ( !Q_stricmp( key, "model" ) && tok[0] && tok[0] != '*' ) {
+										WasmPK3_CollectModelFiles( tok, extraShaderText );
+									}
+								}
+							}
+						}
+						free( entCopy );
+					}
+				}
+			}
+			if ( bspBuf ) FS_FreeFile( bspBuf );
+		}
+	}
+
+	// 4. Configstrings from gamestate (CS_MODELS=298, CS_SOUNDS=811, CS_ICONS=1067, CS_PLAYERS=1131, CS_EFFECTS=1355)
+	WasmPK3_MarkPrefixInMountedPaks( "sound/items/" );
+	WasmPK3_MarkPrefixInMountedPaks( "sound/interface/" );
+	WasmPK3_MarkPrefixInMountedPaks( "sound/player/" );
+	WasmPK3_MarkPrefixInMountedPaks( "sound/effects/" );
+	WasmPK3_MarkPrefixInMountedPaks( "sound/weapons/" );
+	WasmPK3_MarkPrefixInMountedPaks( "sound/movers/switches/" );
+	WasmPK3_MarkPrefixInMountedPaks( "sound/movers/objects/" );
+	WasmPK3_MarkPrefixInMountedPaks( "sound/chars/protocol/misc/" );
+	if ( gs ) {
+		for ( int i = 1; i < MAX_MODELS; i++ ) {
+			int ofs = gs->stringOffsets[298 + i];
+			if ( ofs > 0 && gs->stringData[ofs] ) {
+				WasmPK3_CollectModelFiles( gs->stringData + ofs, extraShaderText );
+			}
+		}
+		for ( int i = 1; i < MAX_SOUNDS; i++ ) {
+			int ofs = gs->stringOffsets[811 + i];
+			if ( ofs > 0 && gs->stringData[ofs] && gs->stringData[ofs] != '*' ) {
+				WasmPK3_MarkImageOrSoundOrFile( gs->stringData + ofs );
+			}
+		}
+		for ( int i = 1; i < MAX_ICONS; i++ ) {
+			int ofs = gs->stringOffsets[1067 + i];
+			if ( ofs > 0 && gs->stringData[ofs] ) {
+				R_WasmCollectShaderFiles( gs->stringData + ofs, extraShaderText, WasmPK3_MarkImageOrSoundOrFile );
+			}
+		}
+		for ( int i = 0; i < MAX_CLIENTS; i++ ) {
+			int ofs = gs->stringOffsets[1131 + i];
+			if ( ofs > 0 && gs->stringData[ofs] ) {
+				const char *pinfo = gs->stringData + ofs;
+				const char *model = Info_ValueForKey( pinfo, "model" );
+				if ( model && model[0] ) {
+					char charName[64];
+					Q_strncpyz( charName, model, sizeof( charName ) );
+					char *slash = strchr( charName, '/' );
+					if ( slash ) *slash = '\0';
+					if ( charName[0] ) {
+						WasmPK3_MarkPrefixInMountedPaks( va( "models/players/%s/", charName ) );
+						WasmPK3_MarkPrefixInMountedPaks( va( "sound/chars/%s/", charName ) );
+					}
+				}
+			}
+		}
+		for ( int i = 1; i < MAX_FX; i++ ) {
+			int ofs = gs->stringOffsets[1355 + i];
+			if ( ofs > 0 && gs->stringData[ofs] && gs->stringData[ofs] != '*' ) {
+				const char *fx = gs->stringData + ofs;
+				char efxPath[MAX_QPATH];
+				if ( !Q_stricmpn( fx, "effects/", 8 ) ) {
+					COM_StripExtension( fx, efxPath, sizeof( efxPath ) );
+				} else {
+					char tmp[MAX_QPATH];
+					COM_StripExtension( fx, tmp, sizeof( tmp ) );
+					Com_sprintf( efxPath, sizeof( efxPath ), "effects/%s", tmp );
+				}
+				Q_strcat( efxPath, sizeof( efxPath ), ".efx" );
+				WasmPK3_MarkExactFile( efxPath, NULL, NULL );
+			}
+		}
+	}
+
+	if ( extraShaderText ) {
+		free( extraShaderText );
+	}
+
+	// 5. Serialize needed chunk spans as JSON
+	size_t pos = 0;
+	pos += (size_t)Com_sprintf(
+		s_planJson + pos,
+		sizeof( s_planJson ) - pos,
+		"{\"bspReady\":%d,\"mapName\":\"%s\",\"spans\":[",
+		bspReady ? 1 : 0,
+		(mapName && mapName[0]) ? mapName : ""
+	);
+	qboolean firstSpan = qtrue;
+	for ( int i = 0; i < g_numWasmPk3Archives; i++ ) {
+		if ( !s_planNeedChunks[i] ) continue;
+		WasmPk3Archive *arch = &g_wasmPk3Archives[i];
+		unsigned long c = 0;
+		while ( c < arch->num_chunks ) {
+			if ( !s_planNeedChunks[i][c] ) {
+				c++;
+				continue;
+			}
+			unsigned long spanStart = c;
+			unsigned long spanEnd = c;
+			while ( spanEnd + 1 < arch->num_chunks && s_planNeedChunks[i][spanEnd + 1] && (spanEnd - spanStart) < 15 ) {
+				spanEnd++;
+			}
+			if ( pos + 160 < sizeof( s_planJson ) ) {
+				pos += (size_t)Com_sprintf(
+					s_planJson + pos,
+					sizeof( s_planJson ) - pos,
+					"%s[\"%s\",%lu,%lu,%lu]",
+					firstSpan ? "" : ",",
+					arch->name,
+					spanStart,
+					spanEnd,
+					arch->size
+				);
+				firstSpan = qfalse;
+			}
+			c = spanEnd + 1;
+		}
+		free( s_planNeedChunks[i] );
+		s_planNeedChunks[i] = NULL;
+	}
+	if ( pos + 4 < sizeof( s_planJson ) ) {
+		Com_sprintf( s_planJson + pos, sizeof( s_planJson ) - pos, "]}" );
+	}
+	return s_planJson;
 }
 #endif
 

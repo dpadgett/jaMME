@@ -1954,79 +1954,47 @@ CL_InitCGame
 Should only be called by CL_StartHunkUsers
 ====================
 */
-void CL_InitCGame( void ) {
+void CL_InitCGame_Begin( void ) {
 	const char			*info;
 	const char			*mapname;
-//	int					t1, t2;
-	vmInterpret_t		interpret;
 
-//	t1 = Sys_Milliseconds();
-
-	// put away the console
 	Con_Close();
 
-	// find the current mapname
 	info = cl.gameState.stringData + cl.gameState.stringOffsets[ CS_SERVERINFO ];
 	mapname = Info_ValueForKey( info, "mapname" );
 	Com_sprintf( cl.mapname, sizeof( cl.mapname ), "maps/%s.bsp", mapname );
 
-	// load the dll or bytecode
-	if ( cl_connectedToPureServer != 0 ) {
-#if 0
-		// if sv_pure is set we only allow qvms to be loaded
-		interpret = VMI_COMPILED;
-#else //load the module type based on what the server is doing -rww
-		interpret = (vmInterpret_t)cl_connectedCGAME;
-#endif
-	}
-	else {
-		interpret = (vmInterpret_t)(int)Cvar_VariableValue( "vm_cgame" );
-	}
-
-	//ent, from q3mme: CaNaBiS, force a native binary first
-	interpret = VMI_NATIVE;
-
-//	cgvm = VM_Create("cgame", CL_CgameSystemCalls, interpret);
 	cgvm = VM_CreateLegacy(VM_CGAME, CL_CgameSystemCalls);
 	if ( !cgvm ) {
 		Com_Error( ERR_DROP, "VM_Create on cgame failed" );
 	}
 	cls.state = CA_LOADING;
+}
 
-	// init for this gamestate
-	// use the lastExecutedServerCommand instead of the serverCommandSequence
-	// otherwise server commands sent just before a gamestate are dropped
-	VM_Call( cgvm, CG_INIT, clc.serverMessageSequence, clc.lastExecutedServerCommand, clc.clientNum );
-
+void CL_InitCGame_Finish( void ) {
 	demoAutoInit();
 
-	// reset any CVAR_CHEAT cvars registered by cgame
 	if ( !clc.demoplaying && !cl_connectedToCheatServer )
 		Cvar_SetCheatState();
 
-	// we will send a usercmd this frame, which
-	// will cause the server to send us the first snapshot
 	cls.state = CA_PRIMED;
 
-//	t2 = Sys_Milliseconds();
-
-//	Com_Printf( "CL_InitCGame: %5.2f seconds\n", (t2-t1)/1000.0 );
-
-	// have the renderer touch all its images, so they are present
-	// on the card even if the driver does deferred loading
 	re.EndRegistration();
 
-	// make sure everything is paged in
-//	if (!Sys_LowPhysicalMemory()) 
 	{
 		Com_TouchMemory();
 	}
 
-	// clear anything that got printed
 	Con_ClearNotify ();
 #ifdef _DONETPROFILE_
 	ClReadProf().Reset();
 #endif
+}
+
+void CL_InitCGame( void ) {
+	CL_InitCGame_Begin();
+	VM_Call( cgvm, CG_INIT, clc.serverMessageSequence, clc.lastExecutedServerCommand, clc.clientNum );
+	CL_InitCGame_Finish();
 }
 
 

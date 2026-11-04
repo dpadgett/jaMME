@@ -1012,7 +1012,6 @@ void CL_PlayDemo_f( void ) {
 	} else if ( haveConvert ) {
 		char mmeName[MAX_OSPATH];
 
-		CL_ScanDemoTimeBounds( clc.demofile );
 		FS_FCloseFile( clc.demofile );
 		clc.demofile = 0;
 
@@ -4342,8 +4341,26 @@ void CL_ShowIP_f(void) {
 #endif
 
 qboolean g_jkJustResumed = qfalse;
+qboolean g_jkPreparingDemo = qfalse;
 void FX_Stop( void );
+void S_ClearSoundBuffer( void );
 qboolean CL_GetServerCommand( int serverCommandNumber );
+qboolean demoConvertBegin( const char *oldName, const char *newBaseName, qboolean smoothen );
+int demoConvertStep( int maxBytes );
+void demoConvertGetProgress( int *doneBytes, int *totalBytes );
+qboolean demoPlayBegin( const char *fileName, qboolean del );
+void CL_InitCGame_Begin( void );
+void CL_InitCGame_Finish( void );
+#ifdef __EMSCRIPTEN__
+extern "C" void CG_Init_Step1_MapAndSounds( int serverMessageNum, int serverCommandSequence, int clientNum );
+extern "C" void CG_Init_Step2_WorldMap( void );
+extern "C" void CG_Init_Step3_WeaponsAndModels( void );
+extern "C" void CG_Init_Step4_BeginClients( int *outTotal );
+extern "C" int CG_Init_Step4_NextClient( int *outDone, int *outTotal );
+extern "C" void CG_Init_Step5_Finish( void );
+extern "C" void S_ResetPrewarmSounds( void );
+extern "C" int S_PrewarmRegisteredSounds( int maxTimeMs, int *outDone, int *outTotal );
+#endif
 
 extern "C" {
 
@@ -4503,7 +4520,6 @@ EMSCRIPTEN_KEEPALIVE int JK_DemoLoad( const char *demoName ) {
 	if ( !checkFile ) {
 		return 0;
 	}
-	CL_ScanDemoTimeBounds( checkFile );
 	FS_FCloseFile( checkFile );
 	g_jkDemoCompleted = qfalse;
 	g_jkActiveRenderedFrames = 0;
@@ -4513,12 +4529,382 @@ EMSCRIPTEN_KEEPALIVE int JK_DemoLoad( const char *demoName ) {
 	return 1;
 }
 
+static int s_jkPrepareStage = 0;
+static float s_jkPreparePct = 0.0f;
+static char s_jkPrepareLabel[160] = "";
+static char s_jkPrepareStatusJson[256] = "";
+static char s_jkPrepareTestName[MAX_OSPATH] = "";
+static char s_jkPrepareDemoFileName[MAX_OSPATH] = "";
+static char s_jkPrepareMmeBase[MAX_OSPATH] = "";
+static char s_jkPrepareMmeFull[MAX_OSPATH] = "";
+static int s_jkPrepareClientsTotal = 0;
+
+extern qboolean demoIsMmeStreamActive( void );
+extern void demoSetMmeStream( qboolean active, const char *fileName, int fileSize, int startTime, int endTime, int totalFrames, int indexCount, const int *indexTriples );
+extern qboolean demoReadStreamInitialGamestate( gameState_t *outGs );
+
+EMSCRIPTEN_KEEPALIVE void JK_DemoSetMmeStream( int active, int fileSize, int startTime, int endTime, int totalFrames, int indexCount, const int *indexTriples ) {
+	demoSetMmeStream( active ? qtrue : qfalse, "mmedemos/current.mme", fileSize, startTime, endTime, totalFrames, indexCount, indexTriples );
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoPrepareBegin( const char *demoName ) {
+#ifdef __EMSCRIPTEN__
+	if ( !demoName || !demoName[0] ) {
+		return 0;
+	}
+	if ( strchr( demoName, ';' ) || strchr( demoName, '\n' ) || strchr( demoName, '\r' ) ||
+	     strchr( demoName, '"' ) || strchr( demoName, '\\' ) || strstr( demoName, ".." ) ) {
+		return 0;
+	}
+	char cleanArg[MAX_OSPATH];
+	Q_strncpyz( cleanArg, demoName, sizeof( cleanArg ) );
+	char *arg = cleanArg;
+	while ( *arg == '/' || *arg == '\\' ) arg++;
+	if ( !Q_stricmpn( arg, "base/", 5 ) || !Q_stricmpn( arg, "base\\", 5 ) ) arg += 5;
+	while ( *arg == '/' || *arg == '\\' ) arg++;
+	if ( !Q_stricmpn( arg, "demos/", 6 ) || !Q_stricmpn( arg, "demos\\", 6 ) ) arg += 6;
+	while ( *arg == '/' || *arg == '\\' ) arg++;
+	if ( !arg[0] ) {
+		return 0;
+	}
+	cvar_t *fs_game = Cvar_FindVar( "fs_game" );
+	if ( !fs_game ) {
+		return JK_DemoLoad( demoName );
+	}
+	demoCommandSmoothingEnable( qfalse );
+	qboolean haveConvert = (qboolean)( mme_demoConvert && mme_demoConvert->integer );
+	if ( haveConvert && ( !Q_stricmp( fs_game->string, "" ) || !Q_stricmp( fs_game->string, "base" ) || !Q_stricmp( fs_game->string, "mme" ) ) ) {
+		demoCommandSmoothingEnable( qtrue );
+	}
+	Q_strncpyz( s_jkPrepareTestName, arg, sizeof( s_jkPrepareTestName ) );
+	char *ext = s_jkPrepareTestName + strlen( s_jkPrepareTestName ) - 6;
+	if ( ( strlen( s_jkPrepareTestName ) > 6 ) && ( ext[0] == '.' ) && ( ( ext[1] == 'd' ) || ( ext[1] == 'D' ) ) && ( ( ext[2] == 'm' ) || ( ext[2] == 'M' ) ) && ( ext[3] == '_' ) ) {
+		Cvar_Set( "mme_demoExt", ext );
+		ext[0] = 0;
+	} else {
+		Cvar_Set( "mme_demoExt", "" );
+	}
+	Cvar_Set( "sv_killserver", "2" );
+	if ( clc.demofile ) {
+		FS_FCloseFile( clc.demofile );
+		clc.demofile = 0;
+	} else if ( clc.demoplaying ) {
+		demoStop();
+	}
+	S_ClearSoundBuffer();
+	g_jkDemoCompleted = qfalse;
+	g_jkActiveRenderedFrames = 0;
+	Cvar_Set( "cl_freezeDemo", "0" );
+	Cvar_Set( "mme_demoPaused", "0" );
+	Cvar_Set( "mme_demoFileName", s_jkPrepareTestName );
+
+	if ( demoIsMmeStreamActive() ) {
+		Com_sprintf( s_jkPrepareMmeBase, sizeof( s_jkPrepareMmeBase ), "mmedemos/%s", s_jkPrepareTestName );
+		Com_sprintf( s_jkPrepareMmeFull, sizeof( s_jkPrepareMmeFull ), "mmedemos/%s.mme", s_jkPrepareTestName );
+		g_jkPreparingDemo = qtrue;
+		s_jkPrepareStage = 2;
+		s_jkPreparePct = 0.48f;
+		Q_strncpyz( s_jkPrepareLabel, "Opening demo & mounting packs...", sizeof( s_jkPrepareLabel ) );
+		return 1;
+	}
+
+	Cvar_Set( "mme_demoExt", CL_WalkDemoExt( s_jkPrepareTestName, s_jkPrepareDemoFileName, &clc.demofile ) );
+	if ( !clc.demofile ) {
+		demoCommandSmoothingEnable( qfalse );
+		return 0;
+	}
+	if ( !haveConvert ) {
+		FS_FCloseFile( clc.demofile );
+		clc.demofile = 0;
+		s_jkPrepareStage = 0;
+		g_jkPreparingDemo = qfalse;
+		return JK_DemoLoad( demoName );
+	}
+	FS_FCloseFile( clc.demofile );
+	clc.demofile = 0;
+	Com_sprintf( s_jkPrepareMmeBase, sizeof( s_jkPrepareMmeBase ), "mmedemos/%s", s_jkPrepareTestName );
+	Com_sprintf( s_jkPrepareMmeFull, sizeof( s_jkPrepareMmeFull ), "mmedemos/%s.mme", s_jkPrepareTestName );
+	if ( !demoConvertBegin( s_jkPrepareDemoFileName, s_jkPrepareMmeBase, (qboolean)( mme_demoSmoothen && mme_demoSmoothen->integer ) ) ) {
+		s_jkPrepareStage = 0;
+		g_jkPreparingDemo = qfalse;
+		return JK_DemoLoad( demoName );
+	}
+	g_jkPreparingDemo = qtrue;
+	s_jkPrepareStage = 1;
+	s_jkPreparePct = 0.01f;
+	Q_strncpyz( s_jkPrepareLabel, "Indexing demo timeline (0%)...", sizeof( s_jkPrepareLabel ) );
+	return 1;
+#else
+	return JK_DemoLoad( demoName );
+#endif
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoPrepareStep( void ) {
+#ifdef __EMSCRIPTEN__
+	if ( !g_jkPreparingDemo || s_jkPrepareStage <= 0 ) {
+		g_jkPreparingDemo = qfalse;
+		s_jkPrepareStage = 0;
+		return 0;
+	}
+	if ( s_jkPrepareStage == 1 ) {
+		int stepRes = demoConvertStep( 524288 );
+		int doneBytes = 0, totalBytes = 0;
+		demoConvertGetProgress( &doneBytes, &totalBytes );
+		float frac = ( totalBytes > 0 ) ? ( (float)doneBytes / (float)totalBytes ) : 1.0f;
+		if ( frac < 0.0f ) frac = 0.0f;
+		if ( frac > 1.0f ) frac = 1.0f;
+		if ( stepRes > 0 ) {
+			s_jkPreparePct = 0.01f + frac * 0.44f;
+			Com_sprintf( s_jkPrepareLabel, sizeof( s_jkPrepareLabel ), "Indexing demo timeline (%d%%)...", (int)( frac * 100.0f ) );
+			return 1;
+		}
+		if ( stepRes < 0 ) {
+			g_jkPreparingDemo = qfalse;
+			s_jkPrepareStage = 0;
+			s_jkPreparePct = 1.0f;
+			return 0;
+		}
+		s_jkPrepareStage = 2;
+		s_jkPreparePct = 0.48f;
+		Q_strncpyz( s_jkPrepareLabel, "Opening demo & mounting packs...", sizeof( s_jkPrepareLabel ) );
+		return 1;
+	}
+	if ( s_jkPrepareStage == 2 ) {
+		if ( !demoPlayBegin( s_jkPrepareMmeFull, qfalse ) ) {
+			g_jkPreparingDemo = qfalse;
+			s_jkPrepareStage = 0;
+			s_jkPreparePct = 1.0f;
+			return 0;
+		}
+		CL_InitCGame_Begin();
+		s_jkPrepareStage = 3;
+		s_jkPreparePct = 0.54f;
+		Q_strncpyz( s_jkPrepareLabel, "Loading map collision & sounds...", sizeof( s_jkPrepareLabel ) );
+		return 1;
+	}
+	if ( s_jkPrepareStage == 3 ) {
+		CG_Init_Step1_MapAndSounds( clc.serverMessageSequence, clc.lastExecutedServerCommand, clc.clientNum );
+		s_jkPrepareStage = 4;
+		s_jkPreparePct = 0.62f;
+		Q_strncpyz( s_jkPrepareLabel, "Loading map geometry & lightmaps...", sizeof( s_jkPrepareLabel ) );
+		return 1;
+	}
+	if ( s_jkPrepareStage == 4 ) {
+		CG_Init_Step2_WorldMap();
+		s_jkPrepareStage = 5;
+		s_jkPreparePct = 0.74f;
+		Q_strncpyz( s_jkPrepareLabel, "Loading weapons & map models...", sizeof( s_jkPrepareLabel ) );
+		return 1;
+	}
+	if ( s_jkPrepareStage == 5 ) {
+		CG_Init_Step3_WeaponsAndModels();
+		s_jkPrepareClientsTotal = 0;
+		CG_Init_Step4_BeginClients( &s_jkPrepareClientsTotal );
+		s_jkPrepareStage = 6;
+		s_jkPreparePct = 0.82f;
+		Com_sprintf( s_jkPrepareLabel, sizeof( s_jkPrepareLabel ), "Loading player models (0/%d)...", s_jkPrepareClientsTotal );
+		return 1;
+	}
+	if ( s_jkPrepareStage == 6 ) {
+		int doneClients = 0, totalClients = 0;
+		int moreClients = CG_Init_Step4_NextClient( &doneClients, &totalClients );
+		if ( moreClients > 0 ) {
+			float cFrac = ( totalClients > 0 ) ? ( (float)doneClients / (float)totalClients ) : 1.0f;
+			s_jkPreparePct = 0.82f + cFrac * 0.10f;
+			Com_sprintf( s_jkPrepareLabel, sizeof( s_jkPrepareLabel ), "Loading player models (%d/%d)...", doneClients, totalClients );
+			return 1;
+		}
+		CG_Init_Step5_Finish();
+		CL_InitCGame_Finish();
+		cls.state = CA_ACTIVE;
+		Q_strncpyz( clc.demoName, s_jkPrepareTestName, sizeof( clc.demoName ) );
+		Q_strncpyz( g_jkLastDemoName, s_jkPrepareTestName, sizeof( g_jkLastDemoName ) );
+		if ( demoStartTime() > 0 ) s_jkDemoStartTimeMs = demoStartTime();
+		if ( demoEndTime() > 0 ) s_jkDemoEndTimeMs = demoEndTime();
+		if ( cl.gameState.stringOffsets[CS_SERVERINFO] ) {
+			const char *info = cl.gameState.stringData + cl.gameState.stringOffsets[CS_SERVERINFO];
+			const char *map = Info_ValueForKey( info, "mapname" );
+			if ( map && map[0] ) {
+				Q_strncpyz( g_jkLastMapName, map, sizeof( g_jkLastMapName ) );
+			}
+		}
+		CG_MME_SetSpeed( s_jkPlaybackSpeed );
+		CG_MME_SetPaused( 0 );
+		S_ResetPrewarmSounds();
+		s_jkPrepareStage = 7;
+		s_jkPreparePct = 0.93f;
+		Q_strncpyz( s_jkPrepareLabel, "Preparing audio effects...", sizeof( s_jkPrepareLabel ) );
+		return 1;
+	}
+	if ( s_jkPrepareStage == 7 ) {
+		int sndDone = 0, sndTotal = 1;
+		int moreSnd = S_PrewarmRegisteredSounds( 35, &sndDone, &sndTotal );
+		if ( moreSnd > 0 ) {
+			float sFrac = ( sndTotal > 0 ) ? ( (float)sndDone / (float)sndTotal ) : 1.0f;
+			s_jkPreparePct = 0.93f + sFrac * 0.06f;
+			Com_sprintf( s_jkPrepareLabel, sizeof( s_jkPrepareLabel ), "Preparing audio effects (%d%%)...", (int)( sFrac * 100.0f ) );
+			return 1;
+		}
+		S_ClearSoundBuffer();
+		com_frameTime = Com_Milliseconds();
+		g_jkPreparingDemo = qfalse;
+		s_jkPrepareStage = 0;
+		s_jkPreparePct = 1.0f;
+		Q_strncpyz( s_jkPrepareLabel, "Ready", sizeof( s_jkPrepareLabel ) );
+		return 0;
+	}
+	g_jkPreparingDemo = qfalse;
+	s_jkPrepareStage = 0;
+	return 0;
+#else
+	return 0;
+#endif
+}
+
+EMSCRIPTEN_KEEPALIVE const char *JK_DemoGetPrepareStatus( void ) {
+	Com_sprintf(
+		s_jkPrepareStatusJson,
+		sizeof( s_jkPrepareStatusJson ),
+		"{\"active\":%d,\"stage\":%d,\"pct\":%.4f,\"label\":\"%s\"}",
+		g_jkPreparingDemo ? 1 : 0,
+		s_jkPrepareStage,
+		s_jkPreparePct,
+		s_jkPrepareLabel
+	);
+	return s_jkPrepareStatusJson;
+}
+
+#ifdef __EMSCRIPTEN__
+extern "C" const char *FS_WasmPlanDemoChunks(
+	const char *referencedSums,
+	const char *referencedNames,
+	const char *loadedSums,
+	const char *loadedNames,
+	const char *mapName,
+	const gameState_t *gs
+);
+#endif
+
+EMSCRIPTEN_KEEPALIVE const char *JK_DemoPlanLoadChunks( const char *demoName ) {
+#ifdef __EMSCRIPTEN__
+	if ( !demoName || !demoName[0] ) {
+		return "{\"bspReady\":0,\"mapName\":\"\",\"spans\":[]}";
+	}
+	char cleanArg[MAX_OSPATH];
+	Q_strncpyz( cleanArg, demoName, sizeof( cleanArg ) );
+	char *arg = cleanArg;
+	while ( *arg == '/' || *arg == '\\' ) arg++;
+	if ( !Q_stricmpn( arg, "base/", 5 ) || !Q_stricmpn( arg, "base\\", 5 ) ) arg += 5;
+	while ( *arg == '/' || *arg == '\\' ) arg++;
+	if ( !Q_stricmpn( arg, "demos/", 6 ) || !Q_stricmpn( arg, "demos\\", 6 ) ) arg += 6;
+	while ( *arg == '/' || *arg == '\\' ) arg++;
+	if ( !arg[0] ) {
+		return "{\"bspReady\":0,\"mapName\":\"\",\"spans\":[]}";
+	}
+	char name[MAX_OSPATH], extension[32];
+	Com_sprintf( extension, sizeof( extension ), ".dm_%d", PROTOCOL_VERSION );
+	if ( strlen( arg ) >= strlen( extension ) && !Q_stricmp( arg + strlen( arg ) - strlen( extension ), extension ) ) {
+		Com_sprintf( name, sizeof( name ), "demos/%s", arg );
+	} else {
+		Com_sprintf( name, sizeof( name ), "demos/%s.dm_%d", arg, PROTOCOL_VERSION );
+	}
+	static gameState_t s_planGs;
+	static byte s_planMsgBuf[MAX_MSGLEN];
+	Com_Memset( &s_planGs, 0, sizeof( s_planGs ) );
+	s_planGs.dataCount = 1;
+	qboolean foundGs = qfalse;
+	if ( demoIsMmeStreamActive() && demoReadStreamInitialGamestate( &s_planGs ) ) {
+		foundGs = qtrue;
+	} else {
+		fileHandle_t f = 0;
+		FS_FOpenFileRead( name, &f, qtrue );
+		if ( !f ) {
+			return "{\"bspReady\":0,\"mapName\":\"\",\"spans\":[]}";
+		}
+		for ( int msgIdx = 0; msgIdx < 8 && !foundGs; msgIdx++ ) {
+			int seq = 0, cursize = 0;
+			if ( FS_Read( &seq, 4, f ) != 4 ) break;
+			if ( FS_Read( &cursize, 4, f ) != 4 ) break;
+			cursize = LittleLong( cursize );
+			if ( cursize <= 0 || cursize > MAX_MSGLEN ) break;
+			if ( FS_Read( s_planMsgBuf, cursize, f ) != cursize ) break;
+			msg_t msg;
+			MSG_Init( &msg, s_planMsgBuf, sizeof( s_planMsgBuf ) );
+			msg.cursize = cursize;
+			MSG_BeginReading( &msg );
+			(void)MSG_ReadLong( &msg ); // reliableAcknowledge
+			while ( msg.readcount <= msg.cursize ) {
+				int cmd = MSG_ReadByte( &msg );
+				if ( cmd == svc_EOF || cmd < 0 ) break;
+				if ( cmd == svc_nop ) continue;
+				if ( cmd == svc_serverCommand ) {
+					(void)MSG_ReadLong( &msg );
+					(void)MSG_ReadString( &msg );
+					continue;
+				}
+				if ( cmd == svc_gamestate ) {
+					foundGs = qtrue;
+					(void)MSG_ReadLong( &msg ); // serverCommandSequence
+					while ( 1 ) {
+						int gcmd = MSG_ReadByte( &msg );
+						if ( gcmd == svc_EOF || gcmd < 0 ) break;
+						if ( gcmd == svc_configstring ) {
+							int csNum = MSG_ReadShort( &msg );
+							char *csStr = MSG_ReadBigString( &msg );
+							if ( csNum >= 0 && csNum < MAX_CONFIGSTRINGS && csStr && csStr[0] ) {
+								int len = (int)strlen( csStr );
+								if ( s_planGs.dataCount + len + 1 < MAX_GAMESTATE_CHARS ) {
+									s_planGs.stringOffsets[csNum] = s_planGs.dataCount;
+									memcpy( s_planGs.stringData + s_planGs.dataCount, csStr, (size_t)len + 1 );
+									s_planGs.dataCount += len + 1;
+								}
+							}
+						} else if ( gcmd == svc_baseline ) {
+							int newnum = MSG_ReadBits( &msg, GENTITYNUM_BITS );
+							if ( newnum < 0 || newnum >= MAX_GENTITIES ) break;
+							entityState_t nullstate, es;
+							Com_Memset( &nullstate, 0, sizeof( nullstate ) );
+							Com_Memset( &es, 0, sizeof( es ) );
+							MSG_ReadDeltaEntity( &msg, &nullstate, &es, newnum );
+						} else {
+							break;
+						}
+					}
+					break;
+				}
+				break;
+			}
+		}
+		FS_FCloseFile( f );
+	}
+	if ( !foundGs ) {
+		return "{\"bspReady\":0,\"mapName\":\"\",\"spans\":[]}";
+	}
+	const char *systemInfo = s_planGs.stringData + s_planGs.stringOffsets[CS_SYSTEMINFO];
+	const char *serverInfo = s_planGs.stringData + s_planGs.stringOffsets[CS_SERVERINFO];
+	static char refSums[BIG_INFO_VALUE];
+	static char refNames[BIG_INFO_VALUE];
+	static char pakSums[BIG_INFO_VALUE];
+	static char pakNames[BIG_INFO_VALUE];
+	static char mapName[MAX_QPATH];
+	Q_strncpyz( refSums, Info_ValueForKey( systemInfo, "sv_referencedPaks" ), sizeof( refSums ) );
+	Q_strncpyz( refNames, Info_ValueForKey( systemInfo, "sv_referencedPakNames" ), sizeof( refNames ) );
+	Q_strncpyz( pakSums, Info_ValueForKey( systemInfo, "sv_paks" ), sizeof( pakSums ) );
+	Q_strncpyz( pakNames, Info_ValueForKey( systemInfo, "sv_pakNames" ), sizeof( pakNames ) );
+	Q_strncpyz( mapName, Info_ValueForKey( serverInfo, "mapname" ), sizeof( mapName ) );
+	return FS_WasmPlanDemoChunks( refSums, refNames, pakSums, pakNames, mapName, &s_planGs );
+#else
+	(void)demoName;
+	return "{\"bspReady\":1,\"mapName\":\"\",\"spans\":[]}";
+#endif
+}
+
 EMSCRIPTEN_KEEPALIVE int JK_DemoGetState( void ) {
 	return (int)cls.state;
 }
 
 EMSCRIPTEN_KEEPALIVE int JK_DemoIsPlaying( void ) {
-	return (clc.demoplaying && cls.state == CA_ACTIVE && g_jkActiveRenderedFrames >= 6) ? 1 : 0;
+	return (clc.demoplaying && cls.state == CA_ACTIVE && g_jkActiveRenderedFrames >= 1) ? 1 : 0;
 }
 
 EMSCRIPTEN_KEEPALIVE int JK_DemoIsReady( void ) {
@@ -4762,15 +5148,19 @@ EMSCRIPTEN_KEEPALIVE int JK_DemoSeekToMs( int targetOffsetMs ) {
 	}
 	int wasPaused = ( JK_DemoIsPaused() && !g_jkDemoCompleted ) ? 1 : 0;
 	g_jkDemoCompleted = qfalse;
+	S_ClearSoundBuffer();
 
 	if ( demoIsMMEPlaying() ) {
 #ifdef __EMSCRIPTEN__
+		g_jkDemoSeeking = qtrue;
 		CG_MME_SetTimeMs( targetOffsetMs );
+		g_jkDemoSeeking = qfalse;
 #else
 		demoSeek( targetOffsetMs );
 #endif
 		cl.serverTime = JK_DemoGetStartTimeMs() + targetOffsetMs;
 		FX_Stop();
+		S_ClearSoundBuffer();
 		JK_DemoSetPaused( wasPaused );
 		com_frameTime = Com_Milliseconds();
 		return JK_DemoGetCurrentTimeMs();
@@ -4922,6 +5312,7 @@ EMSCRIPTEN_KEEPALIVE int JK_DemoSeekToMs( int targetOffsetMs ) {
 	}
 
 	s_jkDemoSeekHitEof = qfalse;
+	S_ClearSoundBuffer();
 	Cvar_Set( "cl_freezeDemo", wasPaused ? "1" : "0" );
 	com_frameTime = Com_Milliseconds();
 	return JK_DemoGetCurrentTimeMs();

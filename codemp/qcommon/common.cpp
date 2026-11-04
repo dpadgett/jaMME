@@ -1609,6 +1609,12 @@ Com_Frame
 =================
 */
 void Com_Frame( void ) {
+#ifdef __EMSCRIPTEN__
+	extern qboolean g_jkPreparingDemo;
+	if ( g_jkPreparingDemo ) {
+		return;
+	}
+#endif
 
 try
 {
@@ -1658,6 +1664,9 @@ try
 		lastTime = com_frameTime;
 	}
 	msec = com_frameTime - lastTime;
+	if ( msec > 100 ) {
+		msec = 50;
+	}
 	IN_Frame();
 	Cbuf_Execute ();
 #else

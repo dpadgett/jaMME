@@ -48,6 +48,15 @@
     bypassCache: false,
     forceSoftwareRenderer: false,
     pendingCommands: [],
+    activeDemoLoadCount: 0,
+    loadProgress: {
+      stage: 'idle',
+      message: '',
+      loadedBytes: 0,
+      totalBytes: 0,
+      percent: 0,
+      updatedAt: 0,
+    },
     loadChain: Promise.resolve(true),
     metrics: {
       bootStartMs: BOOT_START_MS,
@@ -1563,6 +1572,50 @@
       if (!state.muted && typeof ctx.resume === 'function') {
         ctx.resume().catch(() => {});
       }
+      if (typeof ctx.createScriptProcessor === 'function' && !ctx.__jkScriptProcWrapped) {
+        ctx.__jkScriptProcWrapped = true;
+        const origCreateScriptProc = ctx.createScriptProcessor.bind(ctx);
+        ctx.createScriptProcessor = function () {
+          const node = origCreateScriptProc(...arguments);
+          let userCb = null;
+          Object.defineProperty(node, 'onaudioprocess', {
+            configurable: true,
+            enumerable: true,
+            get() {
+              return userCb;
+            },
+            set(fn) {
+              if (typeof fn !== 'function') {
+                userCb = null;
+                return;
+              }
+              userCb = function (audioProcessingEvent) {
+                try {
+                  const outBuf = audioProcessingEvent && audioProcessingEvent.outputBuffer;
+                  if (outBuf) {
+                    const numCh = outBuf.numberOfChannels || 0;
+                    for (let ch = 0; ch < numCh; ch++) {
+                      outBuf.getChannelData(ch).fill(0);
+                    }
+                  }
+                  if (
+                    state.paused ||
+                    state.seeking ||
+                    isPageHidden() ||
+                    (window.Module &&
+                      window.Module.Asyncify &&
+                      window.Module.Asyncify.state !== 0)
+                  ) {
+                    return;
+                  }
+                  fn.call(this, audioProcessingEvent);
+                } catch (_) {}
+              };
+            },
+          });
+          return node;
+        };
+      }
       return ctx;
     };
     WrappedAudioContext.prototype = OrigAudioContext.prototype;
@@ -1624,6 +1677,56 @@
   const origWinAddEventListener = window.addEventListener;
   const origDocAddEventListener = document.addEventListener;
 
+  function isPageHidden() {
+    return Boolean(
+      typeof document !== 'undefined' &&
+        (document.hidden || document.visibilityState === 'hidden')
+    );
+  }
+
+  function waitForPageVisible(extraDelayMs) {
+    const delay = typeof extraDelayMs === 'number' && extraDelayMs > 0 ? extraDelayMs : 0;
+    if (!isPageHidden()) {
+      return delay > 0 ? new Promise((r) => setTimeout(r, delay)) : Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        if (isPageHidden()) return;
+        settled = true;
+        document.removeEventListener('visibilitychange', finish);
+        window.removeEventListener('pageshow', finish);
+        window.removeEventListener('focus', finish);
+        if (delay > 0) {
+          setTimeout(resolve, delay);
+        } else {
+          resolve();
+        }
+      };
+      origDocAddEventListener.call(document, 'visibilitychange', finish);
+      origWinAddEventListener.call(window, 'pageshow', finish);
+      origWinAddEventListener.call(window, 'focus', finish);
+    });
+  }
+
+  async function waitWithVisibleTimeout(checkFn, intervalMs, maxVisibleMs, onTick) {
+    let visibleElapsed = 0;
+    while (visibleElapsed < maxVisibleMs) {
+      if (checkFn()) return true;
+      if (typeof onTick === 'function') {
+        try {
+          onTick(visibleElapsed, isPageHidden());
+        } catch (_) {}
+      }
+      await new Promise((r) => setTimeout(r, intervalMs));
+      if (!isPageHidden()) {
+        visibleElapsed += intervalMs;
+      }
+    }
+    return Boolean(checkFn());
+  }
+
   function wrapEventTargetAdd(origFn) {
     return function (type, listener, options) {
       if (
@@ -1638,11 +1741,25 @@
           type === 'wheel' ||
           type === 'mousewheel' ||
           type === 'blur' ||
-          type === 'focusout')
+          type === 'focusout' ||
+          type === 'focus' ||
+          type === 'focusin' ||
+          type === 'visibilitychange' ||
+          type === 'pagehide' ||
+          type === 'pageshow')
       ) {
         const wrapped = function (ev) {
-          if (type === 'blur' || type === 'focusout') {
-            // Never let canvas/window blur deactivate audio or pause demo
+          if (
+            type === 'blur' ||
+            type === 'focusout' ||
+            type === 'focus' ||
+            type === 'focusin' ||
+            type === 'visibilitychange' ||
+            type === 'pagehide' ||
+            type === 'pageshow'
+          ) {
+            // Never let Emscripten/SDL2 visibilitychange or blur invoke dynCall into Wasm
+            // during Asyncify or backgrounding; player.js manages visibility lifecycle cleanly.
             return;
           }
           if (shouldBlockSDLInput(ev)) {
@@ -1895,33 +2012,51 @@
     }
   }
 
+  async function fetchManifestWithRetry() {
+    if (!state.bypassCache) {
+      try {
+        const cachedRaw = localStorage.getItem(LS_MANIFEST_KEY);
+        if (cachedRaw) {
+          const parsed = JSON.parse(cachedRaw);
+          if (parsed && Array.isArray(parsed.pk3s) && parsed.pk3s.length > 0) {
+            window.__jkPk3Manifest = parsed;
+            return parsed;
+          }
+        }
+      } catch (_) {}
+    }
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (attempt > 0 || isPageHidden()) {
+        await waitForPageVisible(attempt * 250);
+      }
+      try {
+        const resp = await fetch('/base/manifest.json');
+        if (resp.ok) {
+          const data = await resp.json();
+          window.__jkPk3Manifest = data;
+          if (!state.bypassCache) {
+            try {
+              localStorage.setItem(LS_MANIFEST_KEY, JSON.stringify(data));
+            } catch (_) {}
+          }
+          return data;
+        }
+      } catch (_) {}
+    }
+    return window.__jkPk3Manifest || null;
+  }
+
   async function hydrateCacheFromIndexedDB() {
     if (state.bypassCache) {
       try {
         delete window.__jkPk3Manifest;
         localStorage.removeItem(LS_MANIFEST_KEY);
       } catch (_) {}
+      await fetchManifestWithRetry();
       return;
     }
     const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
-    // Kick off async manifest refresh in parallel if not already in localStorage
-    const manifestPromise = (async () => {
-      try {
-        const cachedRaw = localStorage.getItem(LS_MANIFEST_KEY);
-        if (cachedRaw) {
-          window.__jkPk3Manifest = JSON.parse(cachedRaw);
-          return;
-        }
-        const resp = await fetch('/base/manifest.json');
-        if (resp.ok) {
-          const data = await resp.json();
-          window.__jkPk3Manifest = data;
-          try {
-            localStorage.setItem(LS_MANIFEST_KEY, JSON.stringify(data));
-          } catch (_) {}
-        }
-      } catch (_) {}
-    })();
+    const manifestPromise = fetchManifestWithRetry();
 
     const db = await openCacheDB();
     if (db) {
@@ -1982,25 +2117,49 @@
 
   // Hooks called by C++ EM_JS in codemp/qcommon/files.cpp
   window.__jkPk3GetCachedCD = function (name, start, end, dst) {
-    if (state.bypassCache) return 0;
+    if (!window.Module || !window.Module.HEAPU8) return 0;
     const key = name + ':' + start + '-' + end;
-    const bytes = pk3CdCache.get(key);
-    if (!bytes || !window.Module || !window.Module.HEAPU8) return 0;
     const expected = end - start + 1;
-    const copyLen = Math.min(bytes.byteLength, expected);
-    window.Module.HEAPU8.set(bytes.subarray(0, copyLen), dst);
+    const bytes = pk3CdCache.get(key);
+    if (bytes) {
+      const copyLen = Math.min(bytes.byteLength, expected);
+      window.Module.HEAPU8.set(bytes.subarray(0, copyLen), dst);
+      state.pk3CacheHits++;
+      state.pk3CacheBytes += copyLen;
+      return copyLen;
+    }
+    const cStart = (start / WASM_PK3_CHUNK_SIZE) | 0;
+    const cEnd = (end / WASM_PK3_CHUNK_SIZE) | 0;
+    for (let c = cStart; c <= cEnd; c++) {
+      if (!pk3ChunkCache.has(name + ':' + c)) return 0;
+    }
+    const assembled = new Uint8Array(expected);
+    let written = 0;
+    for (let c = cStart; c <= cEnd && written < expected; c++) {
+      const chunk = pk3ChunkCache.get(name + ':' + c);
+      if (!chunk) return 0;
+      const chunkByteStart = c * WASM_PK3_CHUNK_SIZE;
+      const sliceStart = c === cStart ? start - chunkByteStart : 0;
+      const avail = chunk.byteLength - sliceStart;
+      if (avail <= 0) return 0;
+      const toCopy = Math.min(avail, expected - written);
+      assembled.set(chunk.subarray(sliceStart, sliceStart + toCopy), written);
+      written += toCopy;
+    }
+    if (written < expected) return 0;
+    pk3CdCache.set(key, assembled);
+    queueIdbChunkWrite('cd:' + key, assembled);
+    window.Module.HEAPU8.set(assembled, dst);
     state.pk3CacheHits++;
-    state.pk3CacheBytes += copyLen;
-    return copyLen;
+    state.pk3CacheBytes += expected;
+    return expected;
   };
 
   window.__jkPk3HasCachedChunk = function (name, chunkIdx) {
-    if (state.bypassCache) return false;
     return pk3ChunkCache.has(name + ':' + chunkIdx);
   };
 
   window.__jkPk3GetCachedChunk = function (name, chunkIdx, dst, maxLen) {
-    if (state.bypassCache) return 0;
     const key = name + ':' + chunkIdx;
     const bytes = pk3ChunkCache.get(key);
     if (!bytes || !window.Module || !window.Module.HEAPU8) return 0;
@@ -2034,7 +2193,282 @@
     }
   };
 
-  async function fetchAndValidateDemoBytes(nameOrUrl) {
+  const asyncChunkPrefetchInFlight = new Set();
+  window.__jkPk3PrefetchChunkAsync = function (name, chunkIdx, archSize) {
+    if (!name || typeof chunkIdx !== 'number' || chunkIdx < 0) return;
+    const key = name + ':' + chunkIdx;
+    if (pk3ChunkCache.has(key) || asyncChunkPrefetchInFlight.has(key)) return;
+    asyncChunkPrefetchInFlight.add(key);
+    fetchPk3SpanIntoCache(name, chunkIdx, chunkIdx, archSize || 0)
+      .catch(() => {})
+      .finally(() => {
+        asyncChunkPrefetchInFlight.delete(key);
+      });
+  };
+
+  // =========================================================================
+  // Server-Side Converted .mme Progressive Streaming & HTTP Range Seeking
+  // =========================================================================
+  const MME_CHUNK_SIZE = 524288; // 512 KB chunks
+  const mmeStreamState = {
+    active: false,
+    streamId: 0,
+    baseUrl: '',
+    cacheKey: '',
+    fileSize: 0,
+    startTime: 0,
+    endTime: 0,
+    totalFrames: 0,
+    index: [],
+    chunks: new Map(),
+    inFlight: new Map(),
+    bgAbort: null,
+    rangeRequests: 0,
+    bytesTransferred: 0,
+  };
+  window.__jkMmeStreamState = mmeStreamState;
+
+  function stopMmeBackgroundStream() {
+    if (mmeStreamState.bgAbort) {
+      try {
+        mmeStreamState.bgAbort.abort();
+      } catch (_) {}
+      mmeStreamState.bgAbort = null;
+    }
+  }
+
+  function resetMmeStreamState() {
+    stopMmeBackgroundStream();
+    mmeStreamState.active = false;
+    mmeStreamState.streamId++;
+    mmeStreamState.baseUrl = '';
+    mmeStreamState.cacheKey = '';
+    mmeStreamState.fileSize = 0;
+    mmeStreamState.startTime = 0;
+    mmeStreamState.endTime = 0;
+    mmeStreamState.totalFrames = 0;
+    mmeStreamState.index = [];
+    mmeStreamState.chunks.clear();
+    mmeStreamState.inFlight.clear();
+    const mod = window.Module;
+    if (mod && state.engineStarted && typeof mod._JK_DemoSetMmeStream === 'function') {
+      try {
+        mod._JK_DemoSetMmeStream(0, 0, 0, 0, 0, 0, 0);
+      } catch (_) {}
+    }
+  }
+
+  function storeMmeRangeBytes(byteStart, bytes) {
+    if (!bytes || bytes.byteLength === 0) return;
+    let cIdx = Math.floor(byteStart / MME_CHUNK_SIZE);
+    let off = 0;
+    while (off < bytes.byteLength) {
+      const len = Math.min(MME_CHUNK_SIZE, bytes.byteLength - off);
+      const slice = new Uint8Array(len);
+      slice.set(bytes.subarray(off, off + len));
+      mmeStreamState.chunks.set(cIdx, slice);
+      off += len;
+      cIdx++;
+    }
+  }
+
+  async function fetchMmeChunkSpanAsync(cStart, cEnd, streamId, signal) {
+    if (!mmeStreamState.active || mmeStreamState.streamId !== streamId) return 0;
+    if (cStart === cEnd && !signal) {
+      if (mmeStreamState.chunks.has(cStart)) return 0;
+      if (mmeStreamState.inFlight.has(cStart)) {
+        return mmeStreamState.inFlight.get(cStart);
+      }
+    }
+    const byteStart = cStart * MME_CHUNK_SIZE;
+    let byteEnd = (cEnd + 1) * MME_CHUNK_SIZE - 1;
+    if (mmeStreamState.fileSize > 0 && byteEnd >= mmeStreamState.fileSize) {
+      byteEnd = mmeStreamState.fileSize - 1;
+    }
+    if (byteEnd < byteStart) return 0;
+    const doFetch = (async () => {
+      try {
+        const fetchOpts = {
+          headers: { Range: 'bytes=' + byteStart + '-' + byteEnd },
+        };
+        if (signal) fetchOpts.signal = signal;
+        const resp = await fetch(mmeStreamState.baseUrl + '&format=mme', fetchOpts);
+        if (resp.status !== 200 && resp.status !== 206) return 0;
+        const ab = await resp.arrayBuffer();
+        if (!mmeStreamState.active || mmeStreamState.streamId !== streamId) return 0;
+        const bytes = new Uint8Array(ab);
+        if (bytes.byteLength > 0) {
+          storeMmeRangeBytes(byteStart, bytes);
+          mmeStreamState.rangeRequests++;
+          mmeStreamState.bytesTransferred += bytes.byteLength;
+        }
+        return bytes.byteLength;
+      } catch (_) {
+        return 0;
+      } finally {
+        if (cStart === cEnd) {
+          mmeStreamState.inFlight.delete(cStart);
+        }
+      }
+    })();
+    if (cStart === cEnd && !signal) {
+      mmeStreamState.inFlight.set(cStart, doFetch);
+    }
+    return doFetch;
+  }
+
+  function startMmeBackgroundStream(streamId) {
+    stopMmeBackgroundStream();
+    if (!mmeStreamState.active || mmeStreamState.fileSize <= MME_CHUNK_SIZE) return;
+    const totalChunks = Math.ceil(mmeStreamState.fileSize / MME_CHUNK_SIZE);
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    mmeStreamState.bgAbort = ctrl;
+    let nextChunk = 1;
+    const CONCURRENCY = 2;
+    for (let w = 0; w < CONCURRENCY; w++) {
+      (async () => {
+        while (
+          mmeStreamState.active &&
+          mmeStreamState.streamId === streamId &&
+          nextChunk < totalChunks
+        ) {
+          while (isPageHidden() && mmeStreamState.active && mmeStreamState.streamId === streamId) {
+            await new Promise((r) => setTimeout(r, 200));
+          }
+          const cIdx = nextChunk++;
+          if (cIdx >= totalChunks || mmeStreamState.chunks.has(cIdx)) continue;
+          await fetchMmeChunkSpanAsync(
+            cIdx,
+            cIdx,
+            streamId,
+            ctrl ? ctrl.signal : undefined
+          );
+        }
+      })();
+    }
+  }
+
+  function applyMmeStreamToWasm(meta) {
+    const mod = window.Module;
+    if (!mod || !state.engineStarted || typeof mod._JK_DemoSetMmeStream !== 'function') {
+      return false;
+    }
+    const idxArr = Array.isArray(meta.index) ? meta.index : [];
+    const count = idxArr.length;
+    let ptr = 0;
+    try {
+      if (count > 0 && typeof mod._malloc === 'function') {
+        ptr = mod._malloc(count * 3 * 4);
+        if (ptr) {
+          const heap32 = mod.HEAP32 || new Int32Array(mod.HEAPU8.buffer);
+          const base = ptr >> 2;
+          for (let i = 0; i < count; i++) {
+            const row = idxArr[i];
+            heap32[base + i * 3 + 0] = row[0] | 0;
+            heap32[base + i * 3 + 1] = row[1] | 0;
+            heap32[base + i * 3 + 2] = row[2] | 0;
+          }
+        }
+      }
+      mod._JK_DemoSetMmeStream(
+        1,
+        meta.fileSize | 0,
+        meta.startTime | 0,
+        meta.endTime | 0,
+        meta.totalFrames | 0,
+        count | 0,
+        ptr | 0
+      );
+      return true;
+    } finally {
+      if (ptr && typeof mod._free === 'function') {
+        mod._free(ptr);
+      }
+    }
+  }
+
+  window.__jkMmeRead = function (pos, dst, len) {
+    if (!mmeStreamState.active || len <= 0 || !window.Module || !window.Module.HEAPU8) {
+      return 0;
+    }
+    let copied = 0;
+    let curPos = pos | 0;
+    while (copied < len) {
+      if (mmeStreamState.fileSize > 0 && curPos >= mmeStreamState.fileSize) {
+        break;
+      }
+      const cIdx = (curPos / MME_CHUNK_SIZE) | 0;
+      const cOff = curPos - cIdx * MME_CHUNK_SIZE;
+      let chunk = mmeStreamState.chunks.get(cIdx);
+      if (!chunk) {
+        // On-demand synchronous HTTP Range fetch for [cIdx .. cIdx+1] so streamed seeks
+        // to uncached timeline positions resolve in a single Range request.
+        const byteStart = cIdx * MME_CHUNK_SIZE;
+        let byteEnd = (cIdx + 2) * MME_CHUNK_SIZE - 1;
+        if (mmeStreamState.fileSize > 0 && byteEnd >= mmeStreamState.fileSize) {
+          byteEnd = mmeStreamState.fileSize - 1;
+        }
+        try {
+          const xhr = new XMLHttpRequest();
+          xhr.open(
+            'GET',
+            mmeStreamState.baseUrl + '&format=mme&start=' + byteStart + '&end=' + byteEnd,
+            false
+          );
+          xhr.responseType = 'arraybuffer';
+          try {
+            xhr.setRequestHeader('Range', 'bytes=' + byteStart + '-' + byteEnd);
+          } catch (_) {}
+          xhr.send(null);
+          if ((xhr.status === 200 || xhr.status === 206) && xhr.response) {
+            const bytes = new Uint8Array(xhr.response);
+            if (bytes.byteLength > 0) {
+              storeMmeRangeBytes(byteStart, bytes);
+              mmeStreamState.rangeRequests++;
+              mmeStreamState.bytesTransferred += bytes.byteLength;
+              chunk = mmeStreamState.chunks.get(cIdx);
+            }
+          }
+        } catch (_) {}
+      }
+      if (!chunk || cOff >= chunk.byteLength) {
+        break;
+      }
+      const take = Math.min(len - copied, chunk.byteLength - cOff);
+      window.Module.HEAPU8.set(chunk.subarray(cOff, cOff + take), dst + copied);
+      copied += take;
+      curPos += take;
+      // Trigger async lookahead for next chunk if not yet cached
+      if (!mmeStreamState.chunks.has(cIdx + 1)) {
+        fetchMmeChunkSpanAsync(cIdx + 1, cIdx + 1, mmeStreamState.streamId);
+      }
+    }
+    return copied;
+  };
+
+  function emitLoadProgress(stage, message, loadedBytes, totalBytes, percent) {
+    const detail = {
+      stage: String(stage || 'loading'),
+      message: String(message || ''),
+      loadedBytes: Number(loadedBytes || 0),
+      totalBytes: Number(totalBytes || 0),
+      percent:
+        typeof percent === 'number' && Number.isFinite(percent)
+          ? Math.max(0, Math.min(100, Math.round(percent)))
+          : 0,
+      updatedAt: Date.now(),
+    };
+    state.loadProgress = detail;
+    try {
+      window.dispatchEvent(new CustomEvent('jkdemo:progress', { detail }));
+    } catch (_) {}
+  }
+
+  function getLoadProgress() {
+    return Object.assign({}, state.loadProgress);
+  }
+
+  async function fetchAndValidateDemoBytes(nameOrUrl, onFirstMessageReady) {
     let customLabel = '';
     if (nameOrUrl && typeof nameOrUrl === 'object') {
       customLabel = String(nameOrUrl.label || nameOrUrl.title || '').trim();
@@ -2050,9 +2484,21 @@
     if (!fileName) return null;
 
     const cacheKey = isQueryUrl ? raw : fileName;
-    if (!state.bypassCache && demoByteCache.has(cacheKey)) {
+    if (demoByteCache.has(cacheKey)) {
       const cachedBytes = demoByteCache.get(cacheKey);
       if (cachedBytes && cachedBytes.byteLength >= 16) {
+        emitLoadProgress(
+          'demo',
+          'Demo ready from cache',
+          cachedBytes.byteLength,
+          cachedBytes.byteLength,
+          35
+        );
+        if (typeof onFirstMessageReady === 'function') {
+          try {
+            onFirstMessageReady(cachedBytes);
+          } catch (_) {}
+        }
         return {
           fileName,
           shortName: stripDemoExt(fileName),
@@ -2083,44 +2529,182 @@
       url = raw;
     }
 
-    try {
-      const resp = await fetch(url);
-      if (!resp.ok) return null;
-      let headerLabel = customLabel;
-      if (!headerLabel && resp.headers && typeof resp.headers.get === 'function') {
-        const cd = resp.headers.get('content-disposition') || '';
-        const m = cd.match(/filename="?([^";]+)"?/i);
-        if (m && m[1]) headerLabel = m[1].trim();
+    let firedFirstMsg = false;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (attempt > 0 || isPageHidden()) {
+        if (isPageHidden()) {
+          emitLoadProgress(
+            'demo',
+            'Paused in background — switch back to resume...',
+            0,
+            0,
+            Math.max(4, state.loadProgress.percent || 4)
+          );
+        } else if (attempt > 0) {
+          emitLoadProgress(
+            'demo',
+            `Resuming demo download (attempt ${attempt + 1})...`,
+            0,
+            0,
+            Math.max(4, state.loadProgress.percent || 4)
+          );
+        }
+        await waitForPageVisible(attempt * 300);
       }
-      const ab = await resp.arrayBuffer();
-      if (!ab || ab.byteLength < 16) return null;
-      const view = new DataView(ab);
-      const firstMsgLen = view.getInt32(4, true);
-      if (firstMsgLen <= 0 || firstMsgLen > 131072) {
-        return null;
+      try {
+        if (attempt === 0) {
+          emitLoadProgress('demo', 'Downloading demo...', 0, 0, 4);
+        }
+        const resp = await fetch(url);
+        if (!resp.ok) {
+          if (resp.status >= 400 && resp.status < 500 && resp.status !== 408 && resp.status !== 429) {
+            return null;
+          }
+          continue;
+        }
+        let headerLabel = customLabel;
+        if (!headerLabel && resp.headers && typeof resp.headers.get === 'function') {
+          const cd = resp.headers.get('content-disposition') || '';
+          const m = cd.match(/filename="?([^";]+)"?/i);
+          if (m && m[1]) headerLabel = m[1].trim();
+        }
+        const contentLen =
+          resp.headers && typeof resp.headers.get === 'function'
+            ? parseInt(resp.headers.get('content-length') || '0', 10) || 0
+            : 0;
+
+        let bytes = null;
+        if (resp.body && typeof resp.body.getReader === 'function') {
+          const reader = resp.body.getReader();
+          const chunks = [];
+          let received = 0;
+          let firstMsgLen = -1;
+          let lastProgressAt = 0;
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!value || value.byteLength === 0) continue;
+            chunks.push(value);
+            received += value.byteLength;
+
+            if (firstMsgLen === -1 && received >= 8) {
+              const hdr = new Uint8Array(8);
+              let hOff = 0;
+              for (const c of chunks) {
+                const take = Math.min(c.byteLength, 8 - hOff);
+                hdr.set(c.subarray(0, take), hOff);
+                hOff += take;
+                if (hOff >= 8) break;
+              }
+              firstMsgLen = new DataView(hdr.buffer).getInt32(4, true);
+            }
+
+            if (
+              !firedFirstMsg &&
+              firstMsgLen > 0 &&
+              firstMsgLen <= 131072 &&
+              received >= 8 + firstMsgLen
+            ) {
+              firedFirstMsg = true;
+              if (typeof onFirstMessageReady === 'function') {
+                const headLen = 8 + firstMsgLen;
+                const headBytes = new Uint8Array(headLen);
+                let off = 0;
+                for (const c of chunks) {
+                  const take = Math.min(c.byteLength, headLen - off);
+                  headBytes.set(c.subarray(0, take), off);
+                  off += take;
+                  if (off >= headLen) break;
+                }
+                try {
+                  onFirstMessageReady(headBytes);
+                } catch (_) {}
+              }
+            }
+
+            const now = Date.now();
+            if (now - lastProgressAt >= 80) {
+              lastProgressAt = now;
+              const mbLoaded = (received / (1024 * 1024)).toFixed(1);
+              if (contentLen > 0) {
+                const mbTotal = (contentLen / (1024 * 1024)).toFixed(1);
+                const ratio = Math.min(1, received / contentLen);
+                const pct = 4 + Math.round(ratio * 31);
+                emitLoadProgress(
+                  'demo',
+                  `Downloading demo (${mbLoaded} / ${mbTotal} MB)`,
+                  received,
+                  contentLen,
+                  pct
+                );
+              } else {
+                emitLoadProgress(
+                  'demo',
+                  `Downloading demo (${mbLoaded} MB)`,
+                  received,
+                  0,
+                  18
+                );
+              }
+            }
+          }
+
+          if (contentLen > 0 && received < contentLen) {
+            throw new Error(`Truncated demo stream (${received} / ${contentLen})`);
+          }
+
+          bytes = new Uint8Array(received);
+          let offset = 0;
+          for (const c of chunks) {
+            bytes.set(c, offset);
+            offset += c.byteLength;
+          }
+        } else {
+          const ab = await resp.arrayBuffer();
+          if (!ab) continue;
+          bytes = new Uint8Array(ab);
+        }
+
+        if (!bytes || bytes.byteLength < 16) continue;
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const firstMsgLen = view.getInt32(4, true);
+        if (firstMsgLen <= 0 || firstMsgLen > 131072) {
+          return null;
+        }
+        const mbFinal = (bytes.byteLength / (1024 * 1024)).toFixed(1);
+        emitLoadProgress(
+          'demo',
+          `Downloaded demo (${mbFinal} MB)`,
+          bytes.byteLength,
+          bytes.byteLength,
+          35
+        );
+        demoByteCache.set(cacheKey, bytes);
+        demoByteCache.set(fileName, bytes);
+        if (!state.bypassCache) {
+          openCacheDB().then((db) => {
+            if (!db) return;
+            try {
+              const tx = db.transaction(['demos'], 'readwrite');
+              tx.objectStore('demos').put({ name: cacheKey, data: bytes, ts: Date.now() });
+            } catch (_) {}
+          });
+        }
+        return {
+          fileName,
+          shortName: stripDemoExt(fileName),
+          sourceUrl: raw,
+          label: headerLabel || fileName,
+          bytes,
+        };
+      } catch (e) {
+        if (attempt === 3) {
+          return null;
+        }
       }
-      const bytes = new Uint8Array(ab);
-      demoByteCache.set(cacheKey, bytes);
-      demoByteCache.set(fileName, bytes);
-      if (!state.bypassCache) {
-        openCacheDB().then((db) => {
-          if (!db) return;
-          try {
-            const tx = db.transaction(['demos'], 'readwrite');
-            tx.objectStore('demos').put({ name: cacheKey, data: bytes, ts: Date.now() });
-          } catch (_) {}
-        });
-      }
-      return {
-        fileName,
-        shortName: stripDemoExt(fileName),
-        sourceUrl: raw,
-        label: headerLabel || fileName,
-        bytes,
-      };
-    } catch (e) {
-      return null;
     }
+    return null;
   }
 
   // Internal hook invoked by C++ CL_DemoCompleted via EM_JS
@@ -2162,7 +2746,12 @@
     for (let i = state.audioContexts.length - 1; i >= 0; i--) {
       const ctx = state.audioContexts[i];
       if (ctx && typeof ctx.state === 'string') {
-        if (!state.muted && ctx.state === 'suspended' && typeof ctx.resume === 'function') {
+        if (
+          !state.muted &&
+          !isPageHidden() &&
+          (ctx.state === 'suspended' || ctx.state === 'interrupted') &&
+          typeof ctx.resume === 'function'
+        ) {
           ctx.resume().catch(() => {});
         }
         if (!state.muted) return 'running';
@@ -2310,11 +2899,13 @@
       renderer: canvas && canvas.__jkUsingSoftwareWebGL ? 'software' : 'webgl',
       usingSoftwareRenderer: Boolean(canvas && canvas.__jkUsingSoftwareWebGL),
       forceSoftwareRenderer: Boolean(state.forceSoftwareRenderer),
+      loadProgress: Object.assign({}, state.loadProgress),
       metrics: Object.assign({}, state.metrics),
     };
   }
 
   function pause() {
+    state.autoPausedByVisibility = false;
     state.paused = true;
     callWasm('JK_DemoPause', 'number', [], []);
     try {
@@ -2325,8 +2916,12 @@
   }
 
   function resume() {
+    state.autoPausedByVisibility = false;
     state.paused = false;
     callWasm('JK_DemoResume', 'number', [], []);
+    if (!state.muted && !isPageHidden()) {
+      unlockAudio();
+    }
     try {
       window.dispatchEvent(new CustomEvent('jkdemo:resumed', { detail: { isPaused: false } }));
     } catch (_) {}
@@ -2518,40 +3113,165 @@
     }
   }
 
-  // Async parallel range prefetching for common PK3 chunks (_humanoid.gla + hot chunks)
-  async function fetchPk3SpanIntoCache(pk3Name, cStart, cEnd, archSize) {
+  const bgPrefetchControllers = new Set();
+  function abortBackgroundPrefetch() {
+    for (const ctrl of bgPrefetchControllers) {
+      try {
+        ctrl.abort();
+      } catch (_) {}
+    }
+    bgPrefetchControllers.clear();
+  }
+
+  // Async parallel range prefetching for PK3 chunks with retry & visibility awareness
+  async function fetchPk3SpanIntoCache(pk3Name, cStart, cEnd, archSize, signal) {
     const byteStart = cStart * WASM_PK3_CHUNK_SIZE;
     let byteEnd = (cEnd + 1) * WASM_PK3_CHUNK_SIZE;
     if (archSize && byteEnd > archSize) byteEnd = archSize;
     if (byteEnd <= byteStart) return 0;
-    try {
-      const resp = await fetch('/base/' + pk3Name, {
-        headers: { Range: 'bytes=' + byteStart + '-' + (byteEnd - 1) },
-      });
-      if (resp.status !== 200 && resp.status !== 206) return 0;
-      const ab = await resp.arrayBuffer();
-      const bytes = new Uint8Array(ab);
-      if (bytes.byteLength > 0) {
-        window.__jkPk3OnRangeFetched(pk3Name, byteStart, byteEnd - 1, bytes);
+    const maxAttempts = signal ? 1 : 4;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (signal && signal.aborted) return 0;
+      if (attempt > 0 || isPageHidden()) {
+        if (signal) return 0;
+        await waitForPageVisible(attempt * 250);
       }
-      return bytes.byteLength;
-    } catch (_) {
-      return 0;
+      try {
+        const fetchOpts = {
+          headers: { Range: 'bytes=' + byteStart + '-' + (byteEnd - 1) },
+        };
+        if (signal) fetchOpts.signal = signal;
+        const resp = await fetch('/base/' + pk3Name, fetchOpts);
+        if (resp.status !== 200 && resp.status !== 206) {
+          if (resp.status >= 400 && resp.status < 500 && resp.status !== 408 && resp.status !== 429) {
+            return 0;
+          }
+          continue;
+        }
+        const ab = await resp.arrayBuffer();
+        const bytes = new Uint8Array(ab);
+        if (bytes.byteLength > 0) {
+          window.__jkPk3OnRangeFetched(pk3Name, byteStart, byteEnd - 1, bytes);
+        }
+        return bytes.byteLength;
+      } catch (_) {
+        if (signal && signal.aborted) return 0;
+      }
     }
+    return 0;
   }
 
-  async function prefetchCommonChunksAsync() {
-    if (state.bypassCache) return;
+  async function fetchPk3CdIntoCache(p) {
+    if (!p || !p.name || !p.size || typeof p.cd_offset !== 'number' || !p.cd_size) return 0;
+    const start = p.cd_offset;
+    const end = p.size - 1;
+    if (end < start) return 0;
+    const cdKey = p.name + ':' + start + '-' + end;
+    if (pk3CdCache.has(cdKey)) return 0;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (attempt > 0 || isPageHidden()) {
+        await waitForPageVisible(attempt * 250);
+      }
+      try {
+        const resp = await fetch('/base/' + p.name, {
+          headers: { Range: 'bytes=' + start + '-' + end },
+        });
+        if (resp.status !== 200 && resp.status !== 206) continue;
+        const ab = await resp.arrayBuffer();
+        const bytes = new Uint8Array(ab);
+        if (bytes.byteLength > 0) {
+          pk3CdCache.set(cdKey, bytes);
+          queueIdbChunkWrite('cd:' + cdKey, bytes);
+          return bytes.byteLength;
+        }
+      } catch (_) {}
+    }
+    return 0;
+  }
+
+  let startupCorePrefetchPromise = null;
+  function prefetchStartupCoreAssetsAsync() {
+    if (startupCorePrefetchPromise) return startupCorePrefetchPromise;
+    startupCorePrefetchPromise = (async () => {
+      const manifest = window.__jkPk3Manifest || (await fetchManifestWithRetry());
+      const sizeMap = new Map();
+      const cdTasks = [];
+      if (manifest && Array.isArray(manifest.pk3s)) {
+        for (const p of manifest.pk3s) {
+          if (!p || !p.name) continue;
+          if (p.size) sizeMap.set(p.name, p.size);
+          const isBase =
+            typeof p.base_init === 'boolean'
+              ? p.base_init
+              : /^assets[0-3]\.pk3$/i.test(p.name);
+          if (isBase && p.size > 0 && typeof p.cd_offset === 'number') {
+            const cdKey = p.name + ':' + p.cd_offset + '-' + (p.size - 1);
+            if (!pk3CdCache.has(cdKey)) {
+              cdTasks.push(() => fetchPk3CdIntoCache(p));
+            }
+          }
+        }
+      }
+
+      // The 11 startup chunks accessed during Com_Init() + JK_DemoPrewarmAssets():
+      // assets0: [2], assets1: [1180, [1188,1189], 1205, [1208,1209], 1347, 2487], assets2: [4], assets3: [35]
+      const startupSpans = [
+        { pk3Name: 'assets0.pk3', cStart: 2, cEnd: 2 },
+        { pk3Name: 'assets1.pk3', cStart: 1180, cEnd: 1180 },
+        { pk3Name: 'assets1.pk3', cStart: 1188, cEnd: 1189 },
+        { pk3Name: 'assets1.pk3', cStart: 1205, cEnd: 1205 },
+        { pk3Name: 'assets1.pk3', cStart: 1208, cEnd: 1209 },
+        { pk3Name: 'assets1.pk3', cStart: 1347, cEnd: 1347 },
+        { pk3Name: 'assets1.pk3', cStart: 2487, cEnd: 2487 },
+        { pk3Name: 'assets2.pk3', cStart: 4, cEnd: 4 },
+        { pk3Name: 'assets3.pk3', cStart: 35, cEnd: 35 },
+      ];
+      const spanTasks = [];
+      for (const s of startupSpans) {
+        let missing = false;
+        for (let c = s.cStart; c <= s.cEnd; c++) {
+          if (!pk3ChunkCache.has(s.pk3Name + ':' + c)) {
+            missing = true;
+            break;
+          }
+        }
+        if (missing) {
+          const archSize = sizeMap.get(s.pk3Name) || 0;
+          spanTasks.push(() =>
+            fetchPk3SpanIntoCache(s.pk3Name, s.cStart, s.cEnd, archSize)
+          );
+        }
+      }
+
+      const allTasks = cdTasks.concat(spanTasks);
+      if (allTasks.length === 0) return;
+
+      const CONCURRENCY = 6;
+      let cursor = 0;
+      const workers = [];
+      for (let w = 0; w < Math.min(CONCURRENCY, allTasks.length); w++) {
+        workers.push(
+          (async () => {
+            while (cursor < allTasks.length) {
+              const fn = allTasks[cursor++];
+              await fn();
+            }
+          })()
+        );
+      }
+      await Promise.all(workers);
+      flushIdbWriteQueue();
+    })();
+    return startupCorePrefetchPromise;
+  }
+
+  function populateCommonChunkTargets(byArchive, sizeMap) {
     const manifest = window.__jkPk3Manifest;
-    const sizeMap = new Map();
     if (manifest && Array.isArray(manifest.pk3s)) {
       for (const p of manifest.pk3s) {
         if (p && p.name && p.size) sizeMap.set(p.name, p.size);
       }
     }
-
-    // Always ensure _humanoid.gla, kyle, and common MP weapons/effects/sounds are in the prefetch target set
-    const byArchive = new Map();
     const addTarget = (pk3Name, cIdx) => {
       if (pk3ChunkCache.has(pk3Name + ':' + cIdx)) return;
       if (!byArchive.has(pk3Name)) byArchive.set(pk3Name, new Set());
@@ -2580,6 +3300,7 @@
       [2318, 2351], [2459, 2480], [2485, 2487],
     ]);
     addTargetRanges('assets2.pk3', [4]);
+    addTargetRanges('assets3.pk3', [35]);
     for (const key of hotChunkSet) {
       const sep = key.lastIndexOf(':');
       if (sep <= 0) continue;
@@ -2589,6 +3310,13 @@
         addTarget(pk3Name, cIdx);
       }
     }
+  }
+
+  async function prefetchCommonChunksAsync() {
+    if (state.bypassCache) return;
+    const sizeMap = new Map();
+    const byArchive = new Map();
+    populateCommonChunkTargets(byArchive, sizeMap);
 
     const spans = [];
     for (const [pk3Name, idxSet] of byArchive.entries()) {
@@ -2600,7 +3328,7 @@
         while (
           i + 1 < sorted.length &&
           sorted[i + 1] === cEnd + 1 &&
-          cEnd - cStart < 31
+          cEnd - cStart < 3
         ) {
           i++;
           cEnd = sorted[i];
@@ -2610,16 +3338,44 @@
       }
     }
 
-    // Run with bounded concurrency (6 parallel range fetches)
-    const CONCURRENCY = 6;
+    // Run with low background concurrency (2 parallel range fetches, <=1 MB each),
+    // pausing/aborting immediately while a demo load is active or page is hidden.
+    const CONCURRENCY = 2;
     let cursor = 0;
     const workers = [];
     for (let w = 0; w < Math.min(CONCURRENCY, spans.length); w++) {
       workers.push(
         (async () => {
           while (cursor < spans.length) {
+            while (state.activeDemoLoadCount > 0 || isPageHidden()) {
+              await new Promise((r) => setTimeout(r, 200));
+            }
+            if (cursor >= spans.length) break;
             const item = spans[cursor++];
-            await fetchPk3SpanIntoCache(item.pk3Name, item.cStart, item.cEnd, item.archSize);
+            let allCached = true;
+            for (let c = item.cStart; c <= item.cEnd; c++) {
+              if (!pk3ChunkCache.has(item.pk3Name + ':' + c)) {
+                allCached = false;
+                break;
+              }
+            }
+            if (allCached) continue;
+            const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+            if (ctrl) bgPrefetchControllers.add(ctrl);
+            try {
+              const got = await fetchPk3SpanIntoCache(
+                item.pk3Name,
+                item.cStart,
+                item.cEnd,
+                item.archSize,
+                ctrl ? ctrl.signal : undefined
+              );
+              if (got === 0 && ctrl && ctrl.signal.aborted) {
+                cursor = Math.max(0, cursor - 1);
+              }
+            } finally {
+              if (ctrl) bgPrefetchControllers.delete(ctrl);
+            }
           }
         })()
       );
@@ -2633,13 +3389,22 @@
     if (prewarmPromise) return prewarmPromise;
 
     prewarmPromise = (async () => {
-      const waitStart = Date.now();
-      while (!state.engineStarted && Date.now() - waitStart < 30000) {
+      await waitWithVisibleTimeout(
+        () => state.engineStarted && callWasm('JK_DemoIsReady', 'number', [], []) === 1,
+        40,
+        30000
+      );
+      if (!state.engineStarted) {
+        prewarmPromise = null;
+        return false;
+      }
+
+      let res = 0;
+      for (let attempt = 0; attempt < 25; attempt++) {
+        res = callWasm('JK_DemoPrewarmAssets', 'number', [], []);
+        if (res === 1) break;
         await new Promise((r) => setTimeout(r, 40));
       }
-      if (!state.engineStarted) return false;
-
-      const res = callWasm('JK_DemoPrewarmAssets', 'number', [], []);
       if (res === 1) {
         state.prewarmed = true;
         state.ready = true;
@@ -2654,10 +3419,159 @@
             new CustomEvent('jkdemo:prewarmed', { detail: getStartupMetrics() })
           );
         } catch (_) {}
+      } else {
+        prewarmPromise = null;
       }
       return state.prewarmed;
     })();
     return prewarmPromise;
+  }
+
+  async function executePlanPass(shortName, labelPrefix, basePct, spanPct, silentProgress, includeCommonChunks) {
+    const rawPlan = callWasm('JK_DemoPlanLoadChunks', 'string', ['string'], [shortName]);
+    if (!rawPlan && !includeCommonChunks) {
+      return { bspReady: 1, fetchedSpans: 0, fetchedBytes: 0, mapName: '' };
+    }
+    let plan = null;
+    if (rawPlan) {
+      try {
+        plan = JSON.parse(rawPlan);
+      } catch (_) {}
+    }
+    const rawSpans = plan && Array.isArray(plan.spans) ? plan.spans : [];
+    const mapName = String((plan && plan.mapName) || '');
+    const byArchive = new Map();
+    const sizeMap = new Map();
+
+    if (includeCommonChunks) {
+      populateCommonChunkTargets(byArchive, sizeMap);
+    }
+
+    for (const row of rawSpans) {
+      if (!Array.isArray(row) || row.length < 3) continue;
+      const pk3Name = String(row[0] || '');
+      const cStart = Number(row[1]);
+      const cEnd = Number(row[2]);
+      const archSize = Number(row[3] || 0);
+      if (!pk3Name || !Number.isFinite(cStart) || !Number.isFinite(cEnd) || cEnd < cStart) continue;
+      if (archSize > 0) sizeMap.set(pk3Name, archSize);
+      for (let c = cStart; c <= cEnd; c++) {
+        if (!pk3ChunkCache.has(pk3Name + ':' + c)) {
+          if (!byArchive.has(pk3Name)) byArchive.set(pk3Name, new Set());
+          byArchive.get(pk3Name).add(c);
+        }
+      }
+    }
+
+    const spans = [];
+    let totalEstimatedBytes = 0;
+    for (const [pk3Name, idxSet] of byArchive.entries()) {
+      const archSize = sizeMap.get(pk3Name) || 0;
+      const sorted = Array.from(idxSet).sort((a, b) => a - b);
+      let i = 0;
+      while (i < sorted.length) {
+        const subStart = sorted[i];
+        let subEnd = subStart;
+        while (
+          i + 1 < sorted.length &&
+          sorted[i + 1] === subEnd + 1 &&
+          subEnd - subStart < 31
+        ) {
+          i++;
+          subEnd = sorted[i];
+        }
+        const bStart = subStart * WASM_PK3_CHUNK_SIZE;
+        let bEnd = (subEnd + 1) * WASM_PK3_CHUNK_SIZE;
+        if (archSize > 0 && bEnd > archSize) bEnd = archSize;
+        const estBytes = Math.max(0, bEnd - bStart);
+        if (estBytes > 0) {
+          spans.push({ pk3Name, cStart: subStart, cEnd: subEnd, archSize, estBytes });
+          totalEstimatedBytes += estBytes;
+        }
+        i++;
+      }
+    }
+
+    if (spans.length === 0) {
+      return {
+        bspReady: Number(plan.bspReady || 0),
+        fetchedSpans: 0,
+        fetchedBytes: 0,
+        mapName,
+      };
+    }
+
+    let loadedBytes = 0;
+    const stageLabel = mapName ? `${labelPrefix} (${mapName})` : labelPrefix;
+    if (!silentProgress) {
+      const mbTotal = (totalEstimatedBytes / (1024 * 1024)).toFixed(1);
+      emitLoadProgress(
+        'assets',
+        `${stageLabel} (0.0 / ${mbTotal} MB)`,
+        0,
+        totalEstimatedBytes,
+        basePct
+      );
+    }
+
+    const CONCURRENCY = 6;
+    let cursor = 0;
+    const workers = [];
+    for (let w = 0; w < Math.min(CONCURRENCY, spans.length); w++) {
+      workers.push(
+        (async () => {
+          while (cursor < spans.length) {
+            const item = spans[cursor++];
+            const got = await fetchPk3SpanIntoCache(
+              item.pk3Name,
+              item.cStart,
+              item.cEnd,
+              item.archSize
+            );
+            loadedBytes += got > 0 ? got : item.estBytes;
+            if (!silentProgress && totalEstimatedBytes > 0) {
+              const clampedLoaded = Math.min(loadedBytes, totalEstimatedBytes);
+              const mbLoaded = (clampedLoaded / (1024 * 1024)).toFixed(1);
+              const mbTotal = (totalEstimatedBytes / (1024 * 1024)).toFixed(1);
+              const ratio = Math.min(1, clampedLoaded / totalEstimatedBytes);
+              const pct = basePct + Math.round(ratio * spanPct);
+              emitLoadProgress(
+                'assets',
+                `${stageLabel} (${mbLoaded} / ${mbTotal} MB)`,
+                clampedLoaded,
+                totalEstimatedBytes,
+                pct
+              );
+            }
+          }
+        })()
+      );
+    }
+    await Promise.all(workers);
+    flushIdbWriteQueue();
+    return {
+      bspReady: Number((plan && plan.bspReady) || 0),
+      fetchedSpans: spans.length,
+      fetchedBytes: loadedBytes,
+      mapName,
+    };
+  }
+
+  async function planAndPrefetchDemoChunks(shortName) {
+    if (!state.engineStarted) return;
+    // Up to 3 passes:
+    // Pass 1: Common MP chunks + custom PK3 central directories + BSP header & lumps + configstring models/sounds/players
+    // Pass 2: BSP textures/shaders & static models (once BSP chunks are in cache)
+    // Pass 3: Any textures referenced by custom PK3s mounted in Pass 2
+    for (let pass = 0; pass < 3; pass++) {
+      const label = pass === 0 ? 'Loading map & models' : 'Loading map textures & sounds';
+      const basePct = pass === 0 ? 35 : 58;
+      const spanPct = pass === 0 ? 23 : 20;
+      const res = await executePlanPass(shortName, label, basePct, spanPct, false, pass === 0);
+      if (res.bspReady === 1 && res.fetchedSpans === 0) {
+        break;
+      }
+    }
   }
 
   function getCacheStats() {
@@ -2740,26 +3654,146 @@
     };
 
     const runLoad = async () => {
+      state.activeDemoLoadCount = (state.activeDemoLoadCount || 0) + 1;
+      abortBackgroundPrefetch();
+      let earlyPeekPromise = null;
       try {
         const loadStartNow = typeof performance !== 'undefined' ? performance.now() : Date.now();
         state.metrics.demoLoadStartMs = Math.round(loadStartNow * 100) / 100;
         state.metrics.firstActiveFrameMs = 0;
         state.metrics.demoLoadDurationMs = 0;
+        emitLoadProgress('demo', 'Downloading demo...', 0, 0, 2);
 
-        const [demoData, latestAutoexec] = await Promise.all([
-          fetchAndValidateDemoBytes(nameOrUrl),
-          fetchAutoexecConfig(),
-        ]);
+        const onFirstMessageReady = (headBytes) => {
+          if (
+            !state.engineStarted ||
+            callWasm('JK_DemoIsReady', 'number', [], []) !== 1
+          ) {
+            return;
+          }
+          try {
+            writeDemoToFS('__peek.dm_26', headBytes);
+            earlyPeekPromise = executePlanPass(
+              '__peek',
+              'Prefetching map',
+              20,
+              15,
+              true
+            ).catch(() => {});
+          } catch (_) {}
+        };
+
+        let rawInput = nameOrUrl;
+        let customLabel = '';
+        if (rawInput && typeof rawInput === 'object') {
+          customLabel = String(rawInput.label || rawInput.title || '').trim();
+          rawInput = rawInput.url || rawInput.demo || rawInput.href || '';
+        }
+        const rawStr = typeof rawInput === 'string' ? rawInput.trim() : '';
+        const canUseMmeStream = isQueryDemoUrl(rawStr);
+        let usedMmeStream = false;
+        let mmeMetaPromise = null;
+        let activeStreamId = 0;
+        let demoData = null;
+        let latestAutoexec = null;
+
+        if (canUseMmeStream) {
+          const fileName = normalizeDemoFileName(rawStr);
+          const shortName = fileName ? stripDemoExt(fileName) : 'current';
+          const streamUrl =
+            rawStr.startsWith('http://') ||
+            rawStr.startsWith('https://') ||
+            rawStr.startsWith('/')
+              ? rawStr
+              : '/' + rawStr.replace(/^\.\//, '');
+          try {
+            stopMmeBackgroundStream();
+            activeStreamId = ++mmeStreamState.streamId;
+            const autoexecPromise = fetchAutoexecConfig();
+            const initPromise = fetch(streamUrl + '&format=mme_init');
+            mmeMetaPromise = fetch(streamUrl + '&format=mme_meta').then((r) =>
+              r && r.ok ? r.json() : null
+            );
+
+            const initResp = await initPromise;
+            if (initResp && initResp.ok) {
+              const initAb = await initResp.arrayBuffer();
+              const initBytes = new Uint8Array(initAb);
+              const hdrStr =
+                initBytes.byteLength >= 15
+                  ? String.fromCharCode.apply(null, initBytes.subarray(0, 15))
+                  : '';
+              if (hdrStr === 'jaMME 1.11 Demo') {
+                usedMmeStream = true;
+                mmeStreamState.active = true;
+                mmeStreamState.baseUrl = streamUrl;
+                mmeStreamState.cacheKey = rawStr;
+                mmeStreamState.fileSize = Math.max(initBytes.byteLength, 0x3fffffff);
+                mmeStreamState.startTime = 0;
+                mmeStreamState.endTime = 0;
+                mmeStreamState.totalFrames = 1;
+                mmeStreamState.index = [[15, 0, 0]];
+                mmeStreamState.chunks.clear();
+                mmeStreamState.inFlight.clear();
+                storeMmeRangeBytes(0, initBytes);
+                mmeStreamState.rangeRequests = 1;
+                mmeStreamState.bytesTransferred = initBytes.byteLength;
+                const kbInit = Math.round(initBytes.byteLength / 1024);
+                emitLoadProgress(
+                  'demo',
+                  `Streaming demo (${kbInit} KB initial buffer ready)...`,
+                  initBytes.byteLength,
+                  initBytes.byteLength,
+                  32
+                );
+                latestAutoexec = await autoexecPromise;
+                demoData = {
+                  fileName: fileName || 'current.dm_26',
+                  shortName: shortName || 'current',
+                  sourceUrl: rawStr,
+                  label: customLabel,
+                  bytes: null,
+                };
+              }
+            }
+          } catch (_) {
+            usedMmeStream = false;
+          }
+        }
+
+        if (!usedMmeStream) {
+          resetMmeStreamState();
+          [demoData, latestAutoexec] = await Promise.all([
+            fetchAndValidateDemoBytes(nameOrUrl, onFirstMessageReady),
+            fetchAutoexecConfig(),
+          ]);
+        }
         if (!demoData) {
+          emitLoadProgress('error', 'Failed to download demo', 0, 0, 0);
           return false;
         }
 
-        // Wait until engine is initialized if called during boot
-        const bootWaitStart = Date.now();
-        while (!state.engineStarted && Date.now() - bootWaitStart < 30000) {
-          await new Promise((r) => setTimeout(r, 50));
+        // Wait until engine is initialized if called during boot (visibility-aware timeout)
+        await waitWithVisibleTimeout(
+          () => state.engineStarted && callWasm('JK_DemoIsReady', 'number', [], []) === 1,
+          50,
+          45000,
+          (_elapsed, hidden) => {
+            emitLoadProgress(
+              'engine',
+              hidden
+                ? 'Paused in background — switch back to resume...'
+                : 'Initializing 3D engine...',
+              0,
+              0,
+              36
+            );
+          }
+        );
+        if (!state.engineStarted) {
+          emitLoadProgress('error', 'Engine initialization timed out', 0, 0, 0);
+          return false;
         }
-        if (!state.engineStarted) return false;
 
         // If prewarming is currently in flight, wait for it so assets are ready
         if (prewarmPromise && !state.prewarmed) {
@@ -2768,21 +3802,68 @@
           } catch (_) {}
         }
 
-        const asyncWaitStart = Date.now();
-        while (
-          window.Module &&
-          window.Module.Asyncify &&
-          (window.Module.Asyncify.state !== 0 || window.Module.Asyncify.currData) &&
-          Date.now() - asyncWaitStart < 15000
-        ) {
-          await new Promise((r) => setTimeout(r, 25));
-        }
+        await waitWithVisibleTimeout(
+          () =>
+            !(
+              window.Module &&
+              window.Module.Asyncify &&
+              (window.Module.Asyncify.state !== 0 || window.Module.Asyncify.currData)
+            ),
+          25,
+          15000
+        );
 
         if (latestAutoexec) {
           writeConfigToFS('autoexec.cfg', latestAutoexec);
           execCommand('execq autoexec.cfg');
         }
-        writeDemoToFS(demoData.fileName, demoData.bytes);
+        if (usedMmeStream) {
+          applyMmeStreamToWasm({
+            fileSize: mmeStreamState.fileSize,
+            startTime: 0,
+            endTime: 0,
+            totalFrames: 1,
+            index: [[15, 0, 0]],
+          });
+          // Plan & download map/model PK3 chunks immediately while mme_meta finishes on the server!
+          await planAndPrefetchDemoChunks(demoData.shortName);
+          emitLoadProgress('demo', 'Finalizing demo keyframe index...', 0, 0, 76);
+          const meta = mmeMetaPromise ? await mmeMetaPromise.catch(() => null) : null;
+          if (!meta || !meta.fileSize || !Array.isArray(meta.index)) {
+            emitLoadProgress('error', 'Failed to load demo keyframe index', 0, 0, 0);
+            return false;
+          }
+          mmeStreamState.fileSize = Number(meta.fileSize);
+          mmeStreamState.startTime = Number(meta.startTime || 0);
+          mmeStreamState.endTime = Number(meta.endTime || 0);
+          mmeStreamState.totalFrames = Number(meta.totalFrames || 1);
+          mmeStreamState.index = meta.index;
+          applyMmeStreamToWasm(meta);
+          startMmeBackgroundStream(activeStreamId);
+        } else {
+          writeDemoToFS(demoData.fileName, demoData.bytes);
+          if (earlyPeekPromise) {
+            try {
+              await earlyPeekPromise;
+            } catch (_) {}
+          }
+          await planAndPrefetchDemoChunks(demoData.shortName);
+        }
+
+        if (isPageHidden()) {
+          emitLoadProgress(
+            'init',
+            'Ready — switch back to start playback...',
+            0,
+            0,
+            78
+          );
+          await waitForPageVisible(50);
+        }
+
+        emitLoadProgress('init', 'Preparing demo playback (0%)...', 0, 0, 78);
+        await new Promise((r) => setTimeout(r, 0));
+
         decPending();
         const prevStatus = getStatus();
         const prevCompleted = prevStatus.demoCompletedCount;
@@ -2791,9 +3872,34 @@
         state.demoName = demoData.fileName;
         state.demoEnded = false;
         state.paused = false;
+        state.autoPausedByVisibility = false;
 
         callWasm('JK_DemoSetLoop', 'number', ['number'], [state.loop ? 1 : 0]);
-        callWasm('JK_DemoLoad', 'number', ['string'], [demoData.shortName]);
+        const prepStarted = callWasm('JK_DemoPrepareBegin', 'number', ['string'], [demoData.shortName]);
+        if (prepStarted === 1) {
+          let prepStepSafety = 0;
+          while (prepStepSafety < 4000) {
+            prepStepSafety++;
+            if (isPageHidden()) {
+              await waitForPageVisible(20);
+            }
+            const more = callWasm('JK_DemoPrepareStep', 'number', [], []);
+            const rawStatus = callWasm('JK_DemoGetPrepareStatus', 'string', [], []);
+            if (rawStatus) {
+              try {
+                const stObj = JSON.parse(rawStatus);
+                const subPct = Math.max(0, Math.min(1, Number(stObj.pct || 0)));
+                const overallPct = 78 + Math.round(subPct * 21);
+                const label = stObj.label || 'Preparing demo playback...';
+                emitLoadProgress('init', label, 0, 0, overallPct);
+              } catch (_) {}
+            }
+            if (!more) break;
+            await new Promise((r) => setTimeout(r, 0));
+          }
+        } else {
+          callWasm('JK_DemoLoad', 'number', ['string'], [demoData.shortName]);
+        }
 
         try {
           window.dispatchEvent(
@@ -2803,31 +3909,32 @@
           );
         } catch (_) {}
 
-        const pollStart = Date.now();
         let pollTicks = 0;
         const targetShort = demoData.shortName.toLowerCase();
-        while (Date.now() - pollStart < 40000 || pollTicks < 20) {
-          const st = getStatus();
-          if (st.demoCompletedCount > prevCompleted || st.demoEnded) {
-            updateUIControls();
-            return true;
-          }
-          if (
-            st.isPlaying &&
-            st.serverTime > 0 &&
-            st.frameCount >= startFrameCount + 6 &&
-            String(st.demoName || '').toLowerCase().includes(targetShort)
-          ) {
-            updateUIControls();
-            return true;
-          }
-          pollTicks++;
-          await new Promise((r) => setTimeout(r, 50));
-        }
+        await waitWithVisibleTimeout(
+          () => {
+            const st = getStatus();
+            if (st.demoCompletedCount > prevCompleted || st.demoEnded) return true;
+            if (
+              st.isPlaying &&
+              st.serverTime > 0 &&
+              st.frameCount >= startFrameCount + 1 &&
+              String(st.demoName || '').toLowerCase().includes(targetShort)
+            ) {
+              return true;
+            }
+            pollTicks++;
+            return false;
+          },
+          25,
+          40000
+        );
         const finalSt = getStatus();
+        emitLoadProgress('ready', 'Playing', 0, 0, 100);
         updateUIControls();
         return Boolean(finalSt.isPlaying || finalSt.demoCompletedCount > prevCompleted);
       } finally {
+        state.activeDemoLoadCount = Math.max(0, (state.activeDemoLoadCount || 1) - 1);
         decPending();
       }
     };
@@ -2871,9 +3978,14 @@
       return getCurrentTimeMs();
     }
     const clamped = Math.max(0, Math.round(num));
-    const res = callWasm('JK_DemoSeekToMs', 'number', ['number'], [clamped]);
-    updateUIControls();
-    return typeof res === 'number' ? res : getCurrentTimeMs();
+    state.seeking = true;
+    try {
+      const res = callWasm('JK_DemoSeekToMs', 'number', ['number'], [clamped]);
+      updateUIControls();
+      return typeof res === 'number' ? res : getCurrentTimeMs();
+    } finally {
+      state.seeking = false;
+    }
   }
 
   function seekToRatio(ratio) {
@@ -3050,6 +4162,70 @@
       });
       mo.observe(canvas, { attributes: true, attributeFilter: ['style'] });
     }
+
+    if (canvas) {
+      canvas.addEventListener(
+        'webglcontextlost',
+        (ev) => {
+          ev.preventDefault();
+        },
+        false
+      );
+      canvas.addEventListener(
+        'webglcontextrestored',
+        () => {
+          scheduleSync();
+        },
+        false
+      );
+    }
+
+    const handleVisibilityOrFocusChange = () => {
+      if (isPageHidden()) {
+        abortBackgroundPrefetch();
+        if (state.activeDemoLoadCount > 0 || state.pendingDemoLoads > 0) {
+          const cur = state.loadProgress || {};
+          if (cur.stage && cur.stage !== 'ready' && cur.stage !== 'idle') {
+            emitLoadProgress(
+              cur.stage,
+              'Paused in background — switch back to resume...',
+              cur.loadedBytes || 0,
+              cur.totalBytes || 0,
+              cur.percent || 4
+            );
+          }
+        } else if (state.engineStarted && !isPaused()) {
+          state.autoPausedByVisibility = true;
+          state.paused = true;
+          callWasm('JK_DemoPause', 'number', [], []);
+          updateUIControls();
+        }
+      } else {
+        if (state.autoPausedByVisibility) {
+          state.autoPausedByVisibility = false;
+          resume();
+        }
+        if (!state.muted) {
+          unlockAudio();
+          syncAudioContextGain();
+        }
+        scheduleSync();
+      }
+    };
+
+    origDocAddEventListener.call(document, 'visibilitychange', handleVisibilityOrFocusChange);
+    origWinAddEventListener.call(window, 'pagehide', handleVisibilityOrFocusChange);
+    origWinAddEventListener.call(window, 'pageshow', handleVisibilityOrFocusChange);
+    origWinAddEventListener.call(window, 'focus', handleVisibilityOrFocusChange);
+
+    const unlockOnGesture = () => {
+      if (!state.muted && !isPageHidden()) {
+        unlockAudio();
+      }
+    };
+    origWinAddEventListener.call(window, 'pointerdown', unlockOnGesture, { passive: true });
+    origWinAddEventListener.call(window, 'touchstart', unlockOnGesture, { passive: true });
+    origWinAddEventListener.call(window, 'keydown', unlockOnGesture, { passive: true });
   }
 
   function applyQueryConfig(searchStr) {
@@ -3151,6 +4327,7 @@
     getCacheStats,
     clearCache,
     getStartupMetrics,
+    getLoadProgress,
     onDemoComplete,
     onDemoEnded,
     getStatus,
@@ -3316,7 +4493,12 @@
         : 'GPU';
       const cacheLabel =
         st.pk3CacheHits > 0 ? ` | Cache: ${cacheMb} MB (${st.pk3CacheHits} hits)` : '';
-      statusBar.textContent = `Demo: ${st.demoName} | Time: ${formatTimeMMSS(st.currentTimeMs)}/${formatTimeMMSS(st.durationMs)} (${st.serverTime}ms) | Frame: ${st.frameCount} | Speed: ${st.speed}x | Renderer: ${rLabel} | Net: ${mb} MB (${st.pk3RangeRequests} reqs)${cacheLabel}`;
+      const prog = st.loadProgress;
+      const progLabel =
+        !st.isPlaying && prog && prog.message && prog.stage !== 'idle' && prog.stage !== 'ready'
+          ? `[${prog.percent}% ${prog.message}] | `
+          : '';
+      statusBar.textContent = `${progLabel}Demo: ${st.demoName} | Time: ${formatTimeMMSS(st.currentTimeMs)}/${formatTimeMMSS(st.durationMs)} (${st.serverTime}ms) | Frame: ${st.frameCount} | Speed: ${st.speed}x | Renderer: ${rLabel} | Net: ${mb} MB (${st.pk3RangeRequests} reqs)${cacheLabel}`;
     }, 250);
   }
 
@@ -3327,7 +4509,7 @@
 
     const canvas = document.getElementById('jk-canvas');
     const initialDims = resize();
-    const DEFAULT_ASSET_VERSION = '20261104c';
+    const DEFAULT_ASSET_VERSION = '20261104g';
     const cfg = window.JKDemoConfig || {};
     const rawScriptUrl = typeof cfg.scriptUrl === 'string' && cfg.scriptUrl ? cfg.scriptUrl : `/openjk.js?v=${DEFAULT_ASSET_VERSION}`;
     const scriptUrl = rawScriptUrl.includes('?') ? rawScriptUrl : `${rawScriptUrl}?v=${DEFAULT_ASSET_VERSION}`;
@@ -3337,7 +4519,7 @@
 
     const [bootDemoData, , autoexecText] = await Promise.all([
       state.preloadOnly ? Promise.resolve(null) : fetchAndValidateDemoBytes(state.lastDemoSource || state.demoName),
-      hydrateCacheFromIndexedDB(),
+      hydrateCacheFromIndexedDB().then(() => prefetchStartupCoreAssetsAsync()),
       fetchAutoexecConfig(wasmDir),
     ]);
     const bootShortName = bootDemoData ? bootDemoData.shortName : stripDemoExt(state.demoName);
@@ -3399,7 +4581,6 @@
     if (!state.preloadOnly) {
       const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
       state.metrics.demoLoadStartMs = Math.round(nowMs * 100) / 100;
-      engineArgs.push('+demo', bootShortName);
     }
 
     window.Module = {
@@ -3483,6 +4664,8 @@
         resize();
         if (state.preloadOnly) {
           prewarmEngineInBackground();
+        } else if (!state.demoLoadedOnce) {
+          loadDemo(state.lastDemoSource || state.demoName);
         }
         setTimeout(() => {
           resize();

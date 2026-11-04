@@ -1478,9 +1478,13 @@ static void CG_RegisterSounds( void ) {
 	Q_strncpyz(items, CG_ConfigString(CS_ITEMS), sizeof(items));
 
 	for ( i = 1 ; i < bg_numItems ; i++ ) {
+#ifdef __EMSCRIPTEN__
+		CG_RegisterItemSounds( i );
+#else
 		if ( items[ i ] == '1' || com_buildScript.integer ) {
 			CG_RegisterItemSounds( i );
 		}
+#endif
 	}
 
 	for ( i = 1 ; i < MAX_SOUNDS ; i++ ) {
@@ -1624,12 +1628,8 @@ CG_RegisterGraphics
 This function may execute for a couple of minutes with a slow disk.
 =================
 */
-static void CG_RegisterGraphics( void ) {
+static void CG_RegisterGraphics_Part1( void ) {
 	int			i;
-	int			breakPoint;
-	char		items[MAX_ITEMS+1];
-	const char	*terrainInfo;
-	int			terrainID;
 
 	static char		*sb_nums[11] = {
 		"gfx/2d/numbers/zero",
@@ -1923,6 +1923,14 @@ Ghoul2 Insert Start
 Ghoul2 Insert End
 */
 	memset( cg_weapons, 0, sizeof( cg_weapons ) );
+}
+
+static void CG_RegisterGraphics_Part2( void ) {
+	int			i;
+	int			breakPoint;
+	char		items[MAX_ITEMS+1];
+	const char	*terrainInfo;
+	int			terrainID;
 
 	// only register the items that the server says we need
 	Q_strncpyz(items, CG_ConfigString(CS_ITEMS), sizeof(items));
@@ -2179,6 +2187,11 @@ Ghoul2 Insert End
 	cgs.effects.rain = trap_FX_RegisterEffect("effects/rain");
 }
 
+static void CG_RegisterGraphics( void ) {
+	CG_RegisterGraphics_Part1();
+	CG_RegisterGraphics_Part2();
+}
+
 
 const char *CG_GetStringEdString(char *refSection, char *refName)
 {
@@ -2256,6 +2269,52 @@ void CG_BuildSpectatorString(void) {
 CG_RegisterClients
 ===================
 */
+static int s_cgClientLoadQueue[MAX_CLIENTS];
+static int s_cgClientLoadTotal = 0;
+static int s_cgClientLoadCursor = 0;
+
+void CG_Init_Step4_BeginClients( int *outTotal ) {
+	int i;
+	s_cgClientLoadTotal = 0;
+	s_cgClientLoadCursor = 0;
+	if ( cg.clientNum >= 0 && cg.clientNum < MAX_CLIENTS ) {
+		s_cgClientLoadQueue[s_cgClientLoadTotal++] = cg.clientNum;
+	}
+	for ( i = 0; i < MAX_CLIENTS; i++ ) {
+		const char *clientInfo;
+		if ( cg.clientNum == i ) {
+			continue;
+		}
+		clientInfo = CG_ConfigString( CS_PLAYERS + i );
+		if ( !clientInfo[0] ) {
+			continue;
+		}
+		s_cgClientLoadQueue[s_cgClientLoadTotal++] = i;
+	}
+	if ( outTotal ) {
+		*outTotal = s_cgClientLoadTotal;
+	}
+}
+
+int CG_Init_Step4_NextClient( int *outDone, int *outTotal ) {
+	if ( s_cgClientLoadCursor < s_cgClientLoadTotal ) {
+		int c = s_cgClientLoadQueue[s_cgClientLoadCursor++];
+		CG_LoadingClient( c );
+		CG_NewClientInfo( c, qfalse );
+	}
+	if ( outDone ) {
+		*outDone = s_cgClientLoadCursor;
+	}
+	if ( outTotal ) {
+		*outTotal = s_cgClientLoadTotal;
+	}
+	if ( s_cgClientLoadCursor >= s_cgClientLoadTotal ) {
+		CG_BuildSpectatorString();
+		return 0;
+	}
+	return 1;
+}
+
 static void CG_RegisterClients( void ) {
 	int		i;
 
@@ -3065,7 +3124,7 @@ Will perform callbacks to make the loading info screen update.
 =================
 */
 extern void trap_MME_RequestFeatures( void );
-void CG_Init( int serverMessageNum, int serverCommandSequence, int clientNum )
+void CG_Init_Step1_MapAndSounds( int serverMessageNum, int serverCommandSequence, int clientNum )
 {
 	static gitem_t *item;
 	char buf[64];
@@ -3272,14 +3331,18 @@ Ghoul2 Insert End
 	//[/TrueView]
 
 	CG_RegisterSounds();
+}
 
-//	CG_LoadingString( "graphics" );
+void CG_Init_Step2_WorldMap( void ) {
+	CG_RegisterGraphics_Part1();
+}
 
-	CG_RegisterGraphics();
+void CG_Init_Step3_WeaponsAndModels( void ) {
+	CG_RegisterGraphics_Part2();
+}
 
-//	CG_LoadingString( "clients" );
-
-	CG_RegisterClients();		// if low on memory, some clients will be deferred
+void CG_Init_Step5_Finish( void ) {
+	char buf[64];
 
 	CG_AssetCache();
 	CG_LoadHudMenu();      // load new hud stuff
@@ -3325,6 +3388,15 @@ Ghoul2 Insert End
 	trap_Cvar_VariableStringBuffer( "rate", buf, sizeof( buf ) );
 	if ( atoi( buf ) == 4000 )
 		CG_Printf( "^3WARNING: Default /rate value detected. Suggest typing /rate 25000 for a smoother connection!\n" );
+}
+
+void CG_Init( int serverMessageNum, int serverCommandSequence, int clientNum )
+{
+	CG_Init_Step1_MapAndSounds( serverMessageNum, serverCommandSequence, clientNum );
+	CG_Init_Step2_WorldMap();
+	CG_Init_Step3_WeaponsAndModels();
+	CG_RegisterClients();
+	CG_Init_Step5_Finish();
 }
 
 //makes sure returned string is in localized format
