@@ -165,6 +165,9 @@ const char	*cg_customDuelSoundNames[MAX_CUSTOM_DUEL_SOUNDS] =
 
 void CG_Disintegration(centity_t *cent, refEntity_t *ent);
 
+#define DEFAULT_FEMALE_SOUNDPATH "chars/mp_generic_female/misc"//"chars/tavion/misc"
+#define DEFAULT_MALE_SOUNDPATH "chars/mp_generic_male/misc"//"chars/kyle/misc"
+
 /*
 ================
 CG_CustomSound
@@ -277,6 +280,10 @@ sfxHandle_t	CG_CustomSound( int clientNum, const char *soundName ) {
 	{
 		if ( i < numCSounds && !strcmp( lSoundName, cg_customSoundNames[i] ) )
 		{
+			if ( !ci->sounds[i] ) {
+				const char *genPath = (ci->gender == GENDER_FEMALE) ? DEFAULT_FEMALE_SOUNDPATH : DEFAULT_MALE_SOUNDPATH;
+				ci->sounds[i] = trap_S_RegisterSound( va("sound/%s/%s", genPath, lSoundName + 1) );
+			}
 			return ci->sounds[i];
 		}
 		else if ( (cgs.gametype >= GT_TEAM || com_buildScript.integer) && i < numCSiegeSounds && !strcmp( lSoundName, bg_customSiegeSoundNames[i] ) )
@@ -863,11 +870,6 @@ void CG_LoadCISounds(clientInfo_t *ci, qboolean modelloaded) {
 	}
 
 	trap_S_ShutUp(qtrue);
-
-#ifdef __EMSCRIPTEN__
-	trap_S_ShutUp(qfalse);
-	return;
-#endif
 
 	for ( i = 0 ; i < MAX_CUSTOM_SOUNDS ; i++ ) {
 		s = cg_customSoundNames[i];

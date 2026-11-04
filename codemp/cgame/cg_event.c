@@ -657,7 +657,7 @@ void CG_PainEvent( centity_t *cent, int health ) {
 	char	*snd;
 
 	// don't do more than two pain sounds a second
-	if ( cg.time - cent->pe.painTime < 500 ) {
+	if ( cg.time >= cent->pe.painTime && cg.time - cent->pe.painTime < 500 ) {
 		return;
 	}
 

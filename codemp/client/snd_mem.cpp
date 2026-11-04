@@ -448,6 +448,10 @@ static int S_MP3Fill( openSound_t *open ) {
 	readSize = S_StreamRead( open, readSize, readStart );
 	if (readSize <= 0)
 		return 0;
+	if (open->filePos >= open->fileSize && readSize + bufLeft + MAD_BUFFER_GUARD <= (int)sizeof(mp3->buf)) {
+		memset(readStart + readSize, 0, MAD_BUFFER_GUARD);
+		readSize += MAD_BUFFER_GUARD;
+	}
 	mad_stream_buffer(&mp3->stream, (unsigned char *)mp3->buf, readSize + bufLeft);
 	mp3->stream.error = (mad_error)0;
 	return readSize;
@@ -643,6 +647,13 @@ static openSound_t *S_MP3Open( const char *fileName ) {
 	}
 	/* Reset to the beginning and finalize setting of values */
 	S_StreamSeek( open, 0 );
+	mp3->stream.sync = 0;
+	mp3->stream.next_frame = NULL;
+	mp3->stream.this_frame = NULL;
+	mp3->stream.buffer = NULL;
+	mp3->stream.bufend = NULL;
+	mp3->stream.error = (mad_error)0;
+	mp3->pcmLeft = 0;
 	mp3->frameSamples = 32 * MAD_NSBSAMPLES( &header );
 	open->totalSamples = mp3->frameSamples * mp3->frameCount;
 	open->rate = header.samplerate;

@@ -96,6 +96,15 @@ void S_SoundInfo_f(void) {
 	Com_Printf("----------------------\n");
 }
 
+static void S_SoundList_f(void) {
+	int i;
+	Com_Printf("----- Sound List (%d entries) -----\n", sfxEntryCount);
+	for (i = 1; i < sfxEntryCount; i++) {
+		Com_Printf("%4d: %s\n", i, sfxEntries[i].name);
+	}
+	Com_Printf("-----------------------------------\n");
+}
+
 
 
 /*
@@ -139,6 +148,8 @@ void S_Init(void) {
 	Cmd_AddCommand("play", S_Play_f);
 	Cmd_AddCommand("music", S_Music_f);
 	Cmd_AddCommand("soundinfo", S_SoundInfo_f);
+	Cmd_AddCommand("soundlist", S_SoundList_f);
+	Cmd_AddCommand("s_list", S_SoundList_f);
 	Cmd_AddCommand("soundstop", S_StopAllSounds);
 	
 	Com_Printf("------------------------------------\n");
@@ -175,6 +186,8 @@ void S_Shutdown( void ) {
 	Cmd_RemoveCommand("play");
 	Cmd_RemoveCommand("music");
 	Cmd_RemoveCommand("soundinfo");
+	Cmd_RemoveCommand("soundlist");
+	Cmd_RemoveCommand("s_list");
 	Cmd_RemoveCommand("soundstop");
 	AS_Free();
 }
