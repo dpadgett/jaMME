@@ -980,7 +980,10 @@
         e.stopPropagation();
         const currentHref = a.getAttribute('href') || href;
         const label = deriveDemoTitle(a);
-        openAndPlay(currentHref, label);
+        openAndPlay(currentHref, {
+          label,
+          unmuteOnUserGesture: Boolean(e && e.isTrusted),
+        });
       });
       a.insertAdjacentElement('afterend', btn);
       added++;
@@ -1020,18 +1023,30 @@
 
   async function openAndPlay(demoUrl, titleOrOpts) {
     let resolvedTitle = '';
+    let unmuteOnUserGesture = false;
     if (typeof titleOrOpts === 'string') {
       resolvedTitle = titleOrOpts.trim();
     } else if (titleOrOpts && typeof titleOrOpts === 'object') {
       resolvedTitle = String(titleOrOpts.label || titleOrOpts.title || '').trim();
+      unmuteOnUserGesture = Boolean(titleOrOpts.unmuteOnUserGesture);
     }
     if (demoUrl && typeof demoUrl === 'object') {
       if (!resolvedTitle) {
         resolvedTitle = String(demoUrl.label || demoUrl.title || '').trim();
       }
+      if (demoUrl.unmuteOnUserGesture) {
+        unmuteOnUserGesture = true;
+      }
       demoUrl = demoUrl.url || demoUrl.demo || demoUrl.href || '';
     }
     if (!demoUrl || typeof demoUrl !== 'string') return false;
+
+    if (unmuteOnUserGesture) {
+      const existingPlayer = getPlayer();
+      if (existingPlayer && typeof existingPlayer.unlockAudio === 'function') {
+        existingPlayer.unlockAudio();
+      }
+    }
 
     const card = createPiPDOM();
     pipState.open = true;
@@ -1067,6 +1082,9 @@
         title: pipState.currentDemoTitle,
         label: pipState.currentDemoTitle,
       });
+      if (unmuteOnUserGesture && player && typeof player.setMuted === 'function') {
+        player.setMuted(false);
+      }
       if (player && typeof player.setLoop === 'function') {
         player.setLoop(true);
       }

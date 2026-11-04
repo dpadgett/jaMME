@@ -6,6 +6,7 @@
 #include "snd_local.h"
 #include "snd_mix.h"
 
+extern qboolean s_soundMuted;
 static	mixSound_t		*mixSounds[SFX_SOUNDS];
 
 #ifdef __ANDROID__
@@ -274,6 +275,12 @@ static void S_MixChannel( mixChannel_t *ch, int speed, int count, int *output ) 
 		origin = s_listenOrigin;
 
 	S_MixSpatialize( origin, volume , &leftVol, &rightVol );
+#ifdef __EMSCRIPTEN__
+	if (s_soundMuted && !mixSounds[ch->handle]) {
+		ch->handle = 0;
+		return;
+	}
+#endif
 	sound = S_MixGetSound( ch->handle );
 
 	index = ch->index;
@@ -436,6 +443,11 @@ static void S_MixLoop( mixLoop_t *loop, const loopQueue_t *lq, int speed, int co
 
 	volume = s_volume->value * lq->volume;
 	S_MixSpatialize( lq->origin, volume, &leftVol, &rightVol );
+#ifdef __EMSCRIPTEN__
+	if (s_soundMuted && !mixSounds[loop->handle]) {
+		return;
+	}
+#endif
 	sound = S_MixGetSound( loop->handle );
 
 	index = loop->index;

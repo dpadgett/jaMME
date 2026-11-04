@@ -38,6 +38,10 @@ cvar_t *s_sdlMixSamps;
 /* The audio callback. All the magic happens here. */
 static int dmapos = 0;
 static int dmasize = 0;
+static SDL_AudioDeviceID dev;
+#ifdef __EMSCRIPTEN__
+static int s_lastAudioCallbackMs = 0;
+#endif
 
 /*
 ===============
@@ -67,23 +71,33 @@ static void SNDDMA_AudioCallback(void *userdata, Uint8 *stream, int len)
 			len2 = len - len1;
 		}
 		memcpy(stream, dma.buffer + pos, len1);
+#ifdef __EMSCRIPTEN__
+		memset(dma.buffer + pos, '\0', len1);
+#endif
 		if (len2 <= 0)
 			dmapos += (len1 / (dma.samplebits/8));
 		else  /* wraparound? */
 		{
 			memcpy(stream+len1, dma.buffer, len2);
+#ifdef __EMSCRIPTEN__
+			memset(dma.buffer, '\0', len2);
+#endif
 			dmapos = (len2 / (dma.samplebits/8));
 		}
 	}
 
-	if (dmapos >= dmasize)
+	if (dmapos >= dma.samples)
 		dmapos = 0;
+
+#ifdef __EMSCRIPTEN__
+	s_lastAudioCallbackMs = Sys_Milliseconds();
+#endif
 }
 
 static struct
 {
 	Uint16	enumFormat;
-	char		*stringFormat;
+	const char	*stringFormat;
 } formatToStringTable[ ] =
 {
 	{ AUDIO_U8,     "AUDIO_U8" },
@@ -91,7 +105,11 @@ static struct
 	{ AUDIO_U16LSB, "AUDIO_U16LSB" },
 	{ AUDIO_S16LSB, "AUDIO_S16LSB" },
 	{ AUDIO_U16MSB, "AUDIO_U16MSB" },
-	{ AUDIO_S16MSB, "AUDIO_S16MSB" }
+	{ AUDIO_S16MSB, "AUDIO_S16MSB" },
+	{ AUDIO_S32LSB, "AUDIO_S32LSB" },
+	{ AUDIO_S32MSB, "AUDIO_S32MSB" },
+	{ AUDIO_F32LSB, "AUDIO_F32LSB" },
+	{ AUDIO_F32MSB, "AUDIO_F32MSB" }
 };
 
 static int formatToStringTableSize = ARRAY_LEN( formatToStringTable );
@@ -104,7 +122,7 @@ SNDDMA_PrintAudiospec
 static void SNDDMA_PrintAudiospec(const char *str, const SDL_AudioSpec *spec)
 {
 	int		i;
-	char	*fmt = NULL;
+	const char	*fmt = NULL;
 
 	Com_Printf("%s:\n", str);
 
@@ -180,7 +198,7 @@ qboolean SNDDMA_Init(void)
 	else
 	{
 #ifdef __EMSCRIPTEN__
-		desired.samples = 2048;
+		desired.samples = 1024;
 #else
 		// just pick a sane default.
 		if (desired.freq <= 11025)
@@ -197,9 +215,10 @@ qboolean SNDDMA_Init(void)
 	desired.channels = (int) s_sdlChannels->value;
 	desired.callback = SNDDMA_AudioCallback;
 
-	if (SDL_OpenAudio(&desired, &obtained) == -1)
+	dev = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained, 0);
+	if (!dev)
 	{
-		Com_Printf("SDL_OpenAudio() failed: %s\n", SDL_GetError());
+		Com_Printf("SDL_OpenAudioDevice() failed: %s\n", SDL_GetError());
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
 		return qfalse;
 	}
@@ -232,8 +251,11 @@ qboolean SNDDMA_Init(void)
 	dma.speed = obtained.freq;
 	dmasize = (dma.samples * (dma.samplebits/8));
 	dma.buffer = (byte *)calloc(1, dmasize);
+#ifdef __EMSCRIPTEN__
+	s_lastAudioCallbackMs = Sys_Milliseconds();
+#endif
 	Com_Printf("Starting SDL audio callback...\n");
-	SDL_PauseAudio(0); // start callback.
+	SDL_PauseAudioDevice(dev, 0); // start callback.
 	Com_Printf("SDL audio initialized.\n");
 	snd_inited = qtrue;
 	return qtrue;
@@ -244,6 +266,20 @@ SNDDMA_GetDMAPos
 ===============
 */
 int SNDDMA_GetDMAPos(void) {
+#ifdef __EMSCRIPTEN__
+	if (snd_inited && dma.samples > 0 && dma.speed > 0 && s_lastAudioCallbackMs > 0) {
+		int elapsed = Sys_Milliseconds() - s_lastAudioCallbackMs;
+		if (elapsed > 0) {
+			int extraMonoSamples = (elapsed * dma.speed * dma.channels) / 1000;
+			int maxExtra = 1024 * dma.channels;
+			if (extraMonoSamples > maxExtra) {
+				extraMonoSamples = maxExtra;
+			}
+			extraMonoSamples &= ~(dma.channels - 1);
+			return (dmapos + extraMonoSamples) % dma.samples;
+		}
+	}
+#endif
 	return dmapos;
 }
 /*
@@ -253,8 +289,8 @@ SNDDMA_Shutdown
 */
 void SNDDMA_Shutdown(void) {
 	Com_Printf("Closing SDL audio device...\n");
-	SDL_PauseAudio(1);
-	SDL_CloseAudio();
+	SDL_PauseAudioDevice(dev, 1);
+	SDL_CloseAudioDevice(dev);
 	SDL_QuitSubSystem(SDL_INIT_AUDIO);
 	free(dma.buffer);
 	dma.buffer = NULL;
@@ -269,7 +305,7 @@ Send sound to device if buffer isn't really the dma buffer
 ===============
 */
 void SNDDMA_Submit(void) {
-	SDL_UnlockAudio();
+	SDL_UnlockAudioDevice(dev);
 }
 /*
 ===============
@@ -277,9 +313,9 @@ SNDDMA_BeginPainting
 ===============
 */
 void SNDDMA_BeginPainting (void) {
-	SDL_LockAudio();
+	SDL_LockAudioDevice(dev);
 }
 // (De)activates sound playback
 void SNDDMA_Activate(qboolean activate) {
-	SDL_PauseAudio(!activate);
+	SDL_PauseAudioDevice(dev, !activate);
 }

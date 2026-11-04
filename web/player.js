@@ -44,6 +44,7 @@
     engineStarted: false,
     prewarmed: false,
     preloadOnly: false,
+    demoLoadedOnce: false,
     bypassCache: false,
     forceSoftwareRenderer: false,
     pendingCommands: [],
@@ -85,6 +86,7 @@
   }
 
   function savePlayerPrefs() {
+    if (state.preloadOnly && !state.demoLoadedOnce) return;
     try {
       localStorage.setItem(
         LS_PREFS_KEY,
@@ -1566,8 +1568,8 @@
       window.webkitAudioContext = WrappedAudioContext;
     }
 
-    const unlockAudioOnGesture = function () {
-      if (state.muted) return;
+    const unlockAudioOnGesture = function (ev) {
+      if (state.muted && !(ev && ev.isTrusted)) return;
       for (const ctx of state.audioContexts) {
         if (ctx && ctx.state === 'suspended' && typeof ctx.resume === 'function') {
           ctx.resume().catch(() => {});
@@ -2307,6 +2309,17 @@
     return getSpeed();
   }
 
+  function unlockAudio() {
+    for (const ctx of state.audioContexts) {
+      if (!ctx) continue;
+      try {
+        if (typeof ctx.resume === 'function') {
+          ctx.resume().catch(() => {});
+        }
+      } catch (_) {}
+    }
+  }
+
   function syncAudioContextGain() {
     const effectiveGain = state.muted ? 0.0 : state.volume;
     for (const g of state.masterGains) {
@@ -2612,6 +2625,7 @@
   }
 
   function loadDemo(nameOrUrl) {
+    state.demoLoadedOnce = true;
     state.pendingDemoLoads = (state.pendingDemoLoads || 0) + 1;
     let decrementedPending = false;
     const decPending = () => {
@@ -2993,6 +3007,7 @@
     toggleMute,
     setMuted,
     isMuted,
+    unlockAudio,
     setVolume,
     getVolume,
     execCommand,

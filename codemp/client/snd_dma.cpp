@@ -110,10 +110,12 @@ void S_DMA_Update( float scale ) {
 		sane = 11;			// 85hz
 	}
 	ma = s_mixahead->value * dma.speed;
+#ifndef __EMSCRIPTEN__
 	op = 0.05f + sane*dma.speed*0.01f;
 	if (op < ma) {
 		ma = op;
 	}
+#endif
 
 	count = lastRead;
 	if (bufDone + count < ma) {

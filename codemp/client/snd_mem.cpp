@@ -112,6 +112,17 @@ static openSound_t *S_StreamOpen( const char *fileName, int dataSize ) {
 	int fileSize = 0;
 	openSound_t *open;
 
+#ifdef __EMSCRIPTEN__
+	void *memBuf = NULL;
+	fileSize = FS_ReadFile( fileName, &memBuf );
+	if ( fileSize <= 0 || !memBuf )
+		return 0;
+	open = (openSound_t *)Z_Malloc( sizeof( openSound_t ) + dataSize, TAG_SND_RAWDATA );
+	memset( open, 0, sizeof( openSound_t ) + dataSize );
+	open->fileSize = fileSize;
+	open->memData = (byte *)memBuf;
+	return open;
+#else
 	fileSize = FS_FOpenFileRead( fileName, &fileHandle, qtrue );
 	if ( fileSize <= 0 || fileHandle <= 0)
 		return 0;
@@ -120,6 +131,7 @@ static openSound_t *S_StreamOpen( const char *fileName, int dataSize ) {
 	open->fileSize = fileSize;
 	open->fileHandle = fileHandle;
 	return open;
+#endif
 }
 
 static int S_StreamRead( openSound_t *open, int size, void *data ) {
@@ -129,6 +141,14 @@ static int S_StreamRead( openSound_t *open, int size, void *data ) {
 		size = (open->fileSize - open->filePos);
 	if (size <= 0)
 		return 0;
+
+#ifdef __EMSCRIPTEN__
+	if ( open->memData ) {
+		Com_Memcpy( dataWrite, open->memData + open->filePos, size );
+		open->filePos += size;
+		return size;
+	}
+#endif
 
 	done = 0;
 	while( 1  ) {
@@ -179,10 +199,21 @@ static int S_StreamSeek( openSound_t *open, int pos ) {
 		pos = open->fileSize;
 	open->bufUsed = 0;
 	open->filePos = pos;
+#ifdef __EMSCRIPTEN__
+	if ( open->memData ) {
+		return 0;
+	}
+#endif
 	return FS_Seek( open->fileHandle, pos, FS_SEEK_SET );
 }
 
 static void S_StreamClose( openSound_t *open ) {
+#ifdef __EMSCRIPTEN__
+	if ( open->memData ) {
+		FS_FreeFile( open->memData );
+		open->memData = 0;
+	}
+#endif
 	if ( open->fileHandle > 0) {
 		FS_FCloseFile( open->fileHandle );
 		open->fileHandle = 0;
@@ -1311,34 +1342,6 @@ static openSound_t *S_FlacOpen( const char *fileName, FLAC__bool is_ogg ) {
 }
 #endif
 
-#ifdef __EMSCRIPTEN__
-static void S_WasmClose( openSound_t *open ) {
-	(void)open;
-}
-
-static int S_WasmSeek( struct openSound_s *open, int samples ) {
-	(void)open;
-	return samples;
-}
-
-static int S_WasmRead( openSound_t *open, qboolean stereo, int size, short *data ) {
-	int i;
-	(void)open;
-	if ( stereo ) {
-		for ( i = 0; i < size; i++ ) {
-			short v = (short)( i & 511 );
-			data[i * 2 + 0] = v;
-			data[i * 2 + 1] = v;
-		}
-	} else {
-		for ( i = 0; i < size; i++ ) {
-			data[i] = (short)( i & 511 );
-		}
-	}
-	return size;
-}
-#endif
-
 openSound_t *S_SoundOpen( const char *fileName ) {
 	const char *fileExt;
 
@@ -1346,18 +1349,6 @@ openSound_t *S_SoundOpen( const char *fileName ) {
 		Com_Printf("SoundOpen:Filename is empty\n" );
 		return 0;
 	}
-#ifdef __EMSCRIPTEN__
-	{
-		openSound_t *open = (openSound_t *)Z_Malloc( sizeof( openSound_t ), TAG_SND_RAWDATA );
-		memset( open, 0, sizeof( openSound_t ) );
-		open->rate = 22050;
-		open->totalSamples = 512;
-		open->read = S_WasmRead;
-		open->seek = S_WasmSeek;
-		open->close = S_WasmClose;
-		return open;
-	}
-#endif
 	fileExt = Q_strrchr( fileName, '.' );
 	if (!fileExt) {
 		Com_Printf("SoundOpen:File %s has no extension\n", fileName );

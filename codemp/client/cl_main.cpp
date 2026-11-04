@@ -4426,8 +4426,11 @@ EMSCRIPTEN_KEEPALIVE float JK_DemoSetSpeed( float rate ) {
 	return rate;
 }
 
+extern qboolean s_soundMuted;
+
 EMSCRIPTEN_KEEPALIVE int JK_DemoSetMuted( int muted ) {
 	g_jkIsMuted = muted ? qtrue : qfalse;
+	s_soundMuted = g_jkIsMuted;
 	if ( g_jkIsMuted ) {
 		Cvar_SetValue( "s_volume", 0.0f );
 		Cvar_SetValue( "s_musicVolume", 0.0f );

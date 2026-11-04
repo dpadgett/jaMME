@@ -71,6 +71,9 @@ typedef struct openSound_s {
 	int					bufUsed, bufPos;
 	fileHandle_t		fileHandle;
 	int					fileSize, filePos;
+#ifdef __EMSCRIPTEN__
+	byte				*memData;
+#endif
 
 	openSoundRead_t		read;
 	openSoundSeek_t		seek;
