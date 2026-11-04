@@ -41,6 +41,7 @@ static int dmasize = 0;
 static SDL_AudioDeviceID dev;
 #ifdef __EMSCRIPTEN__
 static int s_lastAudioCallbackMs = 0;
+static int s_lastDmaUpdateMs = 0;
 #endif
 
 /*
@@ -91,6 +92,7 @@ static void SNDDMA_AudioCallback(void *userdata, Uint8 *stream, int len)
 
 #ifdef __EMSCRIPTEN__
 	s_lastAudioCallbackMs = Sys_Milliseconds();
+	s_lastDmaUpdateMs = s_lastAudioCallbackMs;
 #endif
 }
 
@@ -188,7 +190,11 @@ qboolean SNDDMA_Init(void)
 		tmp = 16;
 
 	desired.freq = (int) s_sdlSpeed->value;
+#ifdef __EMSCRIPTEN__
+	if(!desired.freq) desired.freq = 44100;
+#else
 	if(!desired.freq) desired.freq = 22050;
+#endif
 	desired.format = ((tmp == 16) ? AUDIO_S16SYS : AUDIO_U8);
 
 	// I dunno if this is the best idea, but I'll give it a try...
@@ -198,7 +204,7 @@ qboolean SNDDMA_Init(void)
 	else
 	{
 #ifdef __EMSCRIPTEN__
-		desired.samples = 1024;
+		desired.samples = 512;
 #else
 		// just pick a sane default.
 		if (desired.freq <= 11025)
@@ -215,7 +221,11 @@ qboolean SNDDMA_Init(void)
 	desired.channels = (int) s_sdlChannels->value;
 	desired.callback = SNDDMA_AudioCallback;
 
+#ifdef __EMSCRIPTEN__
+	dev = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
+#else
 	dev = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained, 0);
+#endif
 	if (!dev)
 	{
 		Com_Printf("SDL_OpenAudioDevice() failed: %s\n", SDL_GetError());
@@ -235,6 +245,10 @@ qboolean SNDDMA_Init(void)
 	tmp = s_sdlMixSamps->value;
 	if (!tmp)
 		tmp = (obtained.samples * obtained.channels) * 10;
+#ifdef __EMSCRIPTEN__
+	if (tmp < 65536)
+		tmp = 65536;
+#endif
 
 	if (tmp & (tmp - 1)) { // not a power of two? Seems to confuse something.
 		int val = 1;
@@ -253,6 +267,7 @@ qboolean SNDDMA_Init(void)
 	dma.buffer = (byte *)calloc(1, dmasize);
 #ifdef __EMSCRIPTEN__
 	s_lastAudioCallbackMs = Sys_Milliseconds();
+	s_lastDmaUpdateMs = s_lastAudioCallbackMs;
 #endif
 	Com_Printf("Starting SDL audio callback...\n");
 	SDL_PauseAudioDevice(dev, 0); // start callback.
@@ -267,16 +282,24 @@ SNDDMA_GetDMAPos
 */
 int SNDDMA_GetDMAPos(void) {
 #ifdef __EMSCRIPTEN__
-	if (snd_inited && dma.samples > 0 && dma.speed > 0 && s_lastAudioCallbackMs > 0) {
-		int elapsed = Sys_Milliseconds() - s_lastAudioCallbackMs;
-		if (elapsed > 0) {
-			int extraMonoSamples = (elapsed * dma.speed * dma.channels) / 1000;
-			int maxExtra = 1024 * dma.channels;
-			if (extraMonoSamples > maxExtra) {
-				extraMonoSamples = maxExtra;
+	if (snd_inited && dma.samples > 0 && dma.speed > 0 && dma.channels > 0) {
+		int now = Sys_Milliseconds();
+		if (s_lastAudioCallbackMs > 0 && (now - s_lastAudioCallbackMs) <= 100) {
+			s_lastDmaUpdateMs = now;
+			return dmapos;
+		}
+		if (s_lastDmaUpdateMs <= 0) {
+			s_lastDmaUpdateMs = now;
+		}
+		int dt = now - s_lastDmaUpdateMs;
+		if (dt > 0) {
+			if (dt > 100) dt = 100;
+			int advance = (dt * dma.speed * dma.channels) / 1000;
+			advance &= ~(dma.channels - 1);
+			if (advance > 0) {
+				dmapos = (dmapos + advance) % dma.samples;
+				s_lastDmaUpdateMs = now;
 			}
-			extraMonoSamples &= ~(dma.channels - 1);
-			return (dmapos + extraMonoSamples) % dma.samples;
 		}
 	}
 #endif

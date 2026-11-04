@@ -1539,9 +1539,13 @@
       let ctx;
       if (arguments.length === 0) {
         try {
-          ctx = new OrigAudioContext({ sampleRate: 22050 });
+          ctx = new OrigAudioContext({ sampleRate: 44100, latencyHint: 'interactive' });
         } catch (_) {
-          ctx = new OrigAudioContext();
+          try {
+            ctx = new OrigAudioContext({ latencyHint: 'interactive' });
+          } catch (_2) {
+            ctx = new OrigAudioContext();
+          }
         }
       } else {
         ctx = new OrigAudioContext(...arguments);

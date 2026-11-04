@@ -61,10 +61,15 @@ void S_DMAClearBuffer( void ) {
 	if (dma.buffer)
 		Snd_Memset(dma.buffer, clear, dma.samples * dma.samplebits/8);
 	SNDDMA_Submit ();
+	dmaWrite = SNDDMA_GetDMAPos() >> (dma.channels - 1);
 }
 
 void S_DMAInit(void) {
+#ifdef __EMSCRIPTEN__
+	s_khz = Cvar_Get ("s_khz", "44", CVAR_ARCHIVE);
+#else
 	s_khz = Cvar_Get ("s_khz", "22", CVAR_ARCHIVE);
+#endif
 	s_mixahead = Cvar_Get ("s_mixahead", "0.2", CVAR_ARCHIVE);
 
 	dmaInit = SNDDMA_Init();
@@ -109,13 +114,31 @@ void S_DMA_Update( float scale ) {
 	if (sane<11) {
 		sane = 11;			// 85hz
 	}
+#ifdef __EMSCRIPTEN__
+	if (sane > 200) {
+		sane = 200;
+	}
 	ma = s_mixahead->value * dma.speed;
-#ifndef __EMSCRIPTEN__
+	op = dma.speed * (0.015f + sane * 0.0015f);
+	if (op < ma) {
+		ma = op;
+	}
+	if (bufDone > (int)(ma + dma.speed * 0.025f)) {
+		bufDone = (int)ma;
+		dmaWrite = (thisPos + bufDone) % bufSize;
+	}
+	count = (int)ma - bufDone;
+	if (count < 0) {
+		count = 0;
+	} else if (bufDone + count >= bufSize) {
+		count = bufSize - bufDone - 1;
+	}
+#else
+	ma = s_mixahead->value * dma.speed;
 	op = 0.05f + sane*dma.speed*0.01f;
 	if (op < ma) {
 		ma = op;
 	}
-#endif
 
 	count = lastRead;
 	if (bufDone + count < ma) {
@@ -123,6 +146,7 @@ void S_DMA_Update( float scale ) {
 	} else if (bufDone + count > bufSize) {
 		count = bufSize - bufDone;
 	}
+#endif
 
 	if (count > sizeof(buf) / (2 * sizeof(int))) {
 		count = sizeof(buf) / (2 * sizeof(int));
