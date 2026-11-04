@@ -2291,6 +2291,8 @@ void RB_EndSurface( void ) {
 		{
 			if(tess.currentStageIteratorFunc == RB_StageIteratorSky)
 			{	// don't process these tris at all
+				tess.numIndexes = 0;
+				tess.numVertexes = 0;
 				return;
 			}
 		}
@@ -2301,6 +2303,8 @@ void RB_EndSurface( void ) {
 			{
 				if( !(tess.currentStageIteratorFunc == RB_StageIteratorSky))
 				{	// /only/ process sky tris
+					tess.numIndexes = 0;
+					tess.numVertexes = 0;
 					return;
 				}
 			}

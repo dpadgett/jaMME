@@ -380,9 +380,15 @@ static void DrawSkySide( struct image_s *image, const int mins[2], const int max
 			memcpy(vtx + idx * 3, s_skyPoints[t + 1][s], sizeof(GLfloat) * 3);
 			idx++;
 #else
+#ifdef __EMSCRIPTEN__
+			qglColor3f( tr.identityLight, tr.identityLight, tr.identityLight );
+#endif
 			qglTexCoord2fv(s_skyTexCoords[t][s]);
 			qglVertex3fv(s_skyPoints[t][s]);
 
+#ifdef __EMSCRIPTEN__
+			qglColor3f( tr.identityLight, tr.identityLight, tr.identityLight );
+#endif
 			qglTexCoord2fv(s_skyTexCoords[t + 1][s]);
 			qglVertex3fv(s_skyPoints[t + 1][s]);
 #endif
@@ -834,10 +840,13 @@ void RB_StageIteratorSky( void ) {
 
 	// draw the outer skybox
 	if ( tess.shader->sky->outerbox[0] && tess.shader->sky->outerbox[0] != tr.defaultImage ) {
+		GL_SelectTexture( 0 );
+		GL_Cull( CT_TWO_SIDED );
 		qglColor3f( tr.identityLight, tr.identityLight, tr.identityLight );
 		
 		qglPushMatrix ();
 		GL_State( 0 );
+		qglLoadMatrixf( backEnd.viewParms.world.modelMatrix );
 		qglTranslatef (backEnd.viewParms.ori.origin[0], backEnd.viewParms.ori.origin[1], backEnd.viewParms.ori.origin[2]);
 
 		DrawSkyBox( tess.shader );
