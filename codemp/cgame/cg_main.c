@@ -635,7 +635,7 @@ itemInfo_t			cg_items[MAX_ITEMS];
 extern void CG_CheckNotification(void);
 
 extern void trap_MME_FontRatioFix( float ratio );
-static void CG_Set2DRatio(void) {
+void CG_Set2DRatio(void) {
 	if (mov_ratioFix.integer)
 		cgs.widthRatioCoef = (float)(SCREEN_WIDTH * cgs.glconfig.vidHeight) / (float)(SCREEN_HEIGHT * cgs.glconfig.vidWidth);
 	else
@@ -1929,8 +1929,15 @@ Ghoul2 Insert End
 
 	for ( i = 1 ; i < bg_numItems ; i++ ) {
 		if ( items[ i ] == '1' || com_buildScript.integer ) {
+#ifdef __EMSCRIPTEN__
+			if ( bg_itemlist[i].giType == IT_TEAM ) {
+				CG_LoadingItem( i );
+				CG_RegisterItemVisuals( i );
+			}
+#else
 			CG_LoadingItem( i );
 			CG_RegisterItemVisuals( i );
+#endif
 		}
 	}
 
@@ -2956,6 +2963,9 @@ void CG_LoadHudMenu()
 
 	Menu_Reset();
 
+	trap_PC_RemoveAllGlobalDefines();
+	trap_PC_LoadGlobalDefines("ui/jamp/menudef.h");
+
 	hudSet = cg_hudFiles.string;
 	if (hudSet[0] == '\0') 
 	{
@@ -3064,12 +3074,21 @@ void CG_Init( int serverMessageNum, int serverCommandSequence, int clientNum )
 
 	trap_MME_RequestFeatures();
 
+#ifdef __EMSCRIPTEN__
+	{
+		extern void CG_MME_Reset( void );
+		CG_MME_Reset();
+	}
+#endif
+
 	BG_InitAnimsets(); //clear it out
 
 	trap_CG_RegisterSharedMemory(cg.sharedBuffer);
 
 	//Load external vehicle data
+#ifndef __EMSCRIPTEN__
 	BG_VehicleLoadParms();
+#endif
 
 	// clear everything
 /*
@@ -3545,4 +3564,15 @@ void CG_PrevInventory_f(void)
 		cg.itemSelect = bg_itemlist[cg.snap->ps.stats[STAT_HOLDABLE_ITEM]].giTag;
 		cg.invenSelectTime = cg.time;
 	}
+}
+
+void CG_UpdateViewportSize( int width, int height ) {
+	if ( width <= 0 || height <= 0 ) {
+		return;
+	}
+	cgs.glconfig.vidWidth = width;
+	cgs.glconfig.vidHeight = height;
+	cgs.screenXScale = width / 640.0f;
+	cgs.screenYScale = height / 480.0f;
+	CG_Set2DRatio();
 }

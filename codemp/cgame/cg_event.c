@@ -2110,6 +2110,10 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 
 			assert(weapon >= 0 && weapon < MAX_WEAPONS);
 
+			if ( weapon > WP_NONE && weapon < WP_NUM_WEAPONS && !cg_weapons[weapon].registered ) {
+				CG_RegisterWeapon( weapon );
+			}
+
 			weaponInfo = &cg_weapons[weapon];
 
 			assert(weaponInfo);
@@ -2605,6 +2609,9 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 
 	case EV_DISRUPTOR_MAIN_SHOT:
 		DEBUGNAME("EV_DISRUPTOR_MAIN_SHOT");
+		if ( !cg_weapons[WP_DISRUPTOR].registered ) {
+			CG_RegisterWeapon( WP_DISRUPTOR );
+		}
 		if (!cg.enhanced.unlaggedActive || !cg.enhanced.unlaggedActive(cent->currentState.eventParm)) {
 			vec3_t start, end;
 
@@ -2638,6 +2645,9 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 
 	case EV_DISRUPTOR_SNIPER_SHOT:
 		DEBUGNAME("EV_DISRUPTOR_SNIPER_SHOT");
+		if ( !cg_weapons[WP_DISRUPTOR].registered ) {
+			CG_RegisterWeapon( WP_DISRUPTOR );
+		}
 		if (!cg.enhanced.unlaggedActive || !cg.enhanced.unlaggedActive(cent->currentState.eventParm)) {
 			vec3_t start, end;
 
@@ -2669,6 +2679,9 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 
 	case EV_DISRUPTOR_SNIPER_MISS:
 		DEBUGNAME("EV_DISRUPTOR_SNIPER_MISS");
+		if ( !cg_weapons[WP_DISRUPTOR].registered ) {
+			CG_RegisterWeapon( WP_DISRUPTOR );
+		}
 		ByteToDir( es->eventParm, dir );
 
 		if (es->weapon) //primary
@@ -2682,6 +2695,9 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 		{
 			qboolean alt = qfalse;
 			DEBUGNAME("EV_DISRUPTOR_HIT");
+			if ( !cg_weapons[WP_DISRUPTOR].registered ) {
+				CG_RegisterWeapon( WP_DISRUPTOR );
+			}
 			ByteToDir( es->eventParm, dir );
 
 			if (cent->currentState.eFlags & EF_ALT_FIRING)
@@ -3065,6 +3081,12 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 	//
 	case EV_CONC_ALT_IMPACT:
 		DEBUGNAME("EV_CONC_ALT_IMPACT");
+		if ( !cg_weapons[WP_CONCUSSION].registered ) {
+			CG_RegisterWeapon( WP_CONCUSSION );
+		}
+		if ( !cg_weapons[WP_DISRUPTOR].registered ) {
+			CG_RegisterWeapon( WP_DISRUPTOR );
+		}
 		if (!cg.enhanced.unlaggedActive || !cg.enhanced.unlaggedActive(es->owner)) {
 			float dist;
 			float shotDist = VectorNormalize(es->angles);

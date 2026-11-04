@@ -134,7 +134,12 @@ set(MPCGameGFiles
 source_group("ghoul2" FILES ${MPCGameG2Files})
 set(MPCGameFiles ${MPCGameFiles} ${MPCGameG2Files})
 
-add_library(${jaMMECGame} SHARED ${MPCGameFiles})
+if(EMSCRIPTEN)
+	add_library(${jaMMECGame} STATIC ${MPCGameFiles})
+	target_compile_options(${jaMMECGame} PRIVATE -include "${MPDir}/cgame/cg_sym_prefix.h")
+else()
+	add_library(${jaMMECGame} SHARED ${MPCGameFiles})
+endif()
 
 if(NOT WIN32)
 	# remove "lib" prefix for .so/.dylib files
@@ -143,7 +148,7 @@ endif(NOT WIN32)
 
 if(WIN32)
 	install(TARGETS ${jaMMECGame} RUNTIME DESTINATION "${jaMMEInstallDir}/mme")
-else(WIN32)
+elseif(NOT EMSCRIPTEN)
 	install(TARGETS ${jaMMECGame} LIBRARY DESTINATION "${jaMMEInstallDir}/mme")
 endif(WIN32)
 set_target_properties(${jaMMECGame} PROPERTIES COMPILE_DEFINITIONS "${MPCGameDefines}")

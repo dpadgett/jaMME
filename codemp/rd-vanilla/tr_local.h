@@ -20,7 +20,7 @@
 #else
 	#include "../sdl/sdl_qgl.h"
 
-#ifndef __arm64__
+#if !defined(__arm64__) && !defined(__EMSCRIPTEN__)
 	#include <mmintrin.h>
 	#include <emmintrin.h>
 #endif
@@ -2062,7 +2062,9 @@ typedef struct decalPoly_s
 // tr_surfacesprites
 void RB_DrawSurfaceSprites( shaderStage_t *stage, shaderCommands_t *input);
 
+#ifndef __EMSCRIPTEN__
 extern refexport_t re;
+#endif
 
 qboolean ShaderHashTableExists(void);
 

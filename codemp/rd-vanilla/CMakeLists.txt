@@ -49,7 +49,6 @@ set(MPVanillaRendererFiles
 	"${MPDir}/rd-vanilla/tr_shader.cpp"
 	"${MPDir}/rd-vanilla/tr_shadows.cpp"
 	"${MPDir}/rd-vanilla/tr_sky.cpp"
-	"${MPDir}/rd-vanilla/tr_subs.cpp"
 	"${MPDir}/rd-vanilla/tr_surface.cpp"
 	"${MPDir}/rd-vanilla/tr_surfacesprites.cpp"
 	"${MPDir}/rd-vanilla/tr_terrain.cpp"
@@ -57,19 +56,24 @@ set(MPVanillaRendererFiles
 	"${MPDir}/rd-vanilla/tr_WorldEffects.cpp"
 	"${MPDir}/rd-vanilla/tr_WorldEffects.h"
 	)
+if(NOT EMSCRIPTEN)
+	set(MPVanillaRendererFiles ${MPVanillaRendererFiles} "${MPDir}/rd-vanilla/tr_subs.cpp")
+endif()
 source_group("renderer" FILES ${MPVanillaRendererFiles})
 
-set(MPVanillaRendererQcommonFiles
-	"${MPDir}/qcommon/GenericParser2.cpp"
-	"${MPDir}/qcommon/matcomp.cpp"
-	"${MPDir}/qcommon/q_math.cpp"
-	"${MPDir}/qcommon/q_shared.cpp")
-source_group("qcommon" FILES ${MPVanillaRendererQcommonFiles})
-set(MPVanillaRendererFiles ${MPVanillaRendererFiles} ${MPVanillaRendererQcommonFiles})
+if(NOT EMSCRIPTEN)
+	set(MPVanillaRendererQcommonFiles
+		"${MPDir}/qcommon/GenericParser2.cpp"
+		"${MPDir}/qcommon/matcomp.cpp"
+		"${MPDir}/qcommon/q_math.cpp"
+		"${MPDir}/qcommon/q_shared.cpp")
+	source_group("qcommon" FILES ${MPVanillaRendererQcommonFiles})
+	set(MPVanillaRendererFiles ${MPVanillaRendererFiles} ${MPVanillaRendererQcommonFiles})
 
-file(GLOB_RECURSE MPVanillaRendererJpegFiles "${MPDir}/jpeg-8c/*.c" "${MPDir}/jpeg-8c/*.h")
-source_group("jpeg-8c" FILES ${MPVanillaRendererJpegFiles})
-set(MPVanillaRendererFiles ${MPVanillaRendererFiles} ${MPVanillaRendererJpegFiles})
+	file(GLOB_RECURSE MPVanillaRendererJpegFiles "${MPDir}/jpeg-8c/*.c" "${MPDir}/jpeg-8c/*.h")
+	source_group("jpeg-8c" FILES ${MPVanillaRendererJpegFiles})
+	set(MPVanillaRendererFiles ${MPVanillaRendererFiles} ${MPVanillaRendererJpegFiles})
+endif()
 
 set(MPVanillaRendererPngFiles
 	"${MPDir}/png/rpng.cpp")
@@ -97,15 +101,19 @@ set(MPVanillaRendererFiles ${MPVanillaRendererFiles} ${MPVanillaRendererLibPngFi
 
 if(UseInternalZlib)
 	set(MPVanillaRendererIncludeDirectories ${MPVanillaRendererIncludeDirectories} "${MPDir}/zlib")
-	find_library(ZlibLibrary NAMES zlib PATHS "${MPDir}/libs/win32/lib")
-	set(MPVanillaRendererLibraries ${MPVanillaRendererLibraries} ${ZlibLibrary})
+	if(WIN32)
+		find_library(ZlibLibrary NAMES zlib PATHS "${MPDir}/libs/win32/lib")
+		set(MPVanillaRendererLibraries ${MPVanillaRendererLibraries} ${ZlibLibrary})
+	elseif(NOT EMSCRIPTEN)
+		set(MPVanillaRendererLibraries ${MPVanillaRendererLibraries} bundled_zlib)
+	endif()
 else(UseInternalZlib)
 	find_package(ZLIB REQUIRED)
 	set(MPVanillaRendererIncludeDirectories ${MPVanillaRendererIncludeDirectories} ${ZLIB_INCLUDE_DIR})
 	set(MPVanillaRendererLibraries ${MPVanillaRendererLibraries} ${ZLIB_LIBRARY})
 endif(UseInternalZlib)
 
-if(NOT WIN32)
+if(NOT WIN32 AND NOT EMSCRIPTEN)
 	find_package(OpenGL REQUIRED)
 	set(MPVanillaRendererIncludeDirectories ${MPVanillaRendererIncludeDirectories} ${OPENGL_INCLUDE_DIR})
 	set(MPVanillaRendererLibraries ${MPVanillaRendererLibraries} ${OPENGL_LIBRARIES})
@@ -113,7 +121,7 @@ if(NOT WIN32)
 	find_package(SDL2 REQUIRED)
 	set(MPVanillaRendererIncludeDirectories ${MPVanillaRendererIncludeDirectories} ${SDL2_INCLUDE_DIR})
 	set(MPVanillaRendererLibraries ${MPVanillaRendererLibraries} ${SDL2_LIBRARY})
-endif(NOT WIN32)
+endif(NOT WIN32 AND NOT EMSCRIPTEN)
 
 
 if(WIN32)
@@ -130,7 +138,12 @@ else(WIN32)
 	set(MPVanillaRendererFiles ${MPVanillaRendererFiles} ${MPVanillaRendererSysFiles})
 endif(WIN32)
 
-add_library(${jaMMERenderer} SHARED ${MPVanillaRendererFiles})
+if(EMSCRIPTEN)
+	add_library(${jaMMERenderer} STATIC ${MPVanillaRendererFiles})
+	target_compile_options(${jaMMERenderer} PRIVATE -sUSE_SDL=2)
+else()
+	add_library(${jaMMERenderer} SHARED ${MPVanillaRendererFiles})
+endif()
 
 if(NOT WIN32)
 	# remove "lib" prefix for .so/.dylib files
@@ -139,7 +152,7 @@ endif(NOT WIN32)
 
 if(WIN32)
 	install(TARGETS ${jaMMERenderer} RUNTIME DESTINATION "${jaMMEInstallDir}")
-else(WIN32)
+elseif(NOT EMSCRIPTEN)
 	if(MakeApplicationBundles AND BuildMPEngine)
 		install(TARGETS ${jaMMERenderer} LIBRARY DESTINATION "${jaMMEEngine}.app/Contents/MacOS/")
 	else(MakeApplicationBundles AND BuildMPEngine)
@@ -148,4 +161,6 @@ else(WIN32)
 endif(WIN32)
 set_target_properties(${jaMMERenderer} PROPERTIES COMPILE_DEFINITIONS "${SharedDefines}")
 set_target_properties(${jaMMERenderer} PROPERTIES INCLUDE_DIRECTORIES "${MPVanillaRendererIncludeDirectories}")
-target_link_libraries(${jaMMERenderer} ${MPVanillaRendererLibraries})
+if(NOT EMSCRIPTEN)
+	target_link_libraries(${jaMMERenderer} ${MPVanillaRendererLibraries})
+endif()

@@ -457,6 +457,10 @@ void FS_Shutdown( qboolean closemfp ) {
 	}
 
 	// free everything
+#ifdef __EMSCRIPTEN__
+	extern void WasmPK3_ClearLoadedPacks( void );
+	WasmPK3_ClearLoadedPacks();
+#endif
 	for ( p = fs_searchpaths ; p ; p = next ) {
 		next = p->next;
 

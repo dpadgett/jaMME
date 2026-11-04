@@ -17,7 +17,7 @@ extern void CG_DrawAutoMap(void);
 extern void CG_DrawSkyBoxPortal(const char *cstr);
 extern void CG_DrawZoomMask(void);
 extern void CG_UpdateFallVector(void);
-extern qboolean CG_DrawCrosshairNames(void);
+extern void CG_DrawCrosshairNames(void);
 extern void CG_SetPredictedThirdPerson(void);
 extern qboolean CG_Piloting(int vehNum);
 extern void CG_InterpolatePlayerState( qboolean grabAngles );

@@ -263,6 +263,11 @@ void Con_CheckResize (void)
 	{
 		float	scale = cls.glconfig.displayScale;
 		scale *= (con_scale && con_scale->value > 0.0f) ? con_scale->value : 1.0f;
+#ifdef __EMSCRIPTEN__
+		if (cls.glconfig.vidWidth > 0 && cls.glconfig.vidWidth < SCREEN_WIDTH && (!con_scale || con_scale->value <= 1.0f)) {
+			scale *= (float)cls.glconfig.vidWidth / (float)SCREEN_WIDTH;
+		}
+#endif
 		int		charWidth = scale * SMALLCHAR_WIDTH;
 
 		if (charWidth < 1) {

@@ -79,7 +79,7 @@ void G2Time_ReportTimers(void)
 #endif
 
 //rww - RAGDOLL_BEGIN
-#ifdef __linux__
+#if defined(__linux__) || defined(__EMSCRIPTEN__)
 #include <math.h>
 #else
 #include <float.h>

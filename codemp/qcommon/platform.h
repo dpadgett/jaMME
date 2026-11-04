@@ -5,7 +5,7 @@
 #include <windows.h>
 #endif
 
-#if defined (__linux__)
+#if defined (__linux__) || defined (__EMSCRIPTEN__)
 typedef const char *LPCTSTR;
 typedef const char *LPCSTR;
 typedef unsigned long DWORD;

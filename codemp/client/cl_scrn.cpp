@@ -395,6 +395,9 @@ void SCR_DrawDemoRecording( void ) {
 
 extern qboolean s_soundMuted;
 void SCR_DrawMuted(void) {
+#ifdef __EMSCRIPTEN__
+	return;
+#endif
 	if (!s_soundMuted)
 		return;
 	const float ratio = cls.ratioFix;
@@ -497,7 +500,7 @@ This will be called twice if rendering in stereo mode
 ==================
 */
 void SCR_DrawScreenField( stereoFrame_t stereoFrame ) {
-	qboolean uiFullscreen = (qboolean)(uivm && VM_Call( uivm, UI_IS_FULLSCREEN ));
+	qboolean uiFullscreen = (qboolean)(uivm && (Key_GetCatcher() & KEYCATCH_UI) && !clc.demoplaying && VM_Call( uivm, UI_IS_FULLSCREEN ));
 
 	re.BeginFrame( stereoFrame );
 
@@ -511,7 +514,7 @@ void SCR_DrawScreenField( stereoFrame_t stereoFrame ) {
 		}
 	}
 
-	if ( !uivm ) {
+	if ( !uivm && !cgvm ) {
 		Com_DPrintf("draw screen without UI loaded\n");
 		return;
 	}
@@ -520,7 +523,7 @@ void SCR_DrawScreenField( stereoFrame_t stereoFrame ) {
 	// don't need to render anything under it
 	//actually, yes you do, unless you want clients to cycle out their reliable
 	//commands from sitting in the menu. -rww
-	if ( (uivm && !uiFullscreen) || (!(cls.framecount&7) && cls.state == CA_ACTIVE) ) {
+	if ( !uiFullscreen || (!(cls.framecount&7) && cls.state == CA_ACTIVE) ) {
 	//if ( !VM_Call( uivm, UI_IS_FULLSCREEN ) || (!(cls.framecount&7) && cls.state == CA_ACTIVE)) {
 		switch( cls.state ) {
 		default:
@@ -532,26 +535,34 @@ void SCR_DrawScreenField( stereoFrame_t stereoFrame ) {
 		case CA_DISCONNECTED:
 			// force menu up
 			S_StopAllSounds();
-			VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_MAIN );
+			if ( uivm ) {
+				VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_MAIN );
+			}
 			break;
 		case CA_CONNECTING:
 		case CA_CHALLENGING:
 		case CA_CONNECTED:
 			// connecting clients will only show the connection dialog
 			// refresh to update the time
-			VM_Call( uivm, UI_REFRESH, cls.realtime );
-			VM_Call( uivm, UI_DRAW_CONNECT_SCREEN, qfalse );
+			if ( uivm ) {
+				VM_Call( uivm, UI_REFRESH, cls.realtime );
+				VM_Call( uivm, UI_DRAW_CONNECT_SCREEN, qfalse );
+			}
 			break;
 		case CA_LOADING:
 		case CA_PRIMED:
 			// draw the game information screen and loading progress
-			CL_CGameRendering( stereoFrame );
+			if ( cgvm ) {
+				CL_CGameRendering( stereoFrame );
+			}
 
 			// also draw the connection information, so it doesn't
 			// flash away too briefly on local or lan games
 			// refresh to update the time
-			VM_Call( uivm, UI_REFRESH, cls.realtime );
-			VM_Call( uivm, UI_DRAW_CONNECT_SCREEN, qtrue );
+			if ( uivm ) {
+				VM_Call( uivm, UI_REFRESH, cls.realtime );
+				VM_Call( uivm, UI_DRAW_CONNECT_SCREEN, qtrue );
+			}
 			break;
 		case CA_ACTIVE:
 			CL_CGameRendering( stereoFrame );
@@ -597,7 +608,7 @@ void SCR_UpdateScreen( void ) {
 
 	// If there is no VM, there are also no rendering commands issued. Stop the renderer in
 	// that case.
-	if( uivm || com_dedicated->integer ) {
+	if( uivm || cgvm || com_dedicated->integer ) {
 		// if running in stereo, we need to draw the frame twice
 		if ( cls.glconfig.stereoEnabled ) {
 			SCR_DrawScreenField( STEREO_LEFT );

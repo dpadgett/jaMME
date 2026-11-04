@@ -114,6 +114,9 @@ typedef struct {
 	} cut;
 } demo_t;
 
+#ifdef __EMSCRIPTEN__
+#define demo cl_demo
+#endif
 extern demo_t demo;
 
 extern int demoLength(void);

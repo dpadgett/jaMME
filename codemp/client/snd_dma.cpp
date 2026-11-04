@@ -7,6 +7,10 @@
 extern qboolean s_soundMuted;
 dma_t		dma;
 
+extern "C" {
+long long g_jkAudioSamplesMixed = 0;
+}
+
 static mixBackground_t	dmaBackground;
 static mixLoop_t	dmaLoops[DMA_LOOPCHANNELS];
 static mixChannel_t	dmaChannels[DMA_SNDCHANNELS];
@@ -148,6 +152,9 @@ void S_DMA_Update( float scale ) {
 	SNDDMA_BeginPainting ();
 	S_MixClipOutput(count, buf, (short *)dma.buffer, dmaWrite, bufSize-1);
 	SNDDMA_Submit ();
+	if (count > 0 && speed > 0) {
+		g_jkAudioSamplesMixed += count;
+	}
 	dmaWrite += count;
 	if (dmaWrite >= bufSize)
 		dmaWrite -= bufSize;

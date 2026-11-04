@@ -355,7 +355,7 @@ void GL_State( uint32_t stateBits )
 	//
 	if ( diff & GLS_POLYMODE_LINE )
 	{
-#ifndef HAVE_GLES
+#if !defined(HAVE_GLES) && !defined(__EMSCRIPTEN__)
 		if ( stateBits & GLS_POLYMODE_LINE )
 		{
 			qglPolygonMode( GL_FRONT_AND_BACK, GL_LINE );
@@ -1254,7 +1254,7 @@ void RB_RenderDrawSurfList( drawSurf_t *drawSurfs, int numDrawSurfs ) {
 					//now copy a portion of the screen to this texture
 #ifdef HAVE_GLES
 					qglCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cX, cY, rad, rad, 0);
-#else
+#elif !defined(__EMSCRIPTEN__)
 					qglCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16, cX, cY, rad, rad, 0);
 #endif
 
@@ -1380,7 +1380,7 @@ void RE_StretchRaw (int x, int y, int w, int h, int cols, int rows, const byte *
 	if ( cols != tr.scratchImage[client]->width || rows != tr.scratchImage[client]->height ) {
 		tr.scratchImage[client]->width = cols;
 		tr.scratchImage[client]->height = rows;
-#ifdef HAVE_GLES
+#if defined(HAVE_GLES) || defined(__EMSCRIPTEN__)
 		//don't do qglTexImage2D as this may end up doing a compressed image
 		//on which we are not allowed to do further sub images
 		qglTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cols, rows, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
@@ -1459,7 +1459,7 @@ void RE_UploadCinematic (int cols, int rows, const byte *data, int client, qbool
 	if ( cols != tr.scratchImage[client]->width || rows != tr.scratchImage[client]->height ) {
 		tr.scratchImage[client]->width = tr.scratchImage[client]->width = cols;
 		tr.scratchImage[client]->height = tr.scratchImage[client]->height = rows;
-#ifdef HAVE_GLES
+#if defined(HAVE_GLES) || defined(__EMSCRIPTEN__)
 		qglTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cols, rows, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
 #else
 		qglTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, cols, rows, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
@@ -1958,7 +1958,7 @@ const void	*RB_DrawBuffer( const void *data ) {
 
 	cmd = (const drawBufferCommand_t *)data;
 
-#ifndef HAVE_GLES
+#if !defined(HAVE_GLES) && !defined(__EMSCRIPTEN__)
 	qglDrawBuffer( cmd->buffer );
 #endif
 
@@ -1969,6 +1969,9 @@ const void	*RB_DrawBuffer( const void *data ) {
 	{
 		const fog_t		*fog = &tr.world->fogs[tr.world->globalFog];
 
+#ifdef __EMSCRIPTEN__
+		GL_State( GLS_DEFAULT );
+#endif
 		qglClearColor(fog->parms.color[0],  fog->parms.color[1], fog->parms.color[2], 1.0f );
 		qglClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT );
 	}
@@ -2010,6 +2013,13 @@ const void	*RB_DrawBuffer( const void *data ) {
 		}		
 		qglClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT );
 	}
+#ifdef __EMSCRIPTEN__
+	else {
+		GL_State( GLS_DEFAULT );
+		qglClearColor( 0.0f, 0.0f, 0.0f, 1.0f );
+		qglClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT );
+	}
+#endif
 
 	return (const void *)(cmd + 1);
 }
@@ -2169,9 +2179,11 @@ const void	*RB_SwapBuffers( const void *data ) {
 	}
 #endif
 	
+#ifndef __EMSCRIPTEN__
 	if ( !glState.finishCalled ) {
         qglFinish();
 	}
+#endif
 	/* Allow MME to take a screenshot */
 	if ( r_stereoSeparation->value < 0.0f && tr.finishStereo) {
 		tr.capturingMultiPass = qtrue;

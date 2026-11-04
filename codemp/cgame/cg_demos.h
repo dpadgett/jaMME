@@ -163,7 +163,7 @@ typedef struct demoMain_s {
 		demoScriptPoint_t *points;
 	} script;
 	struct {
-		demoScriptPoint_t *points;
+		demoBookPoint_t *points;
 	} book;
 	struct {
 		int			time;
@@ -228,6 +228,7 @@ typedef struct demoMain_s {
 
 extern demoMain_t demo;
 
+void CG_Set2DRatio(void);
 void demoPlaybackInit(void);
 void CG_DemosAddLog(const char *fmt, ...);
 void demoCameraCommand_f(void);

@@ -565,6 +565,144 @@ of an interpolating one)
 
 ============
 */
+extern int cameraLastFrame;
+extern void CG_TransitionPermanent( void );
+
+void CG_ResetForDemoSeek( int serverCommandSeq, int processedSnapNum ) {
+	int i, j, k;
+	static char oldClientInfo[MAX_CLIENTS][MAX_STRING_CHARS];
+	for ( i = 0; i < MAX_CLIENTS; i++ ) {
+		Q_strncpyz( oldClientInfo[i], CG_ConfigString( CS_PLAYERS + i ), sizeof( oldClientInfo[i] ) );
+	}
+	cg.clientFrame = 0;
+	cg.snap = NULL;
+	cg.nextSnap = NULL;
+	cg.nextNextSnap = NULL;
+	cg.latestSnapshotNum = 0;
+	cg.latestSnapshotTime = 0;
+	cg.validPPS = qfalse;
+	cg.thisFrameTeleport = qtrue;
+	cg.nextFrameTeleport = qfalse;
+	cg.frametime = 0;
+	cg.oldTime = 0;
+	cg.physicsTime = 0;
+	VectorClear( cg.predictedError );
+	cg.predictedErrorTime = 0;
+	cg.zoomTime = 0;
+	cg.damageTime = 0.0f;
+	cg.damageX = 0.0f;
+	cg.damageY = 0.0f;
+	cg.damageValue = 0.0f;
+	cg.v_dmg_time = 0.0f;
+	cg.v_dmg_pitch = 0.0f;
+	cg.v_dmg_roll = 0.0f;
+	VectorClear( cg.kick_angles );
+	cg.kick_time = 0;
+	VectorClear( cg.kick_origin );
+	cg.centerPrintTime = 0;
+	cg.soundTime = 0;
+	cg.soundBufferIn = 0;
+	cg.soundBufferOut = 0;
+	cg.voiceChatTime = 0;
+	cg.voiceChatBufferIn = 0;
+	cg.voiceChatBufferOut = 0;
+	cg.itemPickupTime = 0;
+	cg.itemPickupBlendTime = 0;
+	cg.weaponSelectTime = 0;
+	cg.weaponAnimationTime = 0;
+	cg.headEndTime = 0;
+	cg.headStartTime = 0;
+	cg.nextOrbitTime = 0;
+	cameraLastFrame = 0;
+	memset( &cgScreenEffects, 0, sizeof( cgScreenEffects ) );
+	CG_InitLocalEntities();
+	CG_InitMarkPolys();
+	cgs.processedSnapshotNum = (processedSnapNum >= 0) ? processedSnapNum : 0;
+	if ( serverCommandSeq >= 0 ) {
+		cgs.serverCommandSequence = serverCommandSeq;
+	}
+	trap_GetGameState( &cgs.gameState );
+	for ( i = 0; i < MAX_GENTITIES; i++ ) {
+		cg_entities[i].currentValid = qfalse;
+		cg_entities[i].interpolate = qfalse;
+		cg_entities[i].muzzleFlashTime = 0;
+		cg_entities[i].previousEvent = 0;
+		cg_entities[i].trailTime = 0;
+		cg_entities[i].dustTrailTime = 0;
+		cg_entities[i].miscTime = 0;
+		cg_entities[i].damageTime = 0;
+		cg_entities[i].snapShotTime = 0;
+		cg_entities[i].ragLastOriginTime = 0;
+		cg_entities[i].frame_minus1_refreshed = 0;
+		cg_entities[i].frame_minus2_refreshed = 0;
+		cg_entities[i].frame_hold_time = 0;
+		cg_entities[i].frame_hold_refreshed = 0;
+		cg_entities[i].trickAlpha = 0;
+		cg_entities[i].trickAlphaTime = 0;
+		cg_entities[i].teamPowerEffectTime = 0;
+		cg_entities[i].teamPowerType = 0;
+		cg_entities[i].bodyFadeTime = 0;
+		cg_entities[i].serverSaberHitTime = 0;
+		cg_entities[i].vChatTime = 0;
+		cg_entities[i].numLoopingSounds = 0;
+		VectorClear( cg_entities[i].beamEnd );
+		memset( &cg_entities[i].pe, 0, sizeof( cg_entities[i].pe ) );
+	}
+	CG_TransitionPermanent();
+	CG_SetConfigValues();
+	for ( i = 0; i < MAX_CLIENTS; i++ ) {
+		const char *newStr = CG_ConfigString( CS_PLAYERS + i );
+		cgs.clientinfo[i].medkitUsageTime = 0;
+		cgs.clientinfo[i].breathPuffTime = 0;
+		cgs.clientinfo[i].corrTime = 0;
+		cgs.clientinfo[i].lookTime = 0;
+		cgs.clientinfo[i].superSmoothTime = 0;
+		for ( j = 0; j < MAX_SABERS; j++ ) {
+			for ( k = 0; k < MAX_BLADES; k++ ) {
+				cgs.clientinfo[i].saber[j].blade[k].trail.lastTime = 0;
+				cgs.clientinfo[i].saber[j].blade[k].trail.inAction = qfalse;
+			}
+		}
+		if ( strcmp( oldClientInfo[i], newStr ) != 0 ) {
+			CG_NewClientInfo( i, qtrue );
+		}
+	}
+}
+
+void CG_GetDemoDebugState( float *outFloats, int maxCount ) {
+	int clNum;
+	if ( !outFloats || maxCount < 16 ) {
+		return;
+	}
+	outFloats[0] = (float)cg.time;
+	outFloats[1] = cg.snap ? (float)cg.snap->serverTime : 0.0f;
+	outFloats[2] = cg.nextSnap ? (float)cg.nextSnap->serverTime : 0.0f;
+	outFloats[3] = cg.snap ? (float)cg.snap->ps.clientNum : -1.0f;
+	outFloats[4] = cg.snap ? cg.snap->ps.origin[0] : 0.0f;
+	outFloats[5] = cg.snap ? cg.snap->ps.origin[1] : 0.0f;
+	outFloats[6] = cg.snap ? cg.snap->ps.origin[2] : 0.0f;
+	outFloats[7] = cg.predictedPlayerState.origin[0];
+	outFloats[8] = cg.predictedPlayerState.origin[1];
+	outFloats[9] = cg.predictedPlayerState.origin[2];
+	outFloats[10] = cg.refdef.vieworg[0];
+	outFloats[11] = cg.refdef.vieworg[1];
+	outFloats[12] = cg.refdef.vieworg[2];
+	clNum = cg.predictedPlayerState.clientNum;
+	if ( clNum >= 0 && clNum < MAX_GENTITIES ) {
+		outFloats[13] = cg_entities[clNum].lerpOrigin[0];
+		outFloats[14] = cg_entities[clNum].lerpOrigin[1];
+		outFloats[15] = cg_entities[clNum].lerpOrigin[2];
+	} else {
+		outFloats[13] = outFloats[14] = outFloats[15] = 0.0f;
+	}
+	if ( maxCount >= 20 ) {
+		outFloats[16] = (float)cgs.media.bryarFrontFlash;
+		outFloats[17] = (float)cgs.effects.bryarShotEffect;
+		outFloats[18] = (float)cgs.effects.bryarPowerupShotEffect;
+		outFloats[19] = (float)cg.renderingThirdPerson;
+	}
+}
+
 void CG_ProcessSnapshots( void ) {
 	snapshot_t		*snap;
 	int				n;

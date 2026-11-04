@@ -90,7 +90,9 @@ typedef struct {
 	int			baseOffset;
 	int			fileSize;
 	int			zipFilePos;
+	int			zipFileLen;
 	qboolean	zipFile;
+	qboolean	zipEntryOpened;
 	qboolean	streamed;
 	char		name[MAX_ZPATH];
 } fileHandleData_t;

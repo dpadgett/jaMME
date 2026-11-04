@@ -50,6 +50,11 @@ LAN_LoadCachedServers
 ====================
 */
 void LAN_LoadCachedServers( ) {
+#ifdef __EMSCRIPTEN__
+	cls.numglobalservers = cls_nummplayerservers = cls.numfavoriteservers = 0;
+	cls.numGlobalServerAddresses = 0;
+	return;
+#endif
 	int size;
 	fileHandle_t fileIn;
 	cls.numglobalservers = cls_nummplayerservers = cls.numfavoriteservers = 0;
@@ -77,6 +82,9 @@ LAN_SaveServersToCache
 ====================
 */
 void LAN_SaveServersToCache( ) {
+#ifdef __EMSCRIPTEN__
+	return;
+#endif
 	int size;
 	fileHandle_t fileOut = FS_SV_FOpenFileWrite("servercache.dat");
 	FS_Write(&cls.numglobalservers, sizeof(int), fileOut);

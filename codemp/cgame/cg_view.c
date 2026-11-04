@@ -180,6 +180,14 @@ Sets the coordinates of the rendered window
 static void CG_CalcVrect (void) {
 	int		size;
 
+#ifdef __EMSCRIPTEN__
+	extern void CG_Set2DRatio( void );
+	trap_GetGlconfig( &cgs.glconfig );
+	cgs.screenXScale = cgs.glconfig.vidWidth / 640.0f;
+	cgs.screenYScale = cgs.glconfig.vidHeight / 480.0f;
+	CG_Set2DRatio();
+#endif
+
 	// the intermission should allways be full screen
 	if ( cg.snap->ps.pm_type == PM_INTERMISSION ) {
 		size = 100;

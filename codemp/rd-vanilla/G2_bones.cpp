@@ -13,7 +13,7 @@
 #include "G2_local.h"
 	 
 //rww - RAGDOLL_BEGIN
-#ifndef __linux__
+#if !defined(__linux__) && !defined(__EMSCRIPTEN__)
 #include <float.h>
 #else
 #include <math.h>

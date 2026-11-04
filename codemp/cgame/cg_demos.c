@@ -326,6 +326,12 @@ int demoSetupView( void) {
 		demo.viewRadius = 0;
 	}
 
+#ifdef __EMSCRIPTEN__
+	trap_GetGlconfig( &cgs.glconfig );
+	cgs.screenXScale = cgs.glconfig.vidWidth / (float)SCREEN_WIDTH;
+	cgs.screenYScale = cgs.glconfig.vidHeight / (float)SCREEN_HEIGHT;
+	CG_Set2DRatio();
+#endif
 	cg.refdef.width = cgs.glconfig.vidWidth*cg_viewsize.integer/100;
 	cg.refdef.width &= ~1;
 
@@ -491,9 +497,13 @@ extern qboolean cg_rangedFogging;
 
 extern int cg_siegeClassIndex;
 
+static int s_mmeJustSeekedFrames = 0;
+extern int CL_MMEDemoCompleted( void );
+
 void CG_DemosDrawActiveFrame( int serverTime, stereoFrame_t stereoView ) {
 	int deltaTime;
 	qboolean hadSkip;
+	qboolean isInitialSeekFrame;
 	qboolean captureFrame;
 	float captureFPS;
 	float frameSpeed;
@@ -559,9 +569,20 @@ void CG_DemosDrawActiveFrame( int serverTime, stereoFrame_t stereoView ) {
 	}
 
 	/* Forward the demo */
-	deltaTime = serverTime - demo.serverTime;
+	isInitialSeekFrame = (s_mmeJustSeekedFrames > 0) ? qtrue : qfalse;
+	deltaTime = (demo.serverTime > 0) ? (serverTime - demo.serverTime) : 0;
+	if (deltaTime < 0)
+		deltaTime = 0;
 	if (deltaTime > 50)
 		deltaTime = 50;
+#ifdef __EMSCRIPTEN__
+	if (cg.clientFrame < 6)
+		deltaTime = 0;
+#endif
+	if (s_mmeJustSeekedFrames > 0) {
+		deltaTime = 0;
+		s_mmeJustSeekedFrames--;
+	}
 	demo.serverTime = serverTime;
 	demo.serverDeltaTime = 0.001 * deltaTime;
 	cg.oldTime = cg.time;
@@ -619,6 +640,21 @@ void CG_DemosDrawActiveFrame( int serverTime, stereoFrame_t stereoView ) {
 		float delta = demo.play.fraction + deltaTime * demo.play.speed;
 		demo.play.time += (int)delta;
 		demo.play.fraction = delta - (int)delta;
+#ifdef __EMSCRIPTEN__
+		if (deltaTime > 0 && demo.length >= 0 && (demo.length > 0 ? (demo.play.time >= demo.length) : qtrue)) {
+			if (CL_MMEDemoCompleted()) {
+				demo.play.time = 0;
+				demo.play.fraction = 0.0f;
+				s_mmeJustSeekedFrames = 1;
+				isInitialSeekFrame = qtrue;
+			} else {
+				demo.play.time = demo.length;
+				demo.play.fraction = 0.0f;
+				demo.play.paused = qtrue;
+				trap_Cvar_Set("mme_demoPaused", "1");
+			}
+		}
+#endif
 	}
 
 	demo.play.lastTime = demo.play.time;
@@ -659,7 +695,7 @@ void CG_DemosDrawActiveFrame( int serverTime, stereoFrame_t stereoView ) {
 	frameSpeed *= demo.play.speed;
 
 	cg.frametime = (cg.time - cg.oldTime) + (cg.timeFraction - cg.oldTimeFraction);
-	if (cg.frametime < 0) {
+	if (cg.frametime < 0 || isInitialSeekFrame) {
 		int i;
 		cg.frametime = 0;
 		hadSkip = qtrue;
@@ -701,7 +737,7 @@ void CG_DemosDrawActiveFrame( int serverTime, stereoFrame_t stereoView ) {
 		for (i = 0; i < MAX_CHATBOX_ITEMS; i++)
 			cg.chatItems[i].time = 0;
 		//entFIXME: probably a wrong fix for not disappearing limbs/duplicating limbs after rewinding?
-		for (i = 0; cg_dismember.integer > 0 && i < cg.snap->numEntities; i++) {
+		for (i = 0; cg.snap && cg_dismember.integer > 0 && i < cg.snap->numEntities; i++) {
 			centity_t *cent = &cg_entities[cg.snap->entities[i].number];
 			if (cent->currentState.modelGhoul2 >= G2_MODELPART_HEAD &&
 				cent->currentState.modelGhoul2 <= G2_MODELPART_RLEG &&
@@ -1275,11 +1311,17 @@ void demoPlaybackInit(void) {
 	demo.length = trap_MME_DemoLength();
 	demo.initDone = qtrue;
 	demo.autoLoad = qfalse;
+#ifdef __EMSCRIPTEN__
+	if (demo.play.speed <= 0.0f) {
+		demo.play.speed = 1.0f;
+	}
+#else
 	demo.play.time = 0;
 	demo.play.lastTime = 0;
 	demo.play.fraction = 0;
 	demo.play.speed = 1.0f;
 	demo.play.paused = 0;
+#endif
 
 	demo.move.acceleration = 8;
 	demo.move.friction = 8;
@@ -1295,6 +1337,9 @@ void demoPlaybackInit(void) {
 #ifdef __ANDROID__
 	demo.editType = editNone;
 	demo.seekEnabled = qtrue;
+#elif defined(__EMSCRIPTEN__)
+	demo.editType = editNone;
+	demo.seekEnabled = qfalse;
 #else
 	demo.editType = editCamera;
 #endif
@@ -1615,3 +1660,75 @@ qboolean CG_DemosConsoleCommand( void ) {
 	}
 	return qtrue;
 }
+
+void CG_MME_Reset( void ) {
+	memset( &demo, 0, sizeof( demo ) );
+	demo.play.speed = 1.0f;
+	demo.length = trap_MME_DemoLength();
+	s_mmeJustSeekedFrames = 0;
+}
+
+int CG_MME_IsInitialized( void ) {
+	return demo.initDone ? 1 : 0;
+}
+
+int CG_MME_GetTimeMs( void ) {
+	return demo.play.time;
+}
+
+int CG_MME_GetDurationMs( void ) {
+	if ( demo.length <= 0 ) {
+		demo.length = trap_MME_DemoLength();
+	}
+	return demo.length;
+}
+
+void CG_MME_SetTimeMs( int ms ) {
+	int len = CG_MME_GetDurationMs();
+	if ( ms < 0 ) {
+		ms = 0;
+	}
+	if ( len > 0 && ms > len ) {
+		ms = len;
+	}
+	demo.play.time = ms;
+	demo.play.lastTime = ms;
+	demo.play.oldTime = ms;
+	demo.play.fraction = 0.0f;
+	s_mmeJustSeekedFrames = 1;
+	cg.time = trap_MME_SeekTime( ms );
+	cg.timeFraction = 0.0f;
+	if ( demo.initDone ) {
+		demoProcessSnapShots( qtrue );
+		if ( cg.snap ) {
+			CG_InterpolatePlayerState( qfalse );
+			if ( CG_Piloting( cg.predictedPlayerState.m_iVehicleNum ) ) {
+				CG_InterpolateVehiclePlayerState( qfalse );
+			}
+			BG_PlayerStateToEntityState( &cg.predictedPlayerState, &cg_entities[cg.snap->ps.clientNum].currentState, qfalse );
+			cg_entities[cg.snap->ps.clientNum].currentValid = qtrue;
+			VectorCopy( cg_entities[cg.snap->ps.clientNum].currentState.pos.trBase, cg_entities[cg.snap->ps.clientNum].lerpOrigin );
+			VectorCopy( cg_entities[cg.snap->ps.clientNum].currentState.apos.trBase, cg_entities[cg.snap->ps.clientNum].lerpAngles );
+			VectorCopy( cg.predictedPlayerState.origin, cg.refdef.vieworg );
+			cg.refdef.vieworg[2] += cg.predictedPlayerState.viewheight;
+		}
+	}
+}
+
+int CG_MME_GetPaused( void ) {
+	return demo.play.paused ? 1 : 0;
+}
+
+void CG_MME_SetPaused( int paused ) {
+	demo.play.paused = paused ? qtrue : qfalse;
+	trap_Cvar_Set( "mme_demoPaused", va( "%i", demo.play.paused ) );
+}
+
+float CG_MME_GetSpeed( void ) {
+	return demo.play.speed;
+}
+
+void CG_MME_SetSpeed( float speed ) {
+	demo.play.speed = speed;
+}
+

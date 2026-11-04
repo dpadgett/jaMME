@@ -427,6 +427,7 @@ void RE_BeginFrame( stereoFrame_t stereoFrame ) {
 	}
 
     // check for errors
+#ifndef __EMSCRIPTEN__
     if ( !r_ignoreGLErrors->integer ) {
         int	err;
 
@@ -435,6 +436,7 @@ void RE_BeginFrame( stereoFrame_t stereoFrame ) {
             Com_Error( ERR_FATAL, "RE_BeginFrame() - glGetError() failed (0x%x)!\n", err );
         }
     }
+#endif
 
 	if ( mme_worldShader->modified) {
 		if (R_FindShaderText( mme_worldShader->string )) {

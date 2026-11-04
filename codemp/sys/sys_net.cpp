@@ -483,6 +483,10 @@ NET_Init
 */
 void NET_Init (void)
 {
+#ifdef __EMSCRIPTEN__
+	noudp = Cvar_Get ("net_noudp", "1", 0);
+	return;
+#endif
 	noudp = Cvar_Get ("net_noudp", "0", 0);
 	// open sockets
 	if (! noudp->value) {

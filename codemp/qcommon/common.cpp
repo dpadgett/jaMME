@@ -6,7 +6,7 @@
 #include "GenericParser2.h"
 #include "stringed_ingame.h"
 #include "../qcommon/game_version.h"
-#ifndef __linux__
+#if !defined(__linux__) && !defined(__EMSCRIPTEN__)
 #include "../qcommon/platform.h"
 #endif
 
@@ -1651,6 +1651,16 @@ try
 		timeBeforeFirstEvents = Sys_Milliseconds ();
 	}
 
+#ifdef __EMSCRIPTEN__
+	lastTime = com_frameTime;
+	com_frameTime = Com_EventLoop();
+	if ( lastTime > com_frameTime ) {
+		lastTime = com_frameTime;
+	}
+	msec = com_frameTime - lastTime;
+	IN_Frame();
+	Cbuf_Execute ();
+#else
 	// we may want to spin here if things are going too fast
 	if ( !com_dedicated->integer && com_maxfps->integer > 0 && !com_timedemo->integer ) {
 		minMsec = 1000 / com_maxfps->integer;
@@ -1670,6 +1680,7 @@ try
 	Cbuf_Execute ();
 
 	lastTime = com_frameTime;
+#endif
 
 	// mess with msec if needed
 	com_frameMsec = msec;

@@ -42,6 +42,10 @@ bool FX_Free( bool templates )
 
 	activeFx = 0;
 
+	theFxHelper.mTime = 0;
+	theFxHelper.mOldTime = 0;
+	theFxHelper.mFrameTime = 0;
+
 	theFxScheduler.Clean( templates );
 	return true;
 }
@@ -93,7 +97,7 @@ int	FX_Init( refdef_t* refdef )
 	fx_debug = Cvar_Get("fx_debug", "0", CVAR_TEMP);
 	fx_countScale = Cvar_Get("fx_countScale", "1", CVAR_ARCHIVE);
 	fx_nearCull = Cvar_Get("fx_nearCull", "16", CVAR_ARCHIVE);
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
 	fx_forcePhysics = Cvar_Get("fx_forcePhysics", "0", CVAR_ARCHIVE);
 #else
 	fx_forcePhysics = Cvar_Get("fx_forcePhysics", "13", CVAR_ARCHIVE);

@@ -450,6 +450,14 @@ char *Sys_StripAppBundle( char *dir )
 #	endif
 #endif
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+static void Sys_MainLoopFrame( void )
+{
+	Com_Frame();
+}
+#endif
+
 int main ( int argc, char* argv[] )
 {
 	int		i;
@@ -503,6 +511,9 @@ int main ( int argc, char* argv[] )
 	}
 #endif
 
+#ifdef __EMSCRIPTEN__
+	emscripten_set_main_loop( Sys_MainLoopFrame, 0, 1 );
+#else
 	// main game loop
 	while (1)
 	{
@@ -512,6 +523,7 @@ int main ( int argc, char* argv[] )
 		// run the game
 		Com_Frame();
 	}
+#endif
 
 	// never gets here
 }

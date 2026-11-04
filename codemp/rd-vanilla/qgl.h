@@ -50,6 +50,10 @@
 #include <GL/fxmesa.h>
 #endif
 
+#elif defined( __EMSCRIPTEN__ )
+
+#include <SDL_opengl.h>
+
 #else
 
 #include <gl.h>

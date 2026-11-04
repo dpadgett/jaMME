@@ -12,11 +12,11 @@ cvar_t		*cvar_vars = NULL;
 cvar_t		*cvar_cheats;
 int			cvar_modifiedFlags;
 
-#define	MAX_CVARS	2048
+#define	MAX_CVARS	8192
 cvar_t		cvar_indexes[MAX_CVARS];
 int			cvar_numIndexes;
 
-#define FILE_HASH_SIZE		256
+#define FILE_HASH_SIZE		512
 static	cvar_t*		hashTable[FILE_HASH_SIZE];
 
 static char *lastMemPool = NULL;
@@ -82,11 +82,15 @@ Cvar_FindVar
 cvar_t *Cvar_FindVar( const char *var_name ) {
 	cvar_t	*var;
 	long hash;
+	int guard = 0;
 
 	hash = generateHashValue(var_name);
 	
-	for (var=hashTable[hash] ; var ; var=var->hashNext) {
-		if (!Q_stricmp(var_name, var->name)) {
+	for (var=hashTable[hash] ; var && guard < MAX_CVARS ; var=var->hashNext, guard++) {
+		if (var->hashNext == var) {
+			var->hashNext = NULL;
+		}
+		if (var->name && !Q_stricmp(var_name, var->name)) {
 			return var;
 		}
 	}
@@ -180,8 +184,12 @@ Cvar_CommandCompletion
 */
 void	Cvar_CommandCompletion( callbackFunc_t callback ) {
 	cvar_t		*cvar;
+	int			guard = 0;
 	
-	for ( cvar = cvar_vars ; cvar ; cvar = cvar->next ) {
+	for ( cvar = cvar_vars ; cvar && guard < MAX_CVARS ; cvar = cvar->next, guard++ ) {
+		if ( cvar->next == cvar ) {
+			cvar->next = NULL;
+		}
 		// Dont show internal cvars
 		if ( cvar->flags & CVAR_INTERNAL )
 		{
@@ -748,9 +756,13 @@ Any testing variables will be reset to the safe values
 */
 void Cvar_SetCheatState( void ) {
 	cvar_t	*var;
+	int		guard = 0;
 
 	// set all default vars to the safe value
-	for ( var = cvar_vars ; var ; var = var->next ) {
+	for ( var = cvar_vars ; var && guard < MAX_CVARS ; var = var->next, guard++ ) {
+		if ( var->next == var ) {
+			var->next = NULL;
+		}
 		if ( var->flags & CVAR_CHEAT ) {
 			// the CVAR_LATCHED|CVAR_CHEAT vars might escape the reset here 
 			// because of a different var->latchedString
@@ -981,7 +993,11 @@ void Cvar_WriteVariables( fileHandle_t f ) {
 	}
 */
 	cvarvec_t cvar_vec;
-	for (cvar_t *var = cvar_vars ; var ; var = var->next) {
+	int guard = 0;
+	for (cvar_t *var = cvar_vars ; var && guard < MAX_CVARS ; var = var->next, guard++) {
+		if ( var->next == var ) {
+			var->next = NULL;
+		}
 		if( !var->name )
 			continue;
 
@@ -1033,8 +1049,11 @@ void Cvar_List_f( void ) {
 	}
 
 	i = 0;
-	for (var = cvar_vars ; var ; var = var->next, i++)
+	for (var = cvar_vars ; var && i < MAX_CVARS ; var = var->next, i++)
 	{
+		if ( var->next == var ) {
+			var->next = NULL;
+		}
 		// Dont show internal cvars
 		if ( var->flags & CVAR_INTERNAL )
 		{
@@ -1177,11 +1196,16 @@ and variables added via the VMs if requested.
 void Cvar_Restart(qboolean unsetVM)
 {
 	cvar_t	*curvar;
+	int		guard = 0;
 
 	curvar = cvar_vars;
 
-	while(curvar)
+	while(curvar && guard < MAX_CVARS)
 	{
+		guard++;
+		if (curvar->next == curvar) {
+			curvar->next = NULL;
+		}
 		if((curvar->flags & CVAR_USER_CREATED) ||
 			(unsetVM && (curvar->flags & CVAR_VM_CREATED)))
 		{
@@ -1219,11 +1243,15 @@ Cvar_InfoString
 char	*Cvar_InfoString( int bit ) {
 	static char	info[MAX_INFO_STRING];
 	cvar_t	*var;
+	int		guard = 0;
 
 	info[0] = 0;
 
-	for (var = cvar_vars ; var ; var = var->next)
+	for (var = cvar_vars ; var && guard < MAX_CVARS ; var = var->next, guard++)
 	{
+		if (var->next == var) {
+			var->next = NULL;
+		}
 		if (!(var->flags & CVAR_INTERNAL) && var->name &&
 			(var->flags & bit))
 		{
@@ -1244,11 +1272,15 @@ Cvar_InfoString_Big
 char	*Cvar_InfoString_Big( int bit ) {
 	static char	info[BIG_INFO_STRING];
 	cvar_t	*var;
+	int		guard = 0;
 
 	info[0] = 0;
 
-	for (var = cvar_vars ; var ; var = var->next)
+	for (var = cvar_vars ; var && guard < MAX_CVARS ; var = var->next, guard++)
 	{
+		if (var->next == var) {
+			var->next = NULL;
+		}
 		if (!(var->flags & CVAR_INTERNAL) && var->name &&
 			(var->flags & bit))
 		{
@@ -1399,9 +1431,13 @@ void Cvar_Defrag(void)
 	cvar_t	*var;
 	int totalMem = 0;
 	int nextMemPoolSize;
+	int guard = 0;
 	
-	for (var = cvar_vars; var; var = var->next)
+	for (var = cvar_vars; var && guard < MAX_CVARS; var = var->next, guard++)
 	{
+		if (var->next == var) {
+			var->next = NULL;
+		}
 		if (var->name) {
 			totalMem += strlen(var->name) + 1;
 		}
@@ -1420,7 +1456,8 @@ void Cvar_Defrag(void)
 	nextMemPoolSize = totalMem;
 	totalMem = 0;
 
-	for (var = cvar_vars; var; var = var->next)
+	guard = 0;
+	for (var = cvar_vars; var && guard < MAX_CVARS; var = var->next, guard++)
 	{
 		Cvar_Realloc(&var->name, mem, totalMem);
 		Cvar_Realloc(&var->string, mem, totalMem);

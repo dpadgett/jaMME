@@ -419,6 +419,27 @@ void demoConvert( const char *oldName, const char *newBaseName, qboolean smoothe
 				break;
 			case svc_gamestate:
 				if (newHandle) {
+					int flushStart = convert->frameIndex - (DEMOCONVERTFRAMES/2);
+					int flushIdx;
+					if (flushStart < 0)
+						flushStart = 0;
+					for (flushIdx = flushStart; flushIdx < convert->frameIndex; flushIdx++) {
+						const demoFrame_t *newFrame = &convert->frames[ flushIdx % DEMOCONVERTFRAMES ];
+						msg_t writeMsg;
+						MSG_Init( &writeMsg, demo.buffer, sizeof (demo.buffer));
+						MSG_Clear( &writeMsg );
+						MSG_Bitstream( &writeMsg );
+						if ( newFrame->serverTime > fullTime || flushIdx <= 0 ) {
+							fullTime = newFrame->serverTime + 2000;
+							demoFramePack( &writeMsg, newFrame, 0, &demo.firstPack );
+						} else {
+							const demoFrame_t *oldFrame = &convert->frames[ ( flushIdx - 1 ) % DEMOCONVERTFRAMES ];
+							demoFramePack( &writeMsg, newFrame, oldFrame, &demo.firstPack );
+						}
+						temp = LittleLong( writeMsg.cursize );
+						FS_Write( &temp, 4, newHandle );
+						FS_Write( writeMsg.data, writeMsg.cursize, newHandle );
+					}
 					FS_FCloseFile( newHandle );
 					newHandle = 0;
 				}
@@ -676,6 +697,29 @@ void demoConvert( const char *oldName, const char *newBaseName, qboolean smoothe
 			}
 		}
 	}
+	if (newHandle && convert->frameIndex > 0) {
+		int flushStart = convert->frameIndex - (DEMOCONVERTFRAMES/2);
+		int flushIdx;
+		if (flushStart < 0)
+			flushStart = 0;
+		for (flushIdx = flushStart; flushIdx < convert->frameIndex; flushIdx++) {
+			const demoFrame_t *newFrame = &convert->frames[ flushIdx % DEMOCONVERTFRAMES ];
+			msg_t writeMsg;
+			MSG_Init( &writeMsg, demo.buffer, sizeof (demo.buffer));
+			MSG_Clear( &writeMsg );
+			MSG_Bitstream( &writeMsg );
+			if ( newFrame->serverTime > fullTime || flushIdx <= 0 ) {
+				fullTime = newFrame->serverTime + 2000;
+				demoFramePack( &writeMsg, newFrame, 0, &demo.firstPack );
+			} else {
+				const demoFrame_t *oldFrame = &convert->frames[ ( flushIdx - 1 ) % DEMOCONVERTFRAMES ];
+				demoFramePack( &writeMsg, newFrame, oldFrame, &demo.firstPack );
+			}
+			temp = LittleLong( writeMsg.cursize );
+			FS_Write( &temp, 4, newHandle );
+			FS_Write( writeMsg.data, writeMsg.cursize, newHandle );
+		}
+	}
 conversionerror:
 	FS_FCloseFile( oldHandle );
 	FS_FCloseFile( newHandle );
@@ -755,6 +799,10 @@ static void demoPlayForwardFrame( demoPlay_t *play ) {
 	msg_t		msg;
 
 	if (play->filePos + 4 > play->fileSize) {
+		if (demo.commandSmoothing && play->frameNumber == -1) {
+			play->frame = play->nextFrame;
+			play->frameNumber = 0;
+		}
 		if (mme_demoAutoNext->integer && demo.nextNum && !demo.precaching) {
 			CL_Disconnect_f();
 		}
@@ -825,11 +873,17 @@ static void demoPlaySetIndex( demoPlay_t *play, int index ) {
 }
 static int demoPlaySeek(demoPlay_t *play, int seekTime) {
 	int i;
+	int curFrameTime;
+	if (!play)
+		return 0;
 	play->seekTime = seekTime;
 	seekTime += play->startTime;
 	if (seekTime < 0)
 		seekTime = 0;
-	if (seekTime < play->frame->serverTime || (seekTime > play->frame->serverTime + 1000)) {
+	curFrameTime = (demo.commandSmoothing && play->frameNumber > 0)
+		? play->storageFrame[(play->frameNumber - 1 + FRAME_BUF_SIZE) % FRAME_BUF_SIZE].serverTime
+		: play->frame->serverTime;
+	if (seekTime < curFrameTime || (seekTime > curFrameTime + 1000)) {
 		for (i=0;i<(play->fileIndexCount-1);i++) {
 			if (play->fileIndex[i].time <= seekTime && 
 				play->fileIndex[i+1].time > seekTime)
@@ -857,6 +911,21 @@ int demoTime(void) {
 	if (play->seekTime < 0)
 		play->seekTime = 0;
 	return play->seekTime;
+}
+qboolean demoIsMMEPlaying(void) {
+	return (qboolean)(clc.newDemoPlayer && demo.play.handle != 0);
+}
+int demoStartTime(void) {
+	demoPlay_t *play = demo.play.handle;
+	return play ? play->startTime : 0;
+}
+int demoEndTime(void) {
+	demoPlay_t *play = demo.play.handle;
+	return play ? play->endTime : 0;
+}
+int demoTotalFrames(void) {
+	demoPlay_t *play = demo.play.handle;
+	return play ? play->totalFrames : 0;
 }
 float demoProgress(void) {
 	int pos = demoTime();
@@ -1049,6 +1118,9 @@ qboolean demoGetServerCommand( int cmdNumber ) {
 }
 
 int demoSeek( int seekTime ) {
+	if ( !demo.play.handle ) {
+		return 0;
+	}
 	return demoPlaySeek( demo.play.handle, seekTime );
 }
 
@@ -1109,9 +1181,18 @@ qboolean demoGetSnapshot( int snapNumber, snapshot_t *snap ) {
 	return qtrue;
 }
 
+#ifdef __EMSCRIPTEN__
+extern "C" int CG_MME_GetTimeMs( void );
+#endif
+
 void CL_DemoSetCGameTime( void ) {
 	/* We never timeout */
 	clc.lastPacketTime = cls.realtime;
+#ifdef __EMSCRIPTEN__
+	if ( demoIsMMEPlaying() ) {
+		cl.serverTime = demoStartTime() + CG_MME_GetTimeMs();
+	}
+#endif
 }
 
 void CL_DemoShutDown( void ) {
@@ -1264,6 +1345,16 @@ qboolean demoPlay( const char *fileName, qboolean del ) {
 		Com_EventLoop();
 		// starting to load a map so we get out of full screen ui mode
 		Cvar_Set("r_uiFullScreen", "0");
+		// Populate gamestate before CL_FlushMemory so FS_WasmPrepareDemoPaks can inspect CS_SYSTEMINFO / CS_SERVERINFO
+		Com_Memcpy( cl.gameState.stringOffsets, play->frame->string.offsets, sizeof( play->frame->string.offsets ));
+		Com_Memcpy( cl.gameState.stringData, play->frame->string.data, play->frame->string.used );
+		cl.gameState.dataCount = play->frame->string.used;
+#ifdef __EMSCRIPTEN__
+		{
+			extern void CL_WasmPrepareCurrentGamestatePaks( void );
+			CL_WasmPrepareCurrentGamestatePaks();
+		}
+#endif
 		// flush client memory and start loading stuff
 		// this will also (re)load the UI
 		// if this is a local client then only the client part of the hunk

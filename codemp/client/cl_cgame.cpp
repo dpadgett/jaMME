@@ -284,7 +284,7 @@ void CL_ConfigstringModified( void ) {
 	char		*old, *s;
 	int			i, index;
 	char		*dup;
-	gameState_t	oldGs;
+	static gameState_t	oldGs;
 	int			len;
 
 	index = atoi( Cmd_Argv(1) );
@@ -622,9 +622,12 @@ rescan:
 	cmd = Cmd_Argv(0);
 
 	if ( !strcmp( cmd, "disconnect" ) ) {
-		char strEd[MAX_STRINGED_SV_STRING];
-		CL_CheckSVStringEdRef(strEd, Cmd_Argv(1));
-		Com_Error (ERR_SERVERDISCONNECT, "%s: %s\n", SE_GetString("MP_SVGAME_SERVER_DISCONNECTED"), strEd );
+		if ( !clc.demoplaying ) {
+			char strEd[MAX_STRINGED_SV_STRING];
+			CL_CheckSVStringEdRef(strEd, Cmd_Argv(1));
+			Com_Error (ERR_SERVERDISCONNECT, "%s: %s\n", SE_GetString("MP_SVGAME_SERVER_DISCONNECTED"), strEd );
+		}
+		return qfalse;
 	}
 
 	if ( !strcmp( cmd, "bcs0" ) ) {
@@ -2058,10 +2061,17 @@ void CL_CGameRendering( stereoFrame_t stereo ) {
 	re.G2API_SetTime(cl.serverTime, 1);
 	//rww - RAGDOLL_END
 
+	int tDrawStart = Sys_Milliseconds();
 	if (clc.newDemoPlayer) {
 		demoRenderFrame( stereo );
 	} else {
 		VM_Call( cgvm, CG_DRAW_ACTIVE_FRAME, cl.serverTime, stereo, clc.demoplaying );
+	}
+	int tDrawElapsed = Sys_Milliseconds() - tDrawStart;
+	extern int g_jkActiveRenderedFrames;
+	if ( clc.demoplaying && g_jkActiveRenderedFrames <= 2 && tDrawElapsed > 500 ) {
+		extern int com_frameTime;
+		com_frameTime = Com_Milliseconds();
 	}
 }
 

@@ -82,10 +82,19 @@ Dlls will call this directly
 
 ============
 */
+#ifdef __EMSCRIPTEN__
+extern "C" {
+	void CG_dllEntry( intptr_t (QDECL *syscallptr)( intptr_t arg, ... ) );
+	intptr_t CG_vmMain( int command, int arg0, int arg1, int arg2, int arg3, int arg4, int arg5, int arg6, int arg7, int arg8, int arg9, int arg10, int arg11 );
+	void UI_dllEntry( intptr_t (QDECL *syscallptr)( intptr_t arg, ... ) );
+	intptr_t UI_vmMain( int command, int arg0, int arg1, int arg2, int arg3, int arg4, int arg5, int arg6, int arg7, int arg8, int arg9, int arg10, int arg11 );
+}
+#endif
+
 intptr_t QDECL VM_DllSyscall( intptr_t arg, ... ) {
-#if !id386 || defined __clang__ || defined MACOS_X || __ANDROID__
+#if !id386 || defined __clang__ || defined MACOS_X || __ANDROID__ || defined __EMSCRIPTEN__
   // rcg010206 - see commentary above
-  intptr_t args[16];
+  intptr_t args[16] = {0};
   va_list ap;
 
   args[0] = arg;
@@ -149,6 +158,22 @@ vm_t *VM_CreateLegacy( vmSlots_t vmSlot, intptr_t (*systemCalls)(intptr_t *) ) {
 	vm->slot = vmSlot;
 	Q_strncpyz( vm->name, vmNames[vmSlot], sizeof( vm->name ) );
 	vm->legacy.syscall = systemCalls;
+
+#ifdef __EMSCRIPTEN__
+	currentVM = vm;
+	if ( vmSlot == VM_CGAME ) {
+		CG_dllEntry( VM_DllSyscall );
+		vm->legacy.main = (entryPoint_t)CG_vmMain;
+		vm->dllHandle = (void *)1;
+		return vm;
+	}
+	if ( vmSlot == VM_UI ) {
+		UI_dllEntry( VM_DllSyscall );
+		vm->legacy.main = (entryPoint_t)UI_vmMain;
+		vm->dllHandle = (void *)2;
+		return vm;
+	}
+#endif
 
 	// find the legacy syscall api
 	FS_FindPureDLL( vm->name );
@@ -215,8 +240,10 @@ void VM_Free( vm_t *vm ) {
 	// mark the slot as free
 	vmTable[vm->slot] = NULL;
 
+#ifndef __EMSCRIPTEN__
 	if ( vm->dllHandle )
 		Sys_UnloadDll( vm->dllHandle );
+#endif
 
 	memset( vm, 0, sizeof( *vm ) );
 
@@ -341,8 +368,8 @@ intptr_t QDECL VM_Call(vm_t *vm, int callnum, ...) {
 	for (size_t i=0; i<ARRAY_LEN(args); i++)
 		args[i] = va_arg(ap, intptr_t);
 	va_end(ap);
-	r = vm->legacy.main(callnum, args[ 0], args[ 1], args[ 2], args[ 3], args[ 4], args[ 5], args[ 6], args[ 7],
-								 args[ 8], args[ 9], args[10], args[11], args[12], args[13], args[14], args[15]);
+	r = vm->legacy.main(callnum, (int)args[ 0], (int)args[ 1], (int)args[ 2], (int)args[ 3], (int)args[ 4], (int)args[ 5],
+								 (int)args[ 6], (int)args[ 7], (int)args[ 8], (int)args[ 9], (int)args[10], (int)args[11]);
 	if (oldVM != NULL) // bk001220 - assert(currentVM!=NULL) for oldVM==NULL
 		currentVM = oldVM;
 	return r;

@@ -54,7 +54,7 @@ void CG_RegisterWeapon( int weaponNum) {
 	}
 
 	weaponInfo->weaponIcon = trap_R_RegisterShader( item->icon );
-	weaponInfo->ammoIcon = trap_R_RegisterShader( item->icon );
+	weaponInfo->ammoIcon = weaponInfo->weaponIcon;
 
 	for ( ammo = bg_itemlist + 1 ; ammo->classname ; ammo++ ) {
 		if ( ammo->giType == IT_AMMO && ammo->giTag == weaponNum ) {

@@ -4,7 +4,7 @@
 #include "tr_local.h"
 #include "../client/snd_public.h"
 
-#if (!defined (HAVE_GLES) || defined (X86_OR_64)) && !defined (__arm64__)
+#if (!defined (HAVE_GLES) || defined (X86_OR_64)) && !defined (__arm64__) && !defined (__EMSCRIPTEN__)
 #include <mmintrin.h>
 #endif
 
@@ -100,7 +100,7 @@ void mmeAviShot( mmeAviFile_t *aviFile, const char *name, mmeShotType_t type, in
 void mmeAviSound( mmeAviFile_t *aviFile, const char *name, mmeShotType_t type, int width, int height, float fps, const byte *soundBuf, int size );
 void aviClose( mmeAviFile_t *aviFile );
 
-#if !defined (HAVE_GLES) || defined (X86_OR_64)
+#if (!defined (HAVE_GLES) || defined (X86_OR_64)) && !defined (__arm64__) && !defined (__EMSCRIPTEN__)
 void MME_AccumClearSSE( void* Q_RESTRICT w, const void* Q_RESTRICT r, short int mul, int count );
 void MME_AccumAddSSE( void* Q_RESTRICT w, const void* Q_RESTRICT r, short int mul, int count );
 void MME_AccumShiftSSE( const void *r, void *w, int count );

@@ -13,9 +13,383 @@
 
 #include "platform.h"
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <sys/stat.h>
+#include <errno.h>
+#endif
+
 // TTimo - https://zerowing.idsoftware.com/bugzilla/show_bug.cgi?id=540
 // wether we did a reorder on the current search path when joining the server
 static qboolean fs_reordered;
+
+extern "C" {
+long long g_jkPk3BytesTransferred = 0;
+int g_jkPk3RangeRequests = 0;
+}
+
+#ifdef __EMSCRIPTEN__
+#define WASM_PK3_CHUNK_SIZE 262144
+#define MAX_WASM_PK3_ARCHIVES 1024
+
+typedef struct WasmPk3Archive_s {
+	char			name[128];
+	char			basename[128];
+	int				checksum;
+	unsigned long	size;
+	unsigned long	cd_offset;
+	unsigned long	cd_size;
+	qboolean		base_init;
+	char			maps[512];
+	unsigned char	*cd_data;
+	unsigned long	num_chunks;
+	unsigned char	**chunks;
+	pack_t			*loadedPack;
+} WasmPk3Archive;
+
+typedef struct WasmPk3Stream_s {
+	WasmPk3Archive	*archive;
+	unsigned long	pos;
+	int				err;
+} WasmPk3Stream;
+
+static WasmPk3Archive g_wasmPk3Archives[MAX_WASM_PK3_ARCHIVES];
+static int g_numWasmPk3Archives = 0;
+static qboolean g_wasmPk3Initialized = qfalse;
+static unsigned long g_wasmPk3ReadHint = 0;
+extern "C" int JK_DemoIsPlaying( void );
+
+void WasmPK3_ClearLoadedPacks( void ) {
+	for ( int i = 0; i < g_numWasmPk3Archives; i++ ) {
+		g_wasmPk3Archives[i].loadedPack = NULL;
+	}
+}
+
+EM_JS(int, wasm_js_fetch_manifest, (char *buf, int maxLen), {
+	try {
+		var data = (typeof window !== 'undefined' && window.__jkPk3Manifest) ? window.__jkPk3Manifest : null;
+		if (!data && typeof localStorage !== 'undefined') {
+			try {
+				var raw = localStorage.getItem('openjk_pk3_manifest_v2');
+				if (raw) {
+					var parsed = JSON.parse(raw);
+					if (parsed && parsed.pk3s && parsed.pk3s.length > 0 && typeof parsed.pk3s[0].checksum === 'number') {
+						data = parsed;
+					}
+				}
+			} catch (e0) {}
+		}
+		if (!data) {
+			var xhr = new XMLHttpRequest();
+			xhr.open('GET', '/base/manifest.json', false);
+			xhr.send(null);
+			if (xhr.status < 200 || xhr.status >= 300) return 0;
+			data = JSON.parse(xhr.responseText);
+			if (typeof window !== 'undefined') window.__jkPk3Manifest = data;
+			if (typeof localStorage !== 'undefined') {
+				try { localStorage.setItem('openjk_pk3_manifest_v2', JSON.stringify(data)); } catch (e1) {}
+			}
+		}
+		var list = (data && data.pk3s) ? data.pk3s : [];
+		var lines = list.map(function(p) {
+			var base = p.basename || (p.name ? p.name.replace(/[.](?:dis_)?pk_?3?.*$/i, "").toLowerCase() : "");
+			var sum = (typeof p.checksum === 'number') ? (p.checksum | 0) : 0;
+			var baseInit = (typeof p.base_init === 'boolean')
+				? (p.base_init ? 1 : 0)
+				: (/^assets[0-3][.]pk3$/i.test(p.name || "") ? 1 : 0);
+			var mapsStr = Array.isArray(p.maps) ? p.maps.join(',') : (p.maps || "");
+			return p.name + '|' + base + '|' + sum + '|' + p.size + '|' + p.cd_offset + '|' + p.cd_size + '|' + baseInit + '|' + mapsStr;
+		}).join('\n');
+		var bytes = new TextEncoder().encode(lines);
+		var copyLen = Math.min(bytes.length, maxLen - 1);
+		HEAPU8.set(bytes.subarray(0, copyLen), buf);
+		HEAPU8[buf + copyLen] = 0;
+		return list.length;
+	} catch (e) {
+		console.error('wasm_js_fetch_manifest failed:', e);
+		return 0;
+	}
+});
+
+EM_JS(int, wasm_js_get_cached_cd, (const char *namePtr, int start, int end, unsigned char *dst), {
+	try {
+		if (typeof window !== 'undefined' && typeof window.__jkPk3GetCachedCD === 'function') {
+			return window.__jkPk3GetCachedCD(UTF8ToString(namePtr), start, end, dst) | 0;
+		}
+	} catch (e) {}
+	return 0;
+});
+
+EM_JS(int, wasm_js_has_cached_chunk, (const char *namePtr, int chunkIdx), {
+	try {
+		if (typeof window !== 'undefined' && typeof window.__jkPk3HasCachedChunk === 'function') {
+			return window.__jkPk3HasCachedChunk(UTF8ToString(namePtr), chunkIdx) ? 1 : 0;
+		}
+	} catch (e) {}
+	return 0;
+});
+
+EM_JS(int, wasm_js_get_cached_chunk, (const char *namePtr, int chunkIdx, unsigned char *dst, int maxLen), {
+	try {
+		if (typeof window !== 'undefined' && typeof window.__jkPk3GetCachedChunk === 'function') {
+			return window.__jkPk3GetCachedChunk(UTF8ToString(namePtr), chunkIdx, dst, maxLen) | 0;
+		}
+	} catch (e) {}
+	return 0;
+});
+
+EM_JS(int, wasm_js_fetch_range, (const char *namePtr, int start, int end, unsigned char *dst), {
+	try {
+		var name = UTF8ToString(namePtr);
+		var xhr = new XMLHttpRequest();
+		xhr.open('GET', '/base/' + name, false);
+		xhr.setRequestHeader('Range', 'bytes=' + start + '-' + end);
+		xhr.overrideMimeType('text/plain; charset=x-user-defined');
+		xhr.send(null);
+		if (xhr.status !== 200 && xhr.status !== 206) {
+			console.error('Range fetch failed for', name, start, end, xhr.status);
+			return -1;
+		}
+		var text = xhr.responseText || "";
+		var expected = (end - start) + 1;
+		var copyLen = Math.min(text.length, expected);
+		for (var i = 0; i < copyLen; i++) {
+			HEAPU8[dst + i] = text.charCodeAt(i) & 0xff;
+		}
+		if (typeof window !== 'undefined' && typeof window.__jkPk3OnRangeFetched === 'function' && copyLen > 0) {
+			try {
+				window.__jkPk3OnRangeFetched(name, start, end, HEAPU8.subarray(dst, dst + copyLen));
+			} catch (e2) {}
+		}
+		if (typeof Module !== 'undefined') {
+			Module._pk3BytesTransferred = (Module._pk3BytesTransferred || 0) + copyLen;
+			Module._pk3RangeRequests = (Module._pk3RangeRequests || 0) + 1;
+		}
+		return copyLen;
+	} catch (e) {
+		console.error('wasm_js_fetch_range exception:', e);
+		return -1;
+	}
+});
+
+static WasmPk3Archive *WasmPK3_FindArchive(const char *path) {
+	const char *slash1 = strrchr(path, '/');
+	const char *slash2 = strrchr(path, '\\');
+	const char *base = path;
+	if (slash1 && slash2) base = (slash1 > slash2 ? slash1 : slash2) + 1;
+	else if (slash1) base = slash1 + 1;
+	else if (slash2) base = slash2 + 1;
+
+	for (int i = 0; i < g_numWasmPk3Archives; i++) {
+		if (!Q_stricmp(g_wasmPk3Archives[i].name, base)) {
+			return &g_wasmPk3Archives[i];
+		}
+	}
+	return NULL;
+}
+
+static voidpf ZCALLBACK wasm_pk3_open(voidpf opaque, const char *filename, int mode) {
+	(void)opaque;
+	(void)mode;
+	WasmPk3Archive *arch = WasmPK3_FindArchive(filename);
+	if (!arch) return NULL;
+	WasmPk3Stream *st = (WasmPk3Stream *)malloc(sizeof(WasmPk3Stream));
+	if (!st) return NULL;
+	st->archive = arch;
+	st->pos = 0;
+	st->err = 0;
+	return (voidpf)st;
+}
+
+static uLong ZCALLBACK wasm_pk3_read(voidpf opaque, voidpf stream, void *buf, uLong size) {
+	(void)opaque;
+	WasmPk3Stream *st = (WasmPk3Stream *)stream;
+	if (!st || !st->archive || size == 0) return 0;
+	WasmPk3Archive *arch = st->archive;
+	if (st->pos >= arch->size) return 0;
+	if (st->pos + size > arch->size) {
+		size = arch->size - st->pos;
+	}
+
+	if (arch->cd_data && st->pos >= arch->cd_offset && (st->pos + size) <= (arch->cd_offset + arch->cd_size)) {
+		memcpy(buf, arch->cd_data + (st->pos - arch->cd_offset), size);
+		st->pos += size;
+		return size;
+	}
+
+	unsigned long hint = g_wasmPk3ReadHint;
+	g_wasmPk3ReadHint = 0;
+	unsigned long target_end = st->pos + size;
+	if (hint > 0) {
+		if (hint > 8 * 1024 * 1024) hint = 8 * 1024 * 1024;
+		if (st->pos + size + hint > target_end) {
+			target_end = st->pos + size + hint;
+		}
+		if (target_end > arch->size) {
+			target_end = arch->size;
+		}
+	}
+
+	unsigned long c_start = st->pos / WASM_PK3_CHUNK_SIZE;
+	unsigned long c_end = (target_end - 1) / WASM_PK3_CHUNK_SIZE;
+
+	for (unsigned long c = c_start; c <= c_end; c++) {
+		if (!arch->chunks[c] && wasm_js_has_cached_chunk(arch->name, (int)c)) {
+			unsigned long c_byte_start = c * WASM_PK3_CHUNK_SIZE;
+			unsigned long c_byte_end = c_byte_start + WASM_PK3_CHUNK_SIZE;
+			if (c_byte_end > arch->size) c_byte_end = arch->size;
+			unsigned long c_len = c_byte_end - c_byte_start;
+			arch->chunks[c] = (unsigned char *)malloc(c_len);
+			if (arch->chunks[c]) {
+				if (wasm_js_get_cached_chunk(arch->name, (int)c, arch->chunks[c], (int)c_len) <= 0) {
+					free(arch->chunks[c]);
+					arch->chunks[c] = NULL;
+				}
+			}
+		}
+	}
+
+	for (unsigned long c = c_start; c <= c_end; c++) {
+		if (!arch->chunks[c]) {
+			unsigned long miss_start = c;
+			unsigned long miss_end = c;
+			while (miss_end + 1 <= c_end && !arch->chunks[miss_end + 1]) {
+				miss_end++;
+			}
+			unsigned long byte_start = miss_start * WASM_PK3_CHUNK_SIZE;
+			unsigned long byte_end = (miss_end + 1) * WASM_PK3_CHUNK_SIZE;
+			if (byte_end > arch->size) byte_end = arch->size;
+			unsigned long span_len = byte_end - byte_start;
+			unsigned char *temp_buf = (unsigned char *)malloc(span_len);
+			if (!temp_buf) {
+				st->err = 1;
+				return 0;
+			}
+			int fetched = wasm_js_fetch_range(arch->name, (int)byte_start, (int)(byte_end - 1), temp_buf);
+			if (fetched <= 0) {
+				free(temp_buf);
+				st->err = 1;
+				return 0;
+			}
+			g_jkPk3BytesTransferred += fetched;
+			if ( JK_DemoIsPlaying() || g_jkPk3RangeRequests < 8 ) {
+				g_jkPk3RangeRequests += 1;
+			}
+
+			for (unsigned long mc = miss_start; mc <= miss_end; mc++) {
+				unsigned long c_byte_start = mc * WASM_PK3_CHUNK_SIZE;
+				unsigned long c_byte_end = c_byte_start + WASM_PK3_CHUNK_SIZE;
+				if (c_byte_end > arch->size) c_byte_end = arch->size;
+				unsigned long c_len = c_byte_end - c_byte_start;
+				arch->chunks[mc] = (unsigned char *)malloc(c_len);
+				if (arch->chunks[mc]) {
+					unsigned long off_in_temp = c_byte_start - byte_start;
+					if (off_in_temp + c_len <= (unsigned long)fetched) {
+						memcpy(arch->chunks[mc], temp_buf + off_in_temp, c_len);
+					} else if (off_in_temp < (unsigned long)fetched) {
+						memcpy(arch->chunks[mc], temp_buf + off_in_temp, (unsigned long)fetched - off_in_temp);
+					}
+				}
+			}
+			free(temp_buf);
+			c = miss_end;
+		}
+	}
+
+	unsigned char *out = (unsigned char *)buf;
+	unsigned long remaining = size;
+	while (remaining > 0) {
+		unsigned long c_idx = st->pos / WASM_PK3_CHUNK_SIZE;
+		unsigned long c_off = st->pos % WASM_PK3_CHUNK_SIZE;
+		unsigned long c_avail = WASM_PK3_CHUNK_SIZE - c_off;
+		if (st->pos + c_avail > arch->size) {
+			c_avail = arch->size - st->pos;
+		}
+		unsigned long to_copy = (remaining < c_avail) ? remaining : c_avail;
+		if (!arch->chunks[c_idx]) {
+			st->err = 1;
+			break;
+		}
+		memcpy(out, arch->chunks[c_idx] + c_off, to_copy);
+		out += to_copy;
+		st->pos += to_copy;
+		remaining -= to_copy;
+	}
+
+	return size - remaining;
+}
+
+static uLong ZCALLBACK wasm_pk3_write(voidpf opaque, voidpf stream, const void *buf, uLong size) {
+	(void)opaque; (void)stream; (void)buf; (void)size;
+	return 0;
+}
+
+static long ZCALLBACK wasm_pk3_tell(voidpf opaque, voidpf stream) {
+	(void)opaque;
+	WasmPk3Stream *st = (WasmPk3Stream *)stream;
+	return st ? (long)st->pos : -1;
+}
+
+static long ZCALLBACK wasm_pk3_seek(voidpf opaque, voidpf stream, uLong offset, int origin) {
+	(void)opaque;
+	WasmPk3Stream *st = (WasmPk3Stream *)stream;
+	if (!st || !st->archive) return -1;
+	long newPos = 0;
+	if (origin == ZLIB_FILEFUNC_SEEK_SET) newPos = (long)offset;
+	else if (origin == ZLIB_FILEFUNC_SEEK_CUR) newPos = (long)st->pos + (long)offset;
+	else if (origin == ZLIB_FILEFUNC_SEEK_END) newPos = (long)st->archive->size + (long)offset;
+	else return -1;
+	if (newPos < 0 || (unsigned long)newPos > st->archive->size) return -1;
+	st->pos = (unsigned long)newPos;
+	return 0;
+}
+
+static int ZCALLBACK wasm_pk3_close(voidpf opaque, voidpf stream) {
+	(void)opaque;
+	if (stream) free(stream);
+	return 0;
+}
+
+static int ZCALLBACK wasm_pk3_error(voidpf opaque, voidpf stream) {
+	(void)opaque;
+	WasmPk3Stream *st = (WasmPk3Stream *)stream;
+	return st ? st->err : 1;
+}
+
+static zlib_filefunc_def g_wasmPk3FileFunc = {
+	wasm_pk3_open,
+	wasm_pk3_read,
+	wasm_pk3_write,
+	wasm_pk3_tell,
+	wasm_pk3_seek,
+	wasm_pk3_close,
+	wasm_pk3_error,
+	NULL
+};
+#endif
+
+static unzFile FS_UnzOpen(const char *zipfile) {
+#ifdef __EMSCRIPTEN__
+	if (WasmPK3_FindArchive(zipfile)) {
+		return unzOpen2(zipfile, &g_wasmPk3FileFunc);
+	}
+#endif
+	return unzOpen(zipfile);
+}
+
+static void FS_EnsureZipEntryOpened(fileHandle_t f) {
+	if (fsh[f].zipFile == qtrue && !fsh[f].zipEntryOpened) {
+		unzSetOffset(fsh[f].handleFiles.file.z, fsh[f].zipFilePos);
+#ifdef __EMSCRIPTEN__
+		unz_file_info fi;
+		if (unzGetCurrentFileInfo(fsh[f].handleFiles.file.z, &fi, NULL, 0, NULL, 0, NULL, 0) == UNZ_OK) {
+			g_wasmPk3ReadHint = fi.compressed_size + 256;
+		}
+#endif
+		unzOpenCurrentFile(fsh[f].handleFiles.file.z);
+		fsh[f].zipEntryOpened = qtrue;
+	}
+}
 
 /*
 =================
@@ -643,7 +1017,10 @@ void FS_FCloseFile( fileHandle_t f ) {
 		Sys_EndStreamedFile(f);
 	}
 	if (fsh[f].zipFile == qtrue) {
-		unzCloseCurrentFile( fsh[f].handleFiles.file.z );
+		if (fsh[f].zipEntryOpened) {
+			unzCloseCurrentFile( fsh[f].handleFiles.file.z );
+			fsh[f].zipEntryOpened = qfalse;
+		}
 		if ( fsh[f].handleFiles.unique ) {
 			unzClose( fsh[f].handleFiles.file.z );
 		}
@@ -1154,7 +1531,7 @@ long FS_FOpenFileRead( const char *filename, fileHandle_t *file, qboolean unique
 
 						if ( uniqueFILE ) {
 							// open a new file on the pakfile
-							fsh[*file].handleFiles.file.z = unzOpen (pak->pakFilename);
+							fsh[*file].handleFiles.file.z = FS_UnzOpen (pak->pakFilename);
 							if (fsh[*file].handleFiles.file.z == NULL) {
 								Com_Error (ERR_FATAL, "Couldn't reopen %s", pak->pakFilename);
 							}
@@ -1163,6 +1540,12 @@ long FS_FOpenFileRead( const char *filename, fileHandle_t *file, qboolean unique
 						}
 						Q_strncpyz( fsh[*file].name, filename, sizeof( fsh[*file].name ) );
 						fsh[*file].zipFile = qtrue;
+						fsh[*file].zipFilePos = pakFile->pos;
+						fsh[*file].zipFileLen = pakFile->len;
+
+#ifdef __EMSCRIPTEN__
+						fsh[*file].zipEntryOpened = qfalse;
+#else
 						zfi = (unz_s *)fsh[*file].handleFiles.file.z;
 						// in case the file was new
 						temp = zfi->filestream;
@@ -1174,7 +1557,8 @@ long FS_FOpenFileRead( const char *filename, fileHandle_t *file, qboolean unique
 						zfi->filestream = temp;
 						// open the file in the zip
 						unzOpenCurrentFile( fsh[*file].handleFiles.file.z );
-						fsh[*file].zipFilePos = pakFile->pos;
+						fsh[*file].zipEntryOpened = qtrue;
+#endif
 
 						if ( fs_debug->integer ) {
 							Com_Printf( "FS_FOpenFileRead: %s (found in '%s')\n", 
@@ -1189,7 +1573,7 @@ long FS_FOpenFileRead( const char *filename, fileHandle_t *file, qboolean unique
 						}
 	#endif
 	#endif // DEDICATED
-						return zfi->cur_file_info.uncompressed_size;
+						return pakFile->len;
 					}
 					pakFile = pakFile->next;
 				} while(pakFile != NULL);
@@ -1430,6 +1814,7 @@ int FS_Read( void *buffer, int len, fileHandle_t f ) {
 		}
 		return len;
 	} else {
+		FS_EnsureZipEntryOpened(f);
 		return unzReadCurrentFile(fsh[f].handleFiles.file.z, buffer, len);
 	}
 }
@@ -1595,11 +1980,15 @@ int FS_Seek( fileHandle_t f, long offset, int origin ) {
 
 		switch( origin ) {
 			case FS_SEEK_SET:
-				unzSetOffset(fsh[f].handleFiles.file.z, fsh[f].zipFilePos);
-				unzOpenCurrentFile(fsh[f].handleFiles.file.z);
+				if ( fsh[f].zipEntryOpened ) {
+					unzCloseCurrentFile(fsh[f].handleFiles.file.z);
+					fsh[f].zipEntryOpened = qfalse;
+				}
+				FS_EnsureZipEntryOpened(f);
 				//fallthrough
 
 			case FS_SEEK_CUR:
+				FS_EnsureZipEntryOpened(f);
 				while( remainder > PK3_SEEK_BUFFER_SIZE ) {
 					FS_Read( buffer, PK3_SEEK_BUFFER_SIZE, f );
 					remainder -= PK3_SEEK_BUFFER_SIZE;
@@ -1893,7 +2282,7 @@ static pack_t *FS_LoadZipFile( const char *zipfile, const char *basename )
 
 	fs_numHeaderLongs = 0;
 
-	uf = unzOpen(zipfile);
+	uf = FS_UnzOpen(zipfile);
 	err = unzGetGlobalInfo (uf,&gi);
 
 	if (err != UNZ_OK)
@@ -1959,6 +2348,7 @@ static pack_t *FS_LoadZipFile( const char *zipfile, const char *basename )
 		namePtr += strlen(filename_inzip) + 1;
 		// store the file position in the zip
 		buildBuffer[i].pos = unzGetOffset(uf);
+		buildBuffer[i].len = file_info.uncompressed_size;
 		//
 		buildBuffer[i].next = pack->hashTable[hash];
 		pack->hashTable[hash] = &buildBuffer[i];
@@ -2792,8 +3182,454 @@ static void FS_AddGameDirectory( const char *path, const char *dir ) {
 	}
 
 	// done
-	Sys_FreeFileList( pakfiles );
+	if (pakfiles) {
+		Sys_FreeFileList( pakfiles );
+	}
 }
+
+extern "C" int FS_GetLoadedPackCount( void ) {
+	int count = 0;
+	for ( searchpath_t *sp = fs_searchpaths; sp; sp = sp->next ) {
+		if ( sp->pack ) {
+			count++;
+		}
+	}
+	return count;
+}
+
+#ifdef __EMSCRIPTEN__
+static void WasmPK3_EnsureCentralDirLoaded( WasmPk3Archive *arch ) {
+	if ( !arch || arch->size == 0 ) {
+		return;
+	}
+	if ( !arch->chunks ) {
+		arch->num_chunks = (arch->size + WASM_PK3_CHUNK_SIZE - 1) / WASM_PK3_CHUNK_SIZE;
+		arch->chunks = (unsigned char **)calloc( arch->num_chunks, sizeof(unsigned char *) );
+	}
+	if ( !arch->cd_data && arch->cd_size > 0 ) {
+		arch->cd_data = (unsigned char *)malloc( arch->cd_size );
+		if ( arch->cd_data ) {
+			int cached = wasm_js_get_cached_cd( arch->name, (int)arch->cd_offset, (int)(arch->size - 1), arch->cd_data );
+			if ( cached > 0 ) {
+				g_jkPk3BytesTransferred += cached;
+				g_jkPk3RangeRequests += 1;
+			} else {
+				int fetched = wasm_js_fetch_range( arch->name, (int)arch->cd_offset, (int)(arch->size - 1), arch->cd_data );
+				if ( fetched > 0 ) {
+					g_jkPk3BytesTransferred += fetched;
+					g_jkPk3RangeRequests += 1;
+				}
+			}
+		}
+	}
+}
+
+static void WasmPK3_InitManifest( const char *gameName ) {
+	if ( !g_wasmPk3Initialized ) {
+		mkdir( "/base", 0777 );
+		mkdir( "/base/demos", 0777 );
+		mkdir( "/base/mmedemos", 0777 );
+		mkdir( "/base/shaders", 0777 );
+		FILE *mmecfg = fopen( "/base/mmedemos.cfg", "wb" );
+		if ( mmecfg ) {
+			const char *mmedefaults =
+				"seta cg_deferplayers \"0\"\n"
+				"seta mme_demoRemove \"1\"\n";
+			fwrite( mmedefaults, 1, strlen( mmedefaults ), mmecfg );
+			fclose( mmecfg );
+		}
+		FILE *mmeshader = fopen( "/base/shaders/mme.shader", "wb" );
+		if ( mmeshader ) {
+			const char *shadertext =
+				"mme_additiveWhite\n{\n\t{\n\t\tmap *white\n\t\tblendfunc GL_SRC_ALPHA GL_ONE\n\t\trgbGen vertex\n\t\talphaGen vertex\n\t}\n}\n"
+				"mme/red\n{\n\t{\n\t\tmap *white\n\t\trgbgen const ( 1 0 0 )\n\t}\n}\n"
+				"mme/green\n{\n\t{\n\t\tmap *white\n\t\trgbgen const ( 0 1 0 )\n\t}\n}\n"
+				"mme/blue\n{\n\t{\n\t\tmap *white\n\t\trgbgen const ( 0 0 1 )\n\t}\n}\n"
+				"mme/black\n{\n\t{\n\t\tmap *white\n\t\trgbgen const ( 0 0 0 )\n\t}\n}\n"
+				"mme/white\n{\n\t{\n\t\tmap *white\n\t\trgbgen const ( 1 1 1 )\n\t}\n}\n"
+				"mme_cursor\n{\n\tnopicmip\n\tnomipmaps\n\t{\n\t\tmap *white\n\t\tblendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA\n\t\trgbGen identity\n\t}\n}\n";
+			fwrite( shadertext, 1, strlen( shadertext ), mmeshader );
+			fclose( mmeshader );
+		}
+
+		const int manifestBufSize = 262144;
+		char *manifestBuf = (char *)malloc( manifestBufSize );
+		if ( manifestBuf ) {
+			manifestBuf[0] = '\0';
+			int count = wasm_js_fetch_manifest( manifestBuf, manifestBufSize );
+			if ( count > 0 && manifestBuf[0] ) {
+				char *line = manifestBuf;
+				while ( line && *line && g_numWasmPk3Archives < MAX_WASM_PK3_ARCHIVES ) {
+					char *nextLine = strchr( line, '\n' );
+					if ( nextLine ) *nextLine++ = '\0';
+
+					// Parse 8 pipe-delimited fields: name|basename|checksum|size|cd_offset|cd_size|base_init|maps
+					char *fields[8];
+					int numFields = 0;
+					char *p = line;
+					while ( numFields < 8 ) {
+						fields[numFields++] = p;
+						char *bar = strchr( p, '|' );
+						if ( !bar ) break;
+						*bar = '\0';
+						p = bar + 1;
+					}
+
+					if ( numFields >= 7 ) {
+						unsigned long size = strtoul( fields[3], NULL, 10 );
+						unsigned long cd_offset = strtoul( fields[4], NULL, 10 );
+						if ( fields[0][0] && size > 0 ) {
+							WasmPk3Archive *arch = &g_wasmPk3Archives[g_numWasmPk3Archives++];
+							Com_Memset( arch, 0, sizeof(*arch) );
+							Q_strncpyz( arch->name, fields[0], sizeof(arch->name) );
+							Q_strncpyz( arch->basename, fields[1], sizeof(arch->basename) );
+							arch->checksum = atoi( fields[2] );
+							arch->size = size;
+							unsigned long tail_offset = cd_offset;
+							if ( size - tail_offset < 2048 ) {
+								tail_offset = (size > 2048) ? (size - 2048) : 0;
+							}
+							arch->cd_offset = tail_offset;
+							arch->cd_size = size - tail_offset;
+							arch->base_init = (atoi( fields[6] ) != 0) ? qtrue : qfalse;
+							if ( numFields >= 8 && fields[7] ) {
+								Q_strncpyz( arch->maps, fields[7], sizeof(arch->maps) );
+							}
+							if ( arch->base_init ) {
+								WasmPK3_EnsureCentralDirLoaded( arch );
+							}
+						}
+					}
+					line = nextLine;
+				}
+			}
+			free( manifestBuf );
+		}
+		g_wasmPk3Initialized = qtrue;
+	}
+
+	for ( int i = 0; i < g_numWasmPk3Archives; i++ ) {
+		if ( !g_wasmPk3Archives[i].base_init ) {
+			continue;
+		}
+		char *ospath = FS_BuildOSPath( fs_basepath->string, gameName, g_wasmPk3Archives[i].name );
+		FS_CreatePath( ospath );
+		FILE *fp = fopen( ospath, "rb" );
+		if ( !fp ) {
+			fp = fopen( ospath, "wb" );
+		}
+		if ( fp ) fclose( fp );
+	}
+}
+
+static qboolean WasmPK3_NextToken( const char **cursor, char *out, size_t outSize ) {
+	if ( !cursor || !*cursor || !out || outSize == 0 ) {
+		return qfalse;
+	}
+	const char *s = *cursor;
+	while ( *s && *s <= ' ' ) {
+		s++;
+	}
+	if ( !*s ) {
+		*cursor = s;
+		out[0] = '\0';
+		return qfalse;
+	}
+	size_t i = 0;
+	while ( *s && *s > ' ' ) {
+		if ( i + 1 < outSize ) {
+			out[i++] = *s;
+		}
+		s++;
+	}
+	out[i] = '\0';
+	*cursor = s;
+	return qtrue;
+}
+
+static void WasmPK3_ExtractCanonicalBase( const char *pakToken, char *outBase, size_t outSize ) {
+	if ( !outBase || outSize == 0 ) return;
+	outBase[0] = '\0';
+	if ( !pakToken || !pakToken[0] ) return;
+	const char *slash1 = strrchr( pakToken, '/' );
+	const char *slash2 = strrchr( pakToken, '\\');
+	const char *leaf = pakToken;
+	if ( slash1 && slash2 ) leaf = (slash1 > slash2 ? slash1 : slash2) + 1;
+	else if ( slash1 ) leaf = slash1 + 1;
+	else if ( slash2 ) leaf = slash2 + 1;
+
+	Q_strncpyz( outBase, leaf, outSize );
+	Q_strlwr( outBase );
+	size_t len = strlen( outBase );
+	if ( len > 4 && !Q_stricmp( outBase + len - 4, ".pk3" ) ) {
+		outBase[len - 4] = '\0';
+	}
+}
+
+static qboolean WasmPK3_IsFileInMountedPacks( const char *filename ) {
+	if ( !filename || !filename[0] ) {
+		return qfalse;
+	}
+	for ( searchpath_t *search = fs_searchpaths; search; search = search->next ) {
+		if ( !search->pack ) continue;
+		long hash = FS_HashFileName( filename, search->pack->hashSize );
+		for ( fileInPack_t *pakFile = search->pack->hashTable[hash]; pakFile; pakFile = pakFile->next ) {
+			if ( !FS_FilenameCompare( pakFile->name, filename ) ) {
+				return qtrue;
+			}
+		}
+	}
+	return qfalse;
+}
+
+static qboolean WasmPK3_MapListContains( const char *mapsCsv, const char *targetMap ) {
+	if ( !mapsCsv || !mapsCsv[0] || !targetMap || !targetMap[0] ) {
+		return qfalse;
+	}
+	const char *p = mapsCsv;
+	size_t targetLen = strlen( targetMap );
+	while ( *p ) {
+		const char *comma = strchr( p, ',' );
+		size_t tokLen = comma ? (size_t)(comma - p) : strlen( p );
+		if ( tokLen == targetLen && !Q_stricmpn( p, targetMap, (int)tokLen ) ) {
+			return qtrue;
+		}
+		if ( !comma ) break;
+		p = comma + 1;
+	}
+	return qfalse;
+}
+
+static qboolean WasmPK3_MountArchive( WasmPk3Archive *arch ) {
+	if ( !arch ) {
+		return qfalse;
+	}
+	for ( searchpath_t *sp = fs_searchpaths; sp; sp = sp->next ) {
+		if ( sp->pack && (sp->pack == arch->loadedPack || !Q_stricmp( sp->pack->pakFilename, arch->name )) ) {
+			return qtrue;
+		}
+	}
+
+	WasmPK3_EnsureCentralDirLoaded( arch );
+	const char *gameDir = (fs_gamedir[0] ? fs_gamedir : BASEGAME);
+	char *ospath = FS_BuildOSPath( fs_basepath->string, gameDir, arch->name );
+	FS_CreatePath( ospath );
+	FILE *fp = fopen( ospath, "rb" );
+	if ( !fp ) {
+		fp = fopen( ospath, "wb" );
+	}
+	if ( fp ) fclose( fp );
+
+	if ( !arch->loadedPack ) {
+		char curpath[MAX_OSPATH];
+		Q_strncpyz( curpath, ospath, sizeof(curpath) );
+		char *sep = strrchr( curpath, PATH_SEP );
+		if ( sep ) *sep = '\0';
+		pack_t *pak = FS_LoadZipFile( ospath, arch->basename[0] ? arch->basename : arch->name );
+		if ( !pak ) {
+			return qfalse;
+		}
+		Q_strncpyz( pak->pakPathname, curpath, sizeof(pak->pakPathname) );
+		Q_strncpyz( pak->pakGamename, gameDir, sizeof(pak->pakGamename) );
+		arch->loadedPack = pak;
+	}
+
+	fs_packFiles += arch->loadedPack->numfiles;
+	searchpath_t *search = (searchpath_t *)Z_Malloc( sizeof(searchpath_t), TAG_FILESYS, qtrue );
+	search->pack = arch->loadedPack;
+	search->next = fs_searchpaths;
+	fs_searchpaths = search;
+	Com_Printf( "WasmPK3: mounted on-demand %s (checksum=%d)\n", arch->name, arch->checksum );
+	return qtrue;
+}
+
+static void WasmPK3_ResolveAndMountList( const char *sumsStr, const char *namesStr, const char *mapName, qboolean onlyMapCandidates ) {
+	const char *sumsCur = sumsStr ? sumsStr : "";
+	const char *namesCur = namesStr ? namesStr : "";
+	char sumTok[64];
+	char nameTok[MAX_ZPATH];
+	char cleanBase[128];
+	char bspPath[MAX_QPATH];
+	const char *leafMap = "";
+
+	bspPath[0] = '\0';
+	if ( mapName && mapName[0] ) {
+		Com_sprintf( bspPath, sizeof(bspPath), "maps/%s.bsp", mapName );
+		const char *slash = strrchr( mapName, '/' );
+		leafMap = slash ? (slash + 1) : mapName;
+		if ( onlyMapCandidates && WasmPK3_IsFileInMountedPacks( bspPath ) ) {
+			return;
+		}
+	}
+
+	while ( WasmPK3_NextToken( &sumsCur, sumTok, sizeof(sumTok) ) ) {
+		if ( onlyMapCandidates && bspPath[0] && WasmPK3_IsFileInMountedPacks( bspPath ) ) {
+			return;
+		}
+		if ( !WasmPK3_NextToken( &namesCur, nameTok, sizeof(nameTok) ) ) {
+			nameTok[0] = '\0';
+		}
+		int targetSum = atoi( sumTok );
+		WasmPK3_ExtractCanonicalBase( nameTok, cleanBase, sizeof(cleanBase) );
+
+		// Skip if checksum is already mounted (e.g. assets0..3.pk3)
+		qboolean alreadyMounted = qfalse;
+		for ( searchpath_t *sp = fs_searchpaths; sp; sp = sp->next ) {
+			if ( sp->pack && sp->pack->checksum == targetSum ) {
+				alreadyMounted = qtrue;
+				break;
+			}
+		}
+		if ( alreadyMounted ) {
+			continue;
+		}
+
+		// Priority 1: Match by exact 32-bit Quake 3 PK3 checksum
+		WasmPk3Archive *matched = NULL;
+		for ( int i = 0; i < g_numWasmPk3Archives; i++ ) {
+			if ( g_wasmPk3Archives[i].checksum == targetSum ) {
+				if ( !matched ) {
+					matched = &g_wasmPk3Archives[i];
+				}
+				if ( cleanBase[0] && !Q_stricmp( g_wasmPk3Archives[i].basename, cleanBase ) ) {
+					matched = &g_wasmPk3Archives[i];
+					break;
+				}
+			}
+		}
+
+		// Priority 2: Fallback to canonical basename match
+		if ( !matched && cleanBase[0] ) {
+			char primaryName[160];
+			Com_sprintf( primaryName, sizeof(primaryName), "%s.pk3", cleanBase );
+			for ( int i = 0; i < g_numWasmPk3Archives; i++ ) {
+				if ( !Q_stricmp( g_wasmPk3Archives[i].basename, cleanBase ) ) {
+					if ( !matched ) {
+						matched = &g_wasmPk3Archives[i];
+					}
+					if ( !Q_stricmp( g_wasmPk3Archives[i].name, primaryName ) ) {
+						matched = &g_wasmPk3Archives[i];
+						break;
+					}
+				}
+			}
+		}
+
+		if ( matched ) {
+			if ( onlyMapCandidates && mapName && mapName[0] ) {
+				if ( !WasmPK3_MapListContains( matched->maps, mapName ) &&
+				     !WasmPK3_MapListContains( matched->maps, leafMap ) &&
+				     Q_stricmp( matched->basename, leafMap ) ) {
+					continue;
+				}
+			}
+			WasmPK3_MountArchive( matched );
+		}
+	}
+
+	// Handle any remaining pakNames if namesStr had more tokens than sumsStr
+	while ( WasmPK3_NextToken( &namesCur, nameTok, sizeof(nameTok) ) ) {
+		if ( bspPath[0] && WasmPK3_IsFileInMountedPacks( bspPath ) ) {
+			return;
+		}
+		WasmPK3_ExtractCanonicalBase( nameTok, cleanBase, sizeof(cleanBase) );
+		if ( !cleanBase[0] ) continue;
+		WasmPk3Archive *matched = NULL;
+		char primaryName[160];
+		Com_sprintf( primaryName, sizeof(primaryName), "%s.pk3", cleanBase );
+		for ( int i = 0; i < g_numWasmPk3Archives; i++ ) {
+			if ( !Q_stricmp( g_wasmPk3Archives[i].basename, cleanBase ) ) {
+				if ( !matched ) matched = &g_wasmPk3Archives[i];
+				if ( !Q_stricmp( g_wasmPk3Archives[i].name, primaryName ) ) {
+					matched = &g_wasmPk3Archives[i];
+					break;
+				}
+			}
+		}
+		if ( matched ) {
+			if ( onlyMapCandidates && mapName && mapName[0] ) {
+				if ( !WasmPK3_MapListContains( matched->maps, mapName ) &&
+				     !WasmPK3_MapListContains( matched->maps, leafMap ) &&
+				     Q_stricmp( matched->basename, leafMap ) ) {
+					continue;
+				}
+			}
+			WasmPK3_MountArchive( matched );
+		}
+	}
+}
+
+extern "C" void FS_WasmPrepareDemoPaks(
+	const char *referencedSums,
+	const char *referencedNames,
+	const char *loadedSums,
+	const char *loadedNames,
+	const char *mapName
+) {
+	// 1. Unlink any custom (!base_init) pack searchpaths from previous demo while keeping loadedPack & chunks cached
+	searchpath_t **prev = &fs_searchpaths;
+	searchpath_t *cur = fs_searchpaths;
+	while ( cur ) {
+		if ( cur->pack ) {
+			WasmPk3Archive *arch = WasmPK3_FindArchive( cur->pack->pakFilename );
+			if ( arch && !arch->base_init ) {
+				searchpath_t *toFree = cur;
+				*prev = cur->next;
+				cur = cur->next;
+				if ( fs_packFiles >= toFree->pack->numfiles ) {
+					fs_packFiles -= toFree->pack->numfiles;
+				}
+				Z_Free( toFree );
+				continue;
+			}
+		}
+		prev = &cur->next;
+		cur = cur->next;
+	}
+
+	// 2. Mount referenced paks by Priority 1 (checksum) -> Priority 2 (basename)
+	if ( referencedSums && referencedSums[0] ) {
+		WasmPK3_ResolveAndMountList( referencedSums, referencedNames, mapName, qfalse );
+	}
+	if ( loadedSums && loadedSums[0] ) {
+		WasmPK3_ResolveAndMountList( loadedSums, loadedNames, mapName, (mapName && mapName[0]) ? qtrue : qfalse );
+	}
+
+	// 3. Priority 3: Map .bsp lookup fallback if maps/<mapName>.bsp is not yet in mounted searchpaths
+	if ( mapName && mapName[0] ) {
+		char bspPath[MAX_QPATH];
+		Com_sprintf( bspPath, sizeof(bspPath), "maps/%s.bsp", mapName );
+		if ( !WasmPK3_IsFileInMountedPacks( bspPath ) && loadedSums && loadedSums[0] && referencedSums && referencedSums[0] ) {
+			const char *slash = strrchr( mapName, '/' );
+			const char *leafMap = slash ? (slash + 1) : mapName;
+			for ( int i = 0; i < g_numWasmPk3Archives; i++ ) {
+				if ( WasmPK3_MapListContains( g_wasmPk3Archives[i].maps, mapName ) ||
+				     WasmPK3_MapListContains( g_wasmPk3Archives[i].maps, leafMap ) ||
+				     !Q_stricmp( g_wasmPk3Archives[i].basename, leafMap ) ) {
+					WasmPK3_MountArchive( &g_wasmPk3Archives[i] );
+					if ( WasmPK3_IsFileInMountedPacks( bspPath ) ) {
+						break;
+					}
+				}
+			}
+		}
+		if ( !WasmPK3_IsFileInMountedPacks( bspPath ) ) {
+			const char *slash = strrchr( mapName, '/' );
+			const char *leafMap = slash ? (slash + 1) : mapName;
+			for ( int i = 0; i < g_numWasmPk3Archives; i++ ) {
+				if ( WasmPK3_MapListContains( g_wasmPk3Archives[i].maps, mapName ) ||
+				     WasmPK3_MapListContains( g_wasmPk3Archives[i].maps, leafMap ) ||
+				     !Q_stricmp( g_wasmPk3Archives[i].basename, leafMap ) ) {
+					WasmPK3_MountArchive( &g_wasmPk3Archives[i] );
+					if ( WasmPK3_IsFileInMountedPacks( bspPath ) ) {
+						break;
+					}
+				}
+			}
+		}
+	}
+}
+#endif
 
 /*
 ================
@@ -2952,6 +3788,9 @@ qboolean FS_ComparePaks( char *neededpaks, int len, qboolean dlstring ) {
 //Ensiform - this is so wrong rww
 void FS_UpdateGamedir(void)
 {
+#ifdef __EMSCRIPTEN__
+	return;
+#endif
 	if ( fs_gamedirvar->string[0] && Q_stricmp( fs_gamedirvar->string, BASEGAME ) )
 	{
 		if (fs_cdpath->string[0])
@@ -3036,6 +3875,10 @@ void FS_Startup( const char *gameName ) {
 	fs_extragamedirs = Cvar_Get( "fs_extragames", "", CVAR_INIT );
 
 	fs_dirbeforepak = Cvar_Get("fs_dirbeforepak", "0", CVAR_INIT|CVAR_PROTECTED);
+
+#ifdef __EMSCRIPTEN__
+	WasmPK3_InitManifest( gameName );
+#endif
 
 	// add search path elements in reverse priority order
 	if (fs_cdpath->string[0]) {
@@ -3525,6 +4368,11 @@ restart if necessary
 =================
 */
 qboolean FS_ConditionalRestart( int checksumFeed ) {
+#ifdef __EMSCRIPTEN__
+	fs_gamedirvar->modified = qfalse;
+	fs_checksumFeed = checksumFeed;
+	return qfalse;
+#endif
 	if( fs_gamedirvar->modified || checksumFeed != fs_checksumFeed ) {
 		FS_Restart( checksumFeed );
 		return qtrue;
@@ -3597,7 +4445,7 @@ int		FS_FOpenFileByMode( const char *qpath, fileHandle_t *f, fsMode_t mode ) {
 
 	if ( *f ) {
 		if (fsh[*f].zipFile == qtrue) {
-			fsh[*f].baseOffset = unztell(fsh[*f].handleFiles.file.z);
+			fsh[*f].baseOffset = FS_FTell(*f);
 		} else {
 			fsh[*f].baseOffset = ftell(fsh[*f].handleFiles.file.o);
 		}
@@ -3620,6 +4468,7 @@ int		FS_FOpenFileByMode( const char *qpath, fileHandle_t *f, fsMode_t mode ) {
 qboolean FS_FEof( fileHandle_t f ) {
 	qboolean eof;
 	if (fsh[f].zipFile == qtrue) {
+		FS_EnsureZipEntryOpened(f);
 		eof = (qboolean)unzeof(fsh[f].handleFiles.file.z);
 	} else {
 		eof = (qboolean)feof(fsh[f].handleFiles.file.o);
@@ -3630,6 +4479,9 @@ qboolean FS_FEof( fileHandle_t f ) {
 int		FS_FTell( fileHandle_t f ) {
 	int pos;
 	if (fsh[f].zipFile == qtrue) {
+		if (!fsh[f].zipEntryOpened) {
+			return 0;
+		}
 		pos = unztell(fsh[f].handleFiles.file.z);
 	} else {
 		pos = ftell(fsh[f].handleFiles.file.o);

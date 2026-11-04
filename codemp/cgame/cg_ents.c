@@ -1922,6 +1922,9 @@ Ghoul2 Insert Start
 	}
 
 	item = &bg_itemlist[ es->modelindex ];
+	if ( !cg_items[es->modelindex].registered ) {
+		CG_RegisterItemVisuals( es->modelindex );
+	}
 
 	if ((item->giType == IT_WEAPON || item->giType == IT_POWERUP) &&
 		!(cent->currentState.eFlags & EF_DROPPEDWEAPON) &&
@@ -2530,10 +2533,16 @@ static void CG_Missile( centity_t *cent ) {
 
 	if (cent->ghoul2 && s1->weapon == G2_MODEL_PART)
 	{
+		if ( !cg_weapons[WP_SABER].registered ) {
+			CG_RegisterWeapon( WP_SABER );
+		}
 		weapon = &cg_weapons[WP_SABER];
 	}
 	else
 	{
+		if ( s1->weapon > WP_NONE && s1->weapon < WP_NUM_WEAPONS && !cg_weapons[s1->weapon].registered ) {
+			CG_RegisterWeapon( s1->weapon );
+		}
 		weapon = &cg_weapons[s1->weapon];
 	}
 

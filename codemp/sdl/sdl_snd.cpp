@@ -179,6 +179,9 @@ qboolean SNDDMA_Init(void)
 		desired.samples = s_sdlDevSamps->value;
 	else
 	{
+#ifdef __EMSCRIPTEN__
+		desired.samples = 2048;
+#else
 		// just pick a sane default.
 		if (desired.freq <= 11025)
 			desired.samples = 256;
@@ -188,6 +191,7 @@ qboolean SNDDMA_Init(void)
 			desired.samples = 1024;
 		else
 			desired.samples = 2048;  // (*shrug*)
+#endif
 	}
 
 	desired.channels = (int) s_sdlChannels->value;

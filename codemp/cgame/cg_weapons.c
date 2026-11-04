@@ -46,6 +46,28 @@ void CG_RegisterItemVisuals( int itemNum ) {
 	memset( itemInfo, 0, sizeof( *itemInfo ) );
 	itemInfo->registered = qtrue;
 
+	if (item->icon)
+	{
+		if (item->giType == IT_HEALTH)
+		{ //medpack gets nomip'd by the ui or something I guess.
+			itemInfo->icon = trap_R_RegisterShaderNoMip( item->icon );
+		}
+		else
+		{
+			itemInfo->icon = trap_R_RegisterShader( item->icon );
+		}
+	}
+	else
+	{
+		itemInfo->icon = 0;
+	}
+
+#ifdef __EMSCRIPTEN__
+	if ( cg_simpleItems.integer && item->giType != IT_TEAM ) {
+		return;
+	}
+#endif
+
 	if (item->giType == IT_TEAM &&
 		(item->giTag == PW_REDFLAG || item->giTag == PW_BLUEFLAG) &&
 		cgs.gametype == GT_CTY)
@@ -79,25 +101,12 @@ Ghoul2 Insert Start
 /*
 Ghoul2 Insert End
 */
-	if (item->icon)
-	{
-		if (item->giType == IT_HEALTH)
-		{ //medpack gets nomip'd by the ui or something I guess.
-			itemInfo->icon = trap_R_RegisterShaderNoMip( item->icon );
-		}
-		else
-		{
-			itemInfo->icon = trap_R_RegisterShader( item->icon );
-		}
-	}
-	else
-	{
-		itemInfo->icon = 0;
-	}
 
+#ifndef __EMSCRIPTEN__
 	if ( item->giType == IT_WEAPON ) {
 		CG_RegisterWeapon( item->giTag );
 	}
+#endif
 
 	//
 	// powerups have an accompanying ring or sphere
@@ -1911,6 +1920,9 @@ void CG_FireWeapon( centity_t *cent, qboolean altFire ) {
 		CG_Error( "CG_FireWeapon: ent->weapon >= WP_NUM_WEAPONS" );
 		return;
 	}
+	if ( !cg_weapons[ ent->weapon ].registered ) {
+		CG_RegisterWeapon( ent->weapon );
+	}
 	weap = &cg_weapons[ ent->weapon ];
 
 	// mark the entity as muzzle flashing, so when it is added it will
@@ -2147,6 +2159,10 @@ void CG_MissileHitWall(int weapon, int clientNum, vec3_t origin, vec3_t dir, imp
 	int parm;
 	vec3_t up={0,0,1};
 
+	if ( weapon > WP_NONE && weapon < WP_NUM_WEAPONS && !cg_weapons[weapon].registered ) {
+		CG_RegisterWeapon( weapon );
+	}
+
 	switch( weapon )
 	{
 	case WP_BRYAR_PISTOL:
@@ -2254,6 +2270,10 @@ void CG_MissileHitPlayer(int weapon, vec3_t origin, vec3_t dir, int entityNum, q
 {
 	qboolean	humanoid = qtrue;
 	vec3_t up={0,0,1};
+
+	if ( weapon > WP_NONE && weapon < WP_NUM_WEAPONS && !cg_weapons[weapon].registered ) {
+		CG_RegisterWeapon( weapon );
+	}
 
 	/*
 	// NOTENOTE Non-portable code from single player
@@ -2473,11 +2493,47 @@ Ghoul2 Insert Start
 // create one instance of all the weapons we are going to use so we can just copy this info into each clients gun ghoul2 object in fast way
 static void *g2WeaponInstances[MAX_WEAPONS];
 
+#ifdef __EMSCRIPTEN__
+static void CG_EnsureG2WeaponInstance(int weapon)
+{
+	gitem_t *item;
+	if (weapon <= WP_NONE || weapon >= MAX_WEAPONS || g2WeaponInstances[weapon])
+	{
+		return;
+	}
+	for (item = bg_itemlist + 1; item->classname; item++)
+	{
+		if (item->giType == IT_WEAPON && item->giTag == weapon)
+		{
+			trap_G2API_InitGhoul2Model(&g2WeaponInstances[weapon], item->world_model[0], 0, 0, 0, 0, 0);
+			if (g2WeaponInstances[weapon])
+			{
+				trap_G2API_SetBoltInfo(g2WeaponInstances[weapon], 0, 0);
+				if (weapon == WP_SABER)
+				{
+					trap_G2API_AddBolt(g2WeaponInstances[weapon], 0, "*blade1");
+				}
+				else
+				{
+					trap_G2API_AddBolt(g2WeaponInstances[weapon], 0, "*flash");
+				}
+			}
+			break;
+		}
+	}
+}
+#endif
+
 void CG_InitG2Weapons(void)
 {
 	int i = 0;
 	gitem_t		*item;
 	memset(g2WeaponInstances, 0, sizeof(g2WeaponInstances));
+#ifdef __EMSCRIPTEN__
+	(void)i;
+	(void)item;
+	return;
+#endif
 	for ( item = bg_itemlist + 1 ; item->classname ; item++ ) 
 	{
 		if ( item->giType == IT_WEAPON )
@@ -2526,6 +2582,13 @@ void *CG_G2WeaponInstance(centity_t *cent, int weapon)
 {
 	clientInfo_t *ci = NULL;
 
+#ifdef __EMSCRIPTEN__
+	if (weapon != WP_SABER)
+	{
+		CG_EnsureG2WeaponInstance(weapon);
+	}
+#endif
+
 	if (weapon != WP_SABER)
 	{
 		return g2WeaponInstances[weapon];
@@ -2534,6 +2597,9 @@ void *CG_G2WeaponInstance(centity_t *cent, int weapon)
 	if (cent->currentState.eType != ET_PLAYER &&
 		cent->currentState.eType != ET_NPC)
 	{
+#ifdef __EMSCRIPTEN__
+		CG_EnsureG2WeaponInstance(weapon);
+#endif
 		return g2WeaponInstances[weapon];
 	}
 
@@ -2548,6 +2614,9 @@ void *CG_G2WeaponInstance(centity_t *cent, int weapon)
 
 	if (!ci)
 	{
+#ifdef __EMSCRIPTEN__
+		CG_EnsureG2WeaponInstance(weapon);
+#endif
 		return g2WeaponInstances[weapon];
 	}
 
@@ -2559,6 +2628,9 @@ void *CG_G2WeaponInstance(centity_t *cent, int weapon)
 	}
 
 	//If no custom then just use the default.
+#ifdef __EMSCRIPTEN__
+	CG_EnsureG2WeaponInstance(weapon);
+#endif
 	return g2WeaponInstances[weapon];
 }
 
@@ -2567,6 +2639,18 @@ void CG_CopyG2WeaponInstance(centity_t *cent, int weaponNum, void *toGhoul2)
 {
 	//rww - the -1 is because there is no "weapon" for WP_NONE
 	assert(weaponNum < MAX_WEAPONS);
+	if (weaponNum == WP_EMPLACED_GUN || weaponNum == WP_MELEE)
+	{
+		if (trap_G2API_HasGhoul2ModelOnIndex(&(toGhoul2), 2))
+		{
+			trap_G2API_RemoveGhoul2Model(&(toGhoul2), 2);
+		}
+		if (trap_G2API_HasGhoul2ModelOnIndex(&(toGhoul2), 1))
+		{
+			trap_G2API_RemoveGhoul2Model(&(toGhoul2), 1);
+		}
+		return;
+	}
 	if (CG_G2WeaponInstance(cent, weaponNum/*-1*/))
 	{
 		if (weaponNum == WP_SABER)

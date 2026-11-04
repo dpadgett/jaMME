@@ -786,6 +786,15 @@ static void Upload32( unsigned *data,
 			height >>= 1;
 		}
 
+#ifdef __EMSCRIPTEN__
+		(void)c;
+		(void)scan;
+		(void)rMax;
+		(void)gMax;
+		(void)bMax;
+		(void)samples;
+		*pformat = GL_RGBA;
+#else
 		//
 		// scan the texture for each channel's max values
 		// and verify if the alpha channel is being used or not
@@ -907,6 +916,7 @@ static void Upload32( unsigned *data,
 #endif
 			}
 		}
+#endif
 
 		*pUploadWidth = width;
 		*pUploadHeight = height;
@@ -963,6 +973,7 @@ static void Upload32( unsigned *data,
 		// copy or resample data as appropriate for first MIP level
 		if (!mipmap)
 		{
+			R_LightScaleTexture (data, width, height, qtrue );
 			qglTexImage2D( uiTarget, 0, *pformat, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data );
 			goto done;
 		}
@@ -1341,7 +1352,11 @@ qboolean RE_RegisterImages_LevelLoadEnd(void)
 		image_t *pImage = (*itImage).second;
 
 		// don't un-register system shaders (*fog, *dlight, *white, *default), but DO de-register lightmaps ("*<mapname>/lightmap%d")
+#ifdef __EMSCRIPTEN__
+		if (pImage->imgName[0] == '*' && strchr(pImage->imgName, '/'))
+#else
 		if (pImage->imgName[0] != '*' || strchr(pImage->imgName, '/'))
+#endif
 		{
 			// image used on this level?
 			//
@@ -1470,7 +1485,12 @@ image_t *R_CreateImage( const char *name, const byte *pic, int width, int height
 	image = (image_t*) Z_Malloc( sizeof( image_t ), TAG_IMAGE_T, qtrue );
 //	memset(image,0,sizeof(*image));	// qtrue above does this 
 	
+#ifdef __EMSCRIPTEN__
+	qglGenTextures( 1, &image->texnum );
+	giTextureBindNum++;
+#else
 	image->texnum = 1024 + giTextureBindNum++;	// ++ is of course staggeringly important...
+#endif
 
 	// record which map it was used on...
 	//
@@ -2922,6 +2942,22 @@ static void R_CreateDlightImage( void ) {
 
 	R_LoadImage("gfx/2d/dlight", &pic, &width, &height, &format);
 	if (pic) {                                    
+		for (int x = 0; x < width; x++) {
+			pic[(0 * width + x) * 4 + 0] = 0;
+			pic[(0 * width + x) * 4 + 1] = 0;
+			pic[(0 * width + x) * 4 + 2] = 0;
+			pic[((height - 1) * width + x) * 4 + 0] = 0;
+			pic[((height - 1) * width + x) * 4 + 1] = 0;
+			pic[((height - 1) * width + x) * 4 + 2] = 0;
+		}
+		for (int y = 0; y < height; y++) {
+			pic[(y * width + 0) * 4 + 0] = 0;
+			pic[(y * width + 0) * 4 + 1] = 0;
+			pic[(y * width + 0) * 4 + 2] = 0;
+			pic[(y * width + (width - 1)) * 4 + 0] = 0;
+			pic[(y * width + (width - 1)) * 4 + 1] = 0;
+			pic[(y * width + (width - 1)) * 4 + 2] = 0;
+		}
 		tr.dlightImage = R_CreateImage("*dlight", pic, width, height, GL_RGBA, qfalse, qfalse, qfalse, GL_CLAMP );
 		Z_Free(pic);
 	} else { // if we dont get a successful load
@@ -3047,7 +3083,7 @@ static void R_CreateFogImage( void ) {
 	borderColor[2] = 1.0;
 	borderColor[3] = 1;
 
-#ifndef HAVE_GLES
+#if !defined(HAVE_GLES) && !defined(__EMSCRIPTEN__)
 	qglTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, borderColor);
 #endif
 }
@@ -3106,6 +3142,7 @@ void R_CreateBuiltinImages( void ) {
 	tr.screenImage = R_CreateImage("*screen", (byte *)data, 8, 8, GL_RGBA, qfalse, qfalse, qfalse, GL_REPEAT );
 
 #ifndef HAVE_GLES
+#ifndef __EMSCRIPTEN__
 	// Create the scene glow image. - AReis
 	tr.screenGlow = 1024 + giTextureBindNum++;
 	qglDisable( GL_TEXTURE_2D );
@@ -3144,6 +3181,7 @@ void R_CreateBuiltinImages( void ) {
 	qglTexParameteri( GL_TEXTURE_RECTANGLE_EXT, GL_TEXTURE_WRAP_T, GL_CLAMP );
 	qglDisable( GL_TEXTURE_RECTANGLE_EXT );
 	qglEnable( GL_TEXTURE_2D );
+#endif
 
 
 	// with overbright bits active, we need an image which is some fraction of full color,

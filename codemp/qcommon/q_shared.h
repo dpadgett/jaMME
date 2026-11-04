@@ -331,7 +331,7 @@ float FloatSwap( const float *f );
 //
 // ================================================================
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__EMSCRIPTEN__)
 
     #ifdef __cplusplus
         #include <cstddef>
@@ -350,7 +350,9 @@ float FloatSwap( const float *f );
 	#define	PATH_SEP '/'
 	#define RAND_MAX 2147483647
 
-	#if defined(__linux__)
+	#if defined(__EMSCRIPTEN__)
+		#define OS_STRING "emscripten"
+	#elif defined(__linux__)
 		#define OS_STRING "linux"
 	#else
 		#define OS_STRING "kFreeBSD"
@@ -364,7 +366,9 @@ float FloatSwap( const float *f );
 
 	#define PATH_SEP '/'
 
-	#if defined(__i386__)
+	#if defined(__EMSCRIPTEN__)
+		#define ARCH_STRING "wasm32"
+	#elif defined(__i386__)
 		#define ARCH_STRING "i386"
 	#elif defined(__x86_64__)
 		#define idx64
@@ -401,7 +405,11 @@ float FloatSwap( const float *f );
 		#define Q3_LITTLE_ENDIAN
 	#endif
 
-	#define DLL_EXT ".so"
+	#if defined(__EMSCRIPTEN__)
+		#define DLL_EXT ".wasm"
+	#else
+		#define DLL_EXT ".so"
+	#endif
 
 #endif
 
@@ -1619,7 +1627,7 @@ typedef struct {
 #endif
 #endif
 
-#if defined(MACOS_X) || defined(__linux__)
+#if defined(MACOS_X) || defined(__linux__) || defined(__EMSCRIPTEN__)
 	#define	SnapVector(v) {v[0]=((int)(v[0]));v[1]=((int)(v[1]));v[2]=((int)(v[2]));}
 #else 
 	#if !defined(__LCC__) && !defined(MINGW32) && !defined(WIN64)

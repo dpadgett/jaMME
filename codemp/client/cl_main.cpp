@@ -23,8 +23,59 @@
 #include "../sys/sys_loadlib.h"
 #include "../sys/sys_local.h"
 #endif
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 cvar_t	*cl_renderer;
+cvar_t	*cl_skipMenu;
+cvar_t	*ui_bypassMainMenuLoad;
+
+static qboolean	g_jkDemoCompleted = qfalse;
+static int		g_jkDemoCompletedCount = 0;
+static char		g_jkLastDemoName[MAX_OSPATH] = "";
+static char		g_jkLastMapName[MAX_QPATH] = "";
+static float	g_jkSavedVolume = 0.8f;
+static qboolean	g_jkIsMuted = qfalse;
+static float	s_jkPlaybackSpeed = 1.0f;
+int				g_jkActiveRenderedFrames = 0;
+int				s_jkDemoStartTimeMs = 0;
+int				s_jkDemoEndTimeMs = 0;
+static qboolean	s_jkDemoLoopEnabled = qtrue;
+qboolean		g_jkDemoSeeking = qfalse;
+qboolean		g_jkDemoSeekingRewind = qfalse;
+qboolean		g_jkDemoJustLooped = qfalse;
+int				g_jkPinServerTimeFrames = 0;
+int				g_jkPinnedServerTime = 0;
+static qboolean	s_jkDemoSeekHitEof = qfalse;
+
+extern "C" int JK_DemoSeekToMs( int targetOffsetMs );
+extern qboolean demoIsMMEPlaying( void );
+extern int demoStartTime( void );
+extern int demoEndTime( void );
+extern int demoLength( void );
+extern int demoSeek( int seekTime );
+
+#ifdef __EMSCRIPTEN__
+extern "C" int CG_MME_GetTimeMs( void );
+extern "C" void CG_MME_SetTimeMs( int targetMs );
+extern "C" int CG_MME_GetLengthMs( void );
+extern "C" void CG_MME_SetPaused( int paused );
+extern "C" int CG_MME_GetPaused( void );
+extern "C" void CG_MME_SetSpeed( float speed );
+extern "C" float CG_MME_GetSpeed( void );
+
+EM_JS(void, JK_NotifyDemoCompletedJS, (const char *demoName, int serverTime, int frameCount, int completedCount), {
+	var nameStr = demoName ? UTF8ToString(demoName) : "";
+	if (typeof window !== "undefined") {
+		if (typeof window.__jkNotifyDemoCompleted === "function") {
+			window.__jkNotifyDemoCompleted(nameStr, serverTime, frameCount, completedCount);
+		} else if (window.JKDemoPlayer && typeof window.JKDemoPlayer._onInternalDemoCompleted === "function") {
+			window.JKDemoPlayer._onInternalDemoCompleted(nameStr, serverTime, frameCount, completedCount);
+		}
+	}
+});
+#endif
 
 cvar_t	*cl_nodelta;
 cvar_t	*cl_debugMove;
@@ -99,9 +150,11 @@ netadr_t rcon_address;
 refexport_t	re = {0};
 static void	*rendererLib = NULL;
 //RAZFIXME: BAD BAD, maybe? had to move it out of ghoul2_shared.h -> CGhoul2Info_v at the least..
+#ifndef __EMSCRIPTEN__
 IGhoul2InfoArray &_TheGhoul2InfoArray( void ) {
 	return re.TheGhoul2InfoArray();
 }
+#endif
 ping_t	cl_pinglist[MAX_PINGREQUESTS];
 
 typedef struct serverStatus_s
@@ -407,12 +460,53 @@ CLIENT SIDE DEMO PLAYBACK
 =======================================================================
 */
 
+extern "C" int CL_MMEDemoCompleted( void ) {
+	char completedDemoName[MAX_OSPATH];
+	int finalServerTime = demoIsMMEPlaying() ? demoEndTime() : cl.serverTime;
+	int finalFrameCount = cls.framecount;
+	(void)finalServerTime;
+	(void)finalFrameCount;
+
+	Q_strncpyz( completedDemoName, clc.demoName[0] ? clc.demoName : g_jkLastDemoName, sizeof( completedDemoName ) );
+	g_jkDemoCompletedCount++;
+
+	if ( s_jkDemoLoopEnabled ) {
+		g_jkDemoCompleted = qfalse;
+		g_jkDemoJustLooped = qtrue;
+		S_StopAllSounds();
+#ifdef __EMSCRIPTEN__
+		JK_NotifyDemoCompletedJS( completedDemoName, finalServerTime, finalFrameCount, g_jkDemoCompletedCount );
+#endif
+		return 1;
+	}
+
+	g_jkDemoCompleted = qtrue;
+	g_jkDemoJustLooped = qtrue;
+	Cvar_Set( "cl_freezeDemo", "1" );
+	Cvar_Set( "mme_demoPaused", "1" );
+	S_StopAllSounds();
+#ifdef __EMSCRIPTEN__
+	JK_NotifyDemoCompletedJS( completedDemoName, finalServerTime, finalFrameCount, g_jkDemoCompletedCount );
+#endif
+	return 0;
+}
+
 /*
 =================
 CL_DemoCompleted
 =================
 */
 void CL_DemoCompleted( void ) {
+	char completedDemoName[MAX_OSPATH];
+	int finalServerTime = cl.serverTime;
+	int finalFrameCount = cls.framecount;
+	(void)finalServerTime;
+	(void)finalFrameCount;
+
+	Q_strncpyz( completedDemoName, clc.demoName[0] ? clc.demoName : g_jkLastDemoName, sizeof( completedDemoName ) );
+	g_jkDemoCompleted = qtrue;
+	g_jkDemoCompletedCount++;
+
 	if (cl_timedemo && cl_timedemo->integer) {
 		int	time;
 		
@@ -423,18 +517,86 @@ void CL_DemoCompleted( void ) {
 		}
 	}
 
-/*	CL_Disconnect( qtrue );
-	CL_NextDemo();
-	*/
-
-	//rww - The above code seems to just stick you in a no-menu state and you can't do anything there.
-	//I'm not sure why it ever worked in TA, but whatever. This code will bring us back to the main menu
-	//after a demo is finished playing instead.
-	CL_Disconnect_f();
+#ifdef __EMSCRIPTEN__
+	if ( s_jkDemoLoopEnabled && clc.demofile ) {
+		g_jkDemoCompleted = qfalse;
+		g_jkDemoJustLooped = qtrue;
+		S_StopAllSounds();
+		JK_DemoSeekToMs( 0 );
+		JK_NotifyDemoCompletedJS( completedDemoName, finalServerTime, finalFrameCount, g_jkDemoCompletedCount );
+		return;
+	}
+	JK_NotifyDemoCompletedJS( completedDemoName, finalServerTime, finalFrameCount, g_jkDemoCompletedCount );
+	if ( clc.demofile ) {
+		g_jkDemoJustLooped = qtrue;
+		Cvar_Set( "cl_freezeDemo", "1" );
+		if ( cl.snap.valid ) {
+			cl.serverTime = cl.snap.serverTime - 1;
+			cl.oldServerTime = cl.serverTime;
+			cl.serverTimeDelta = cl.serverTime - cls.realtime;
+		}
+		S_StopAllSounds();
+		return;
+	}
+	CL_Disconnect( qfalse );
 	S_StopAllSounds();
-	VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_MAIN );
-
 	CL_NextDemo();
+#else
+	if ( s_jkDemoLoopEnabled && clc.demofile ) {
+		g_jkDemoCompleted = qfalse;
+		g_jkDemoJustLooped = qtrue;
+		S_StopAllSounds();
+		JK_DemoSeekToMs( 0 );
+		return;
+	}
+	if ( !cls.uiStarted ) {
+		CL_Disconnect( qfalse );
+		S_StopAllSounds();
+		CL_NextDemo();
+	} else {
+		//rww - The above code seems to just stick you in a no-menu state and you can't do anything there.
+		//I'm not sure why it ever worked in TA, but whatever. This code will bring us back to the main menu
+		//after a demo is finished playing instead.
+		CL_Disconnect_f();
+		S_StopAllSounds();
+		VM_Call( uivm, UI_SET_ACTIVE_MENU, UIMENU_MAIN );
+
+		CL_NextDemo();
+	}
+#endif
+}
+
+static byte *s_jkDemoMemBuf = NULL;
+static int s_jkDemoMemCap = 0;
+static int s_jkDemoMemLen = 0;
+static int s_jkDemoMemPos = 0;
+static fileHandle_t s_jkDemoMemHandle = 0;
+
+static int CL_DemoReadBytes( void *dst, int len, fileHandle_t demoFile ) {
+	if ( s_jkDemoMemBuf && s_jkDemoMemLen > 0 && demoFile == s_jkDemoMemHandle ) {
+		if ( s_jkDemoMemPos + len > s_jkDemoMemLen ) {
+			int avail = s_jkDemoMemLen - s_jkDemoMemPos;
+			if ( avail > 0 ) {
+				Com_Memcpy( dst, s_jkDemoMemBuf + s_jkDemoMemPos, avail );
+				s_jkDemoMemPos = s_jkDemoMemLen;
+				return avail;
+			}
+			return 0;
+		}
+		Com_Memcpy( dst, s_jkDemoMemBuf + s_jkDemoMemPos, len );
+		s_jkDemoMemPos += len;
+		return len;
+	}
+	return FS_Read( dst, len, demoFile );
+}
+
+static void CL_DemoRewind( fileHandle_t demoFile ) {
+	if ( s_jkDemoMemBuf && s_jkDemoMemLen > 0 && demoFile == s_jkDemoMemHandle ) {
+		s_jkDemoMemPos = 0;
+	}
+	if ( demoFile ) {
+		FS_Seek( demoFile, 0, FS_SEEK_SET );
+	}
 }
 
 /*
@@ -449,13 +611,21 @@ void CL_ReadDemoMessage( void ) {
 	int			s;
 
 	if ( !clc.demofile ) {
+		if ( g_jkDemoSeeking ) {
+			s_jkDemoSeekHitEof = qtrue;
+			return;
+		}
 		CL_DemoCompleted ();
 		return;
 	}
 
 	// get the sequence number
-	r = FS_Read( &s, 4, clc.demofile);
+	r = CL_DemoReadBytes( &s, 4, clc.demofile);
 	if ( r != 4 ) {
+		if ( g_jkDemoSeeking ) {
+			s_jkDemoSeekHitEof = qtrue;
+			return;
+		}
 		CL_DemoCompleted ();
 		return;
 	}
@@ -465,22 +635,34 @@ void CL_ReadDemoMessage( void ) {
 	MSG_Init( &buf, bufData, sizeof( bufData ) );
 
 	// get the length
-	r = FS_Read (&buf.cursize, 4, clc.demofile);
+	r = CL_DemoReadBytes (&buf.cursize, 4, clc.demofile);
 	if ( r != 4 ) {
+		if ( g_jkDemoSeeking ) {
+			s_jkDemoSeekHitEof = qtrue;
+			return;
+		}
 		CL_DemoCompleted ();
 		return;
 	}
 	buf.cursize = LittleLong( buf.cursize );
 	if ( buf.cursize == -1 ) {
+		if ( g_jkDemoSeeking ) {
+			s_jkDemoSeekHitEof = qtrue;
+			return;
+		}
 		CL_DemoCompleted ();
 		return;
 	}
 	if ( buf.cursize > buf.maxsize ) {
 		Com_Error (ERR_DROP, "CL_ReadDemoMessage: demoMsglen > MAX_MSGLEN");
 	}
-	r = FS_Read( buf.data, buf.cursize, clc.demofile );
+	r = CL_DemoReadBytes( buf.data, buf.cursize, clc.demofile );
 	if ( r != buf.cursize ) {
 		Com_Printf( "Demo file was truncated.\n");
+		if ( g_jkDemoSeeking ) {
+			s_jkDemoSeekHitEof = qtrue;
+			return;
+		}
 		CL_DemoCompleted ();
 		return;
 	}
@@ -488,6 +670,161 @@ void CL_ReadDemoMessage( void ) {
 	clc.lastPacketTime = cls.realtime;
 	buf.readcount = 0;
 	CL_ParseServerMessage( &buf );
+}
+
+qboolean g_jkDemoSkipSnapshot = qfalse;
+
+typedef struct {
+	int fileOffset;
+	int nextOffset;
+	int messageSeq;
+	int snapTime;
+	int deltaNum;
+	byte hasNonSnap;
+	byte needSnap;
+} demoPktIndex_t;
+
+static demoPktIndex_t *s_jkDemoPkts = NULL;
+static int s_jkDemoPktsCap = 0;
+static int s_jkDemoPktsCount = 0;
+
+/*
+====================
+CL_ScanDemoTimeBounds
+====================
+*/
+void CL_ScanDemoTimeBounds( fileHandle_t demoFile ) {
+	static byte bufData[MAX_MSGLEN];
+	msg_t buf;
+	int s, r;
+	int firstTime = 0;
+	int firstAnyTime = 0;
+	int lastTime = 0;
+
+	if ( !demoFile ) {
+		return;
+	}
+
+	s_jkDemoPktsCount = 0;
+	FS_Seek( demoFile, 0, FS_SEEK_END );
+	int fileLen = FS_FTell( demoFile );
+	FS_Seek( demoFile, 0, FS_SEEK_SET );
+	if ( fileLen > 0 && fileLen <= 64 * 1024 * 1024 ) {
+		if ( fileLen > s_jkDemoMemCap ) {
+			if ( s_jkDemoMemBuf ) {
+				free( s_jkDemoMemBuf );
+			}
+			s_jkDemoMemBuf = (byte *)malloc( fileLen );
+			s_jkDemoMemCap = s_jkDemoMemBuf ? fileLen : 0;
+		}
+		if ( s_jkDemoMemBuf ) {
+			int got = FS_Read( s_jkDemoMemBuf, fileLen, demoFile );
+			FS_Seek( demoFile, 0, FS_SEEK_SET );
+			if ( got == fileLen ) {
+				s_jkDemoMemLen = fileLen;
+				s_jkDemoMemPos = 0;
+				s_jkDemoMemHandle = demoFile;
+			} else {
+				s_jkDemoMemLen = 0;
+				s_jkDemoMemPos = 0;
+				s_jkDemoMemHandle = 0;
+			}
+		}
+	} else {
+		s_jkDemoMemLen = 0;
+		s_jkDemoMemPos = 0;
+		s_jkDemoMemHandle = 0;
+	}
+
+	while ( 1 ) {
+		int pktOffset = ( s_jkDemoMemBuf && s_jkDemoMemLen > 0 && demoFile == s_jkDemoMemHandle ) ? s_jkDemoMemPos : -1;
+		r = CL_DemoReadBytes( &s, 4, demoFile );
+		if ( r != 4 ) {
+			break;
+		}
+		int msgSeq = LittleLong( s );
+		MSG_Init( &buf, bufData, sizeof( bufData ) );
+		r = CL_DemoReadBytes( &buf.cursize, 4, demoFile );
+		if ( r != 4 ) {
+			break;
+		}
+		buf.cursize = LittleLong( buf.cursize );
+		if ( buf.cursize == -1 || buf.cursize <= 0 || buf.cursize > buf.maxsize ) {
+			break;
+		}
+		r = CL_DemoReadBytes( buf.data, buf.cursize, demoFile );
+		if ( r != buf.cursize ) {
+			break;
+		}
+		int pktNextOffset = ( s_jkDemoMemBuf && s_jkDemoMemLen > 0 && demoFile == s_jkDemoMemHandle ) ? s_jkDemoMemPos : -1;
+
+		buf.readcount = 0;
+		MSG_Bitstream( &buf );
+		(void)MSG_ReadLong( &buf ); // reliableAcknowledge
+
+		int pktSnapTime = 0;
+		int pktDeltaNum = -1;
+		byte pktHasNonSnap = 0;
+
+		while ( buf.readcount <= buf.cursize ) {
+			int cmd = MSG_ReadByte( &buf );
+			if ( cmd == svc_EOF || cmd < 0 ) {
+				break;
+			}
+			if ( cmd == svc_nop ) {
+				continue;
+			} else if ( cmd == svc_serverCommand ) {
+				pktHasNonSnap = 1;
+				(void)MSG_ReadLong( &buf );
+				(void)MSG_ReadString( &buf );
+			} else if ( cmd == svc_snapshot ) {
+				int snapTime = MSG_ReadLong( &buf );
+				int deltaByte = MSG_ReadByte( &buf );
+				pktSnapTime = snapTime;
+				pktDeltaNum = ( deltaByte == 0 ) ? -1 : ( msgSeq - deltaByte );
+				if ( snapTime > 0 ) {
+					if ( firstAnyTime == 0 ) {
+						firstAnyTime = snapTime;
+					}
+					if ( firstTime == 0 && deltaByte == 0 ) {
+						firstTime = snapTime;
+					}
+					if ( snapTime > lastTime ) {
+						lastTime = snapTime;
+					}
+				}
+				break;
+			} else {
+				pktHasNonSnap = 1;
+				break;
+			}
+		}
+
+		if ( pktOffset >= 0 ) {
+			if ( s_jkDemoPktsCount >= s_jkDemoPktsCap ) {
+				int newCap = s_jkDemoPktsCap ? ( s_jkDemoPktsCap * 2 ) : 8192;
+				demoPktIndex_t *newPkts = (demoPktIndex_t *)realloc( s_jkDemoPkts, newCap * sizeof( demoPktIndex_t ) );
+				if ( newPkts ) {
+					s_jkDemoPkts = newPkts;
+					s_jkDemoPktsCap = newCap;
+				}
+			}
+			if ( s_jkDemoPktsCount < s_jkDemoPktsCap ) {
+				demoPktIndex_t *p = &s_jkDemoPkts[s_jkDemoPktsCount++];
+				p->fileOffset = pktOffset;
+				p->nextOffset = pktNextOffset;
+				p->messageSeq = msgSeq;
+				p->snapTime = pktSnapTime;
+				p->deltaNum = pktDeltaNum;
+				p->hasNonSnap = pktHasNonSnap;
+				p->needSnap = 0;
+			}
+		}
+	}
+
+	s_jkDemoStartTimeMs = ( firstTime > 0 ) ? firstTime : firstAnyTime;
+	s_jkDemoEndTimeMs = lastTime;
+	CL_DemoRewind( demoFile );
 }
 
 /*
@@ -524,8 +861,8 @@ demo <demoname>
 */
 extern void demoCommandSmoothingEnable(qboolean enable);
 void CL_PlayDemo_f( void ) {
-	char		name[MAX_OSPATH], *testName, testNameActual[MAX_OSPATH];
-	char		*ext = NULL;
+	char		name[MAX_OSPATH], *testName, testNameActual[MAX_OSPATH], cleanArg[MAX_OSPATH];
+	char		*ext = NULL, *arg = NULL;
 	qboolean	haveConvert, forceNewConvert = qfalse, del = qfalse;
 	cvar_t		*fs_game;
 
@@ -536,28 +873,53 @@ void CL_PlayDemo_f( void ) {
 	if (Cmd_Argc() >= 3 && !Q_stricmp(Cmd_Argv(2), "del")) {
 		del = qtrue;
 	}
+	Q_strncpyz( cleanArg, Cmd_Argv(1), sizeof( cleanArg ) );
+	arg = cleanArg;
+	while ( *arg == '/' || *arg == '\\' ) {
+		arg++;
+	}
+	if ( !Q_stricmpn( arg, "base/", 5 ) || !Q_stricmpn( arg, "base\\", 5 ) ) {
+		arg += 5;
+	}
+	while ( *arg == '/' || *arg == '\\' ) {
+		arg++;
+	}
+	if ( !Q_stricmpn( arg, "demos/", 6 ) || !Q_stricmpn( arg, "demos\\", 6 ) ) {
+		arg += 6;
+	}
+	while ( *arg == '/' || *arg == '\\' ) {
+		arg++;
+	}
+	if ( !arg[0] ) {
+		Com_Printf( "CL_PlayDemo_f: empty demo name\n" );
+		return;
+	}
+
 	fs_game = Cvar_FindVar ("fs_game" );
 	if (!fs_game)
 		return;
 	demoCommandSmoothingEnable(qfalse);
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
 	haveConvert = (qboolean)(mme_demoConvert->integer);
 	if (haveConvert && fs_game && (!Q_stricmp(fs_game->string, "")
 		|| !Q_stricmp(fs_game->string, "base")
 		|| !Q_stricmp(fs_game->string, "mme"))) {
 		demoCommandSmoothingEnable(qtrue);
 	}
-	Q_strncpyz( testNameActual, Cmd_Argv(1), sizeof( testNameActual ) );
+	Q_strncpyz( testNameActual, arg, sizeof( testNameActual ) );
+#ifdef __EMSCRIPTEN__
+	forceNewConvert = qtrue;
+#endif
 #else
 	haveConvert = (qboolean)(mme_demoConvert->integer && cls.mmeStateCGame >= MME_STATE_DEFAULT);
 	if (haveConvert && cls.mmeStateCGame == MME_STATE_DEFAULT)
 		demoCommandSmoothingEnable(qtrue);
 	if (del) {
-		ext = strstr(Cmd_Argv(1), ".mme");
+		ext = strstr(arg, ".mme");
 		if (!ext) {
 			int i = 0;
 			while(demo_protocols[i]) {
-				ext = strstr(Cmd_Argv(1), va(".dm_%d", demo_protocols[i]));
+				ext = strstr(arg, va(".dm_%d", demo_protocols[i]));
 				if (ext && *ext) {
 					break;
 				}
@@ -572,16 +934,16 @@ void CL_PlayDemo_f( void ) {
 					break;
 				Q_strcat(temp, sizeof(temp), "_");
 			}
-			if (FS_CopyFileAbsolute(Cmd_Argv(1), va("%s/%s%s", demos, temp, ext))) {
+			if (FS_CopyFileAbsolute(arg, va("%s/%s%s", demos, temp, ext))) {
 				Q_strncpyz( testNameActual, temp, sizeof( testNameActual ) );
 				if (Q_stricmp(ext, ".mme"))
 					forceNewConvert = qtrue;
 			} else {
-				Q_strncpyz( testNameActual, Cmd_Argv(1), sizeof( testNameActual ) );
+				Q_strncpyz( testNameActual, arg, sizeof( testNameActual ) );
 			}
 		}
 	} else {
-		Q_strncpyz( testNameActual, Cmd_Argv(1), sizeof( testNameActual ) );
+		Q_strncpyz( testNameActual, arg, sizeof( testNameActual ) );
 	}
 #endif
 	// make sure a local server is killed
@@ -606,50 +968,112 @@ void CL_PlayDemo_f( void ) {
 		demoStop();
 	}
 
+	g_jkDemoCompleted = qfalse;
+	g_jkActiveRenderedFrames = 0;
+	Cvar_Set( "cl_freezeDemo", "0" );
+	Cvar_Set( "mme_demoPaused", "0" );
 	Cvar_Set( "mme_demoFileName", testName );
 
 	if (haveConvert && !forceNewConvert) {
 		Com_sprintf (name, MAX_OSPATH, "mmedemos/%s.mme", testName );
 		if (FS_FileExists( name )) {
-			if (demoPlay( name, del ))
+			if (demoPlay( name, del )) {
+				Q_strncpyz( clc.demoName, testName, sizeof( clc.demoName ) );
+				Q_strncpyz( g_jkLastDemoName, testName, sizeof( g_jkLastDemoName ) );
+				if ( demoStartTime() > 0 ) s_jkDemoStartTimeMs = demoStartTime();
+				if ( demoEndTime() > 0 ) s_jkDemoEndTimeMs = demoEndTime();
+				if ( cl.gameState.stringOffsets[CS_SERVERINFO] ) {
+					const char *info = cl.gameState.stringData + cl.gameState.stringOffsets[CS_SERVERINFO];
+					const char *map = Info_ValueForKey( info, "mapname" );
+					if ( map && map[0] ) {
+						Q_strncpyz( g_jkLastMapName, map, sizeof( g_jkLastMapName ) );
+					}
+				}
+#ifdef __EMSCRIPTEN__
+				CG_MME_SetSpeed( s_jkPlaybackSpeed );
+				CG_MME_SetPaused( 0 );
+#endif
+				extern int com_frameTime;
+				com_frameTime = Com_Milliseconds();
 				return;
+			}
 		}
 	}
 	
 	Cvar_Set( "mme_demoExt", CL_WalkDemoExt( testName, name, &clc.demofile ) );
 	if (!clc.demofile) {
+#ifdef __EMSCRIPTEN__
+		Com_Printf( "CL_PlayDemo_f: couldn't open %s\n", name );
+#else
 		Com_Error( ERR_DROP, "couldn't open %s", name);
+#endif
 		demoCommandSmoothingEnable(qfalse);
 		return;
 	} else if ( haveConvert ) {
 		char mmeName[MAX_OSPATH];
 
+		CL_ScanDemoTimeBounds( clc.demofile );
 		FS_FCloseFile( clc.demofile );
 		clc.demofile = 0;
 
 		Com_sprintf( mmeName, sizeof( mmeName ), "mmedemos/%s", testName );
 		demoConvert( name, mmeName, (qboolean)mme_demoSmoothen->integer );
 		Q_strcat( mmeName , sizeof( mmeName ), ".mme" );
-		if (demoPlay( mmeName, del ))
+		if (demoPlay( mmeName, del )) {
+			Q_strncpyz( clc.demoName, testName, sizeof( clc.demoName ) );
+			Q_strncpyz( g_jkLastDemoName, testName, sizeof( g_jkLastDemoName ) );
+			if ( demoStartTime() > 0 ) s_jkDemoStartTimeMs = demoStartTime();
+			if ( demoEndTime() > 0 ) s_jkDemoEndTimeMs = demoEndTime();
+			if ( cl.gameState.stringOffsets[CS_SERVERINFO] ) {
+				const char *info = cl.gameState.stringData + cl.gameState.stringOffsets[CS_SERVERINFO];
+				const char *map = Info_ValueForKey( info, "mapname" );
+				if ( map && map[0] ) {
+					Q_strncpyz( g_jkLastMapName, map, sizeof( g_jkLastMapName ) );
+				}
+			}
+#ifdef __EMSCRIPTEN__
+			CG_MME_SetSpeed( s_jkPlaybackSpeed );
+			CG_MME_SetPaused( 0 );
+#endif
+			extern int com_frameTime;
+			com_frameTime = Com_Milliseconds();
 			return;
+		}
 		Com_Printf("Can't seem to play demo %s\n", testName );
 		demoCommandSmoothingEnable(qfalse);
+		CL_WalkDemoExt( testName, name, &clc.demofile );
+		if ( !clc.demofile ) {
+			return;
+		}
 	}
-	Q_strncpyz( clc.demoName, Cmd_Argv(1), sizeof( clc.demoName ) );
+	CL_ScanDemoTimeBounds( clc.demofile );
+	Q_strncpyz( clc.demoName, testName, sizeof( clc.demoName ) );
+	Q_strncpyz( g_jkLastDemoName, testName, sizeof( g_jkLastDemoName ) );
 
 	Con_Close();
 
 	cls.state = CA_CONNECTED;
 	clc.demoplaying = qtrue;
-	Q_strncpyz( cls.servername, Cmd_Argv(1), sizeof( cls.servername ) );
+	Q_strncpyz( cls.servername, testName, sizeof( cls.servername ) );
 
 	// read demo messages until connected
 	while ( cls.state >= CA_CONNECTED && cls.state < CA_PRIMED ) {
 		CL_ReadDemoMessage();
 	}
+	if ( cl.gameState.stringOffsets[CS_SERVERINFO] ) {
+		const char *info = cl.gameState.stringData + cl.gameState.stringOffsets[CS_SERVERINFO];
+		const char *map = Info_ValueForKey( info, "mapname" );
+		if ( map && map[0] ) {
+			Q_strncpyz( g_jkLastMapName, map, sizeof( g_jkLastMapName ) );
+		}
+	}
 	// don't get the first snapshot this frame, to prevent the long
 	// time from the gamestate load from messing causing a time skip
 	clc.firstDemoFrameSkipped = qfalse;
+	{
+		extern int com_frameTime;
+		com_frameTime = Com_Milliseconds();
+	}
 }
 
 
@@ -863,6 +1287,7 @@ void CL_Disconnect(qboolean showMainMenu) {
 	CL_ClearState();
 	// wipe the client connection
 	Com_Memset(&clc, 0, sizeof(clc));
+	g_jkActiveRenderedFrames = 0;
 	Cvar_Set("mme_demoPaused", "0");
 	cls.state = CA_DISCONNECTED;
 	cls.cTable = CT_DEFAULT;
@@ -2439,6 +2864,34 @@ void CL_Frame(int msec) {
 	// update audio
 	S_Update();
 
+	if ( clc.demoplaying && cls.state == CA_ACTIVE && ( cl.snap.valid || demoIsMMEPlaying() ) ) {
+		g_jkActiveRenderedFrames++;
+		if ( demoIsMMEPlaying() ) {
+			if ( g_jkActiveRenderedFrames <= 6 ) {
+				extern int com_frameTime;
+				com_frameTime = Com_Milliseconds();
+			}
+		} else if ( g_jkPinServerTimeFrames > 0 ) {
+			g_jkPinServerTimeFrames--;
+			if ( g_jkPinnedServerTime > 0 ) {
+				cl.serverTime = g_jkPinnedServerTime;
+				cl.oldServerTime = cl.serverTime;
+				cl.oldFrameServerTime = cl.serverTime;
+				cl.serverTimeDelta = cl.serverTime - cls.realtime;
+			}
+			extern int com_frameTime;
+			com_frameTime = Com_Milliseconds();
+		} else if ( g_jkActiveRenderedFrames <= 6 ) {
+			int startTime = ( s_jkDemoStartTimeMs > 0 ) ? s_jkDemoStartTimeMs : cl.snap.serverTime;
+			cl.serverTime = startTime;
+			cl.oldServerTime = startTime;
+			cl.oldFrameServerTime = startTime;
+			cl.serverTimeDelta = startTime - cls.realtime;
+			extern int com_frameTime;
+			com_frameTime = Com_Milliseconds();
+		}
+	}
+
 	// advance local effects for next frame
 	SCR_RunCinematic();
 
@@ -2538,6 +2991,12 @@ void CL_StartHunkUsers( void ) {
 	}
 
 	if ( !cls.uiStarted ) {
+#ifdef __EMSCRIPTEN__
+		if ( ( cl_skipMenu && cl_skipMenu->integer ) ||
+		     ( ui_bypassMainMenuLoad && ui_bypassMainMenuLoad->integer ) ) {
+			return;
+		}
+#endif
 		cls.uiStarted = qtrue;
 		CL_InitUI();
 	}
@@ -2590,15 +3049,24 @@ CMiniHeap CMiniHeap_singleton(G2_VERT_SPACE_SERVER_SIZE * 1024);
 static IHeapAllocator *GetG2VertSpaceServer(void) {
 	return G2VertSpaceServer;
 }
+#ifdef __EMSCRIPTEN__
+extern "C" refexport_t* QDECL GetRefAPI( int apiVersion, refimport_t *rimp );
+#endif
+
 void CL_InitRef( void ) {
 	static refimport_t	ri;
 	refexport_t	*ret;
+#ifndef __EMSCRIPTEN__
 	GetRefAPI_t	GetRefAPI;
 	char		dllName[MAX_OSPATH];
+#endif
 
 	Com_Printf( "----- Initializing Renderer ----\n" );
 
 	cl_renderer = Cvar_Get( "cl_renderer", "rd-jamme", CVAR_ARCHIVE|CVAR_LATCH );
+#ifdef __EMSCRIPTEN__
+	memset( &ri, 0, sizeof( ri ) );
+#else
 #ifdef __ANDROID__
 	Com_sprintf( dllName, sizeof( dllName ), "%s" DLL_EXT, cl_renderer->string );
 #else
@@ -2624,6 +3092,7 @@ void CL_InitRef( void ) {
 	GetRefAPI = (GetRefAPI_t)Sys_LoadFunction( rendererLib, "GetRefAPI" );
 	if ( !GetRefAPI )
 		Com_Error( ERR_FATAL, "Can't load symbol GetRefAPI: '%s'", Sys_LibraryError() );
+#endif
 
 	//set up the import table
 	ri.Printf = CL_RefPrintf;
@@ -2833,6 +3302,8 @@ void CL_Init( void ) {
 	//
 	cl_noprint = Cvar_Get( "cl_noprint", "0", 0 );
 	cl_motd = Cvar_Get ("cl_motd", "1", 0);
+	cl_skipMenu = Cvar_Get( "cl_skipMenu", "1", CVAR_ARCHIVE );
+	ui_bypassMainMenuLoad = Cvar_Get( "ui_bypassMainMenuLoad", "1", CVAR_ARCHIVE );
 
 	cl_timeout = Cvar_Get ("cl_timeout", "200", 0);
 
@@ -2953,7 +3424,7 @@ void CL_Init( void ) {
 	mme_demoFileName = Cvar_Get ("mme_demoFileName", "", CVAR_TEMP | CVAR_NORESTART );
 	mme_demoStartProject = Cvar_Get ("mme_demoStartProject", "", CVAR_TEMP );
 	mme_demoAutoQuit = Cvar_Get ("mme_demoAutoQuit", "0", CVAR_ARCHIVE );
-#ifdef __ANDORID__
+#if defined(__ANDORID__) || defined(__ANDROID__) || defined(__EMSCRIPTEN__)
 	mme_demoRemove = Cvar_Get ("mme_demoRemove", "1", CVAR_ARCHIVE );
 #else
 	mme_demoRemove = Cvar_Get ("mme_demoRemove", "0", CVAR_ARCHIVE );
@@ -3865,4 +4336,655 @@ CL_ShowIP_f
 void CL_ShowIP_f(void) {
 	Sys_ShowIP();
 }
+
+#ifndef EMSCRIPTEN_KEEPALIVE
+#define EMSCRIPTEN_KEEPALIVE
+#endif
+
+qboolean g_jkJustResumed = qfalse;
+void FX_Stop( void );
+qboolean CL_GetServerCommand( int serverCommandNumber );
+
+extern "C" {
+
+extern long long g_jkAudioSamplesMixed;
+extern long long g_jkPk3BytesTransferred;
+extern int g_jkPk3RangeRequests;
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoIsPaused( void ) {
+#ifdef __EMSCRIPTEN__
+	if ( demoIsMMEPlaying() && cls.cgameStarted ) {
+		return CG_MME_GetPaused() ? 1 : 0;
+	}
+#endif
+	return (cl_freezeDemo && cl_freezeDemo->integer) ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE void JK_DemoSetPaused( int paused ) {
+	int wasPaused = JK_DemoIsPaused();
+	if ( !paused && wasPaused ) {
+		g_jkJustResumed = qtrue;
+	}
+	Cvar_Set( "cl_freezeDemo", paused ? "1" : "0" );
+	Cvar_Set( "mme_demoPaused", paused ? "1" : "0" );
+#ifdef __EMSCRIPTEN__
+	if ( demoIsMMEPlaying() && cls.cgameStarted ) {
+		CG_MME_SetPaused( paused ? 1 : 0 );
+	}
+#endif
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoPause( void ) {
+	JK_DemoSetPaused( 1 );
+	return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoResume( void ) {
+	JK_DemoSetPaused( 0 );
+	return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoTogglePaused( void ) {
+	int nextPaused = JK_DemoIsPaused() ? 0 : 1;
+	JK_DemoSetPaused( nextPaused );
+	return nextPaused;
+}
+
+EMSCRIPTEN_KEEPALIVE float JK_DemoGetSpeed( void ) {
+#ifdef __EMSCRIPTEN__
+	if ( demoIsMMEPlaying() && cls.cgameStarted ) {
+		float s = CG_MME_GetSpeed();
+		if ( s > 0.0f ) {
+			return s;
+		}
+	}
+#endif
+	if ( s_jkPlaybackSpeed > 0.0f ) {
+		return s_jkPlaybackSpeed;
+	}
+	float v = Cvar_VariableValue( "timescale" );
+	return (v > 0.0f) ? v : 1.0f;
+}
+
+EMSCRIPTEN_KEEPALIVE float JK_DemoSetSpeed( float rate ) {
+	if ( !(rate == rate) || rate <= 0.0f ) {
+		return JK_DemoGetSpeed();
+	}
+	if ( rate < 0.05f ) rate = 0.05f;
+	if ( rate > 20.0f ) rate = 20.0f;
+	s_jkPlaybackSpeed = rate;
+#ifdef __EMSCRIPTEN__
+	if ( demoIsMMEPlaying() ) {
+		Cvar_SetValue( "timescale", 1.0f );
+		if ( cls.cgameStarted ) {
+			CG_MME_SetSpeed( rate );
+		}
+		return rate;
+	}
+#endif
+	Cvar_SetValue( "timescale", rate );
+	return rate;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoSetMuted( int muted ) {
+	g_jkIsMuted = muted ? qtrue : qfalse;
+	if ( g_jkIsMuted ) {
+		Cvar_SetValue( "s_volume", 0.0f );
+		Cvar_SetValue( "s_musicVolume", 0.0f );
+		Cvar_SetValue( "s_volumeVoice", 0.0f );
+	} else {
+		Cvar_SetValue( "s_volume", g_jkSavedVolume );
+		Cvar_SetValue( "s_musicVolume", g_jkSavedVolume * 0.5f );
+		Cvar_SetValue( "s_volumeVoice", 1.0f );
+	}
+	return g_jkIsMuted ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoMute( void ) {
+	return JK_DemoSetMuted( 1 );
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoUnmute( void ) {
+	return JK_DemoSetMuted( 0 );
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoIsMuted( void ) {
+	return g_jkIsMuted ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE float JK_DemoSetVolume( float level ) {
+	if ( !(level == level) ) {
+		return g_jkSavedVolume;
+	}
+	if ( level < 0.0f ) level = 0.0f;
+	if ( level > 1.0f ) level = 1.0f;
+	g_jkSavedVolume = level;
+	if ( !g_jkIsMuted ) {
+		Cvar_SetValue( "s_volume", g_jkSavedVolume );
+		Cvar_SetValue( "s_musicVolume", g_jkSavedVolume * 0.5f );
+	}
+	return g_jkSavedVolume;
+}
+
+EMSCRIPTEN_KEEPALIVE float JK_DemoGetVolume( void ) {
+	return g_jkSavedVolume;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoLoad( const char *demoName ) {
+	if ( !demoName || !demoName[0] ) {
+		return 0;
+	}
+	if ( strchr( demoName, ';' ) || strchr( demoName, '\n' ) || strchr( demoName, '\r' ) ||
+	     strchr( demoName, '"' ) || strchr( demoName, '\\' ) || strstr( demoName, ".." ) ) {
+		return 0;
+	}
+	const char *arg = demoName;
+	if ( !Q_stricmpn( arg, "demos/", 6 ) || !Q_stricmpn( arg, "demos\\", 6 ) ) {
+		arg += 6;
+	}
+	while ( *arg == '/' || *arg == '\\' ) {
+		arg++;
+	}
+	if ( !arg[0] ) {
+		return 0;
+	}
+	char name[MAX_OSPATH], extension[32];
+	Com_sprintf( extension, sizeof( extension ), ".dm_%d", PROTOCOL_VERSION );
+	if ( strlen( arg ) >= strlen( extension ) && !Q_stricmp( arg + strlen( arg ) - strlen( extension ), extension ) ) {
+		Com_sprintf( name, sizeof( name ), "demos/%s", arg );
+	} else {
+		Com_sprintf( name, sizeof( name ), "demos/%s.dm_%d", arg, PROTOCOL_VERSION );
+	}
+	fileHandle_t checkFile = 0;
+	FS_FOpenFileRead( name, &checkFile, qtrue );
+	if ( !checkFile ) {
+		return 0;
+	}
+	CL_ScanDemoTimeBounds( checkFile );
+	FS_FCloseFile( checkFile );
+	g_jkDemoCompleted = qfalse;
+	g_jkActiveRenderedFrames = 0;
+	Cvar_Set( "cl_freezeDemo", "0" );
+	Cvar_Set( "mme_demoPaused", "0" );
+	Cbuf_ExecuteText( EXEC_APPEND, va( "demo \"%s\"\n", demoName ) );
+	return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoGetState( void ) {
+	return (int)cls.state;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoIsPlaying( void ) {
+	return (clc.demoplaying && cls.state == CA_ACTIVE && g_jkActiveRenderedFrames >= 6) ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoIsReady( void ) {
+	extern qboolean com_fullyInitialized;
+	return com_fullyInitialized ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoIsCompleted( void ) {
+	return g_jkDemoCompleted ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoHasEnded( void ) {
+	return g_jkDemoCompleted ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoGetCompletedCount( void ) {
+	return g_jkDemoCompletedCount;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoGetStartTimeMs( void ) {
+	if ( demoIsMMEPlaying() ) {
+		int st = demoStartTime();
+		if ( st > 0 ) {
+			return st;
+		}
+	}
+	return s_jkDemoStartTimeMs;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoGetEndTimeMs( void ) {
+	if ( demoIsMMEPlaying() ) {
+		int et = demoEndTime();
+		if ( et > 0 ) {
+			return et;
+		}
+	}
+	return s_jkDemoEndTimeMs;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoGetDurationMs( void ) {
+	if ( demoIsMMEPlaying() ) {
+		int len = demoLength();
+		if ( len > 0 ) {
+			return len;
+		}
+	}
+	if ( s_jkDemoEndTimeMs <= s_jkDemoStartTimeMs ) {
+		return 0;
+	}
+	return s_jkDemoEndTimeMs - s_jkDemoStartTimeMs;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoGetCurrentTimeMs( void ) {
+#ifdef __EMSCRIPTEN__
+	if ( demoIsMMEPlaying() && cls.cgameStarted ) {
+		int cur = CG_MME_GetTimeMs();
+		if ( cur < 0 ) {
+			cur = 0;
+		}
+		int dur = JK_DemoGetDurationMs();
+		if ( dur > 0 && cur > dur ) {
+			cur = dur;
+		}
+		return cur;
+	}
+#endif
+	if ( !clc.demoplaying || s_jkDemoStartTimeMs <= 0 ) {
+		return 0;
+	}
+	int curServerTime = cl.serverTime;
+	if ( cl.snap.valid && ( curServerTime == cl.snap.serverTime - 1 || curServerTime <= 0 ) ) {
+		curServerTime = cl.snap.serverTime;
+	}
+	int elapsed = curServerTime - s_jkDemoStartTimeMs;
+	if ( elapsed < 0 ) {
+		elapsed = 0;
+	}
+	int duration = JK_DemoGetDurationMs();
+	if ( duration > 0 && elapsed > duration ) {
+		elapsed = duration;
+	}
+	return elapsed;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoGetServerTime( void ) {
+#ifdef __EMSCRIPTEN__
+	if ( demoIsMMEPlaying() ) {
+		return JK_DemoGetStartTimeMs() + JK_DemoGetCurrentTimeMs();
+	}
+#endif
+	return cl.serverTime;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoGetRealtime( void ) {
+	return cls.realtime;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoGetFrameCount( void ) {
+	return (int)cls.framecount;
+}
+
+EMSCRIPTEN_KEEPALIVE const char *JK_DemoGetName( void ) {
+	if ( clc.demoName[0] ) {
+		return clc.demoName;
+	}
+	return g_jkLastDemoName;
+}
+
+EMSCRIPTEN_KEEPALIVE const char *JK_DemoGetCurrentName( void ) {
+	return JK_DemoGetName();
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoSetInteractive( int enabled ) {
+	Cvar_Set( "in_InteractiveMode", enabled ? "1" : "0" );
+	return enabled ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE const char *JK_DemoGetMapName( void ) {
+	if ( cl.gameState.stringOffsets[CS_SERVERINFO] ) {
+		const char *info = cl.gameState.stringData + cl.gameState.stringOffsets[CS_SERVERINFO];
+		const char *map = Info_ValueForKey( info, "mapname" );
+		if ( map && map[0] ) {
+			Q_strncpyz( g_jkLastMapName, map, sizeof( g_jkLastMapName ) );
+		}
+	}
+	return g_jkLastMapName;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoIsAudioActive( void ) {
+	return cls.soundStarted ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE double JK_DemoGetAudioSamplesMixed( void ) {
+	return (double)g_jkAudioSamplesMixed;
+}
+
+EMSCRIPTEN_KEEPALIVE double JK_DemoGetPk3BytesTransferred( void ) {
+	return (double)g_jkPk3BytesTransferred;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoGetPk3RangeRequests( void ) {
+	return g_jkPk3RangeRequests;
+}
+
+#ifdef __EMSCRIPTEN__
+extern "C" void R_UpdateVideoSize( int width, int height );
+extern "C" void CG_UpdateViewportSize( int width, int height );
+#endif
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoResizeViewport( int width, int height ) {
+	if ( width < 64 || height < 64 ) {
+		return 0;
+	}
+	width &= ~1;
+	height &= ~1;
+	if ( width > 8192 ) width = 8192;
+	if ( height > 8192 ) height = 8192;
+
+	if ( cls.glconfig.vidWidth > 0 ) {
+		cls.glconfig.vidWidth = width;
+		cls.glconfig.vidHeight = height;
+		cls.ratioFix = (float)(SCREEN_WIDTH * cls.glconfig.vidHeight) / (float)(SCREEN_HEIGHT * cls.glconfig.vidWidth);
+
+#ifdef __EMSCRIPTEN__
+		R_UpdateVideoSize( width, height );
+		if ( cls.cgameStarted ) {
+			CG_UpdateViewportSize( width, height );
+		}
+#endif
+
+		Con_CheckResize();
+	}
+	return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoGetViewportWidth( void ) {
+	return cls.glconfig.vidWidth;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoGetViewportHeight( void ) {
+	return cls.glconfig.vidHeight;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoExecCommand( const char *cmd ) {
+	if ( !cmd || !cmd[0] ) {
+		return 0;
+	}
+	Cbuf_AddText( cmd );
+	Cbuf_AddText( "\n" );
+	return 1;
+}
+
+static qboolean g_jkAssetsPrewarmed = qfalse;
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoPrewarmAssets( void ) {
+	if ( g_jkAssetsPrewarmed ) {
+		return 1;
+	}
+	if ( !cls.rendererStarted || !re.RegisterShaderNoMip ) {
+		return 0;
+	}
+	g_jkAssetsPrewarmed = qtrue;
+	re.RegisterShaderNoMip( "gfx/2d/charsgrid_med" );
+	return 1;
+}
+
+#ifdef __EMSCRIPTEN__
+extern "C" void CG_ResetForDemoSeek( int serverCommandSeq, int processedSnapNum );
+extern "C" void CG_GetDemoDebugState( float *outFloats, int maxCount );
+extern "C" void CG_ExecuteNewServerCommands( int latestSequence );
+extern int FS_GetLoadedPackCount( void );
+#endif
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoSetLoop( int enabled ) {
+	s_jkDemoLoopEnabled = enabled ? qtrue : qfalse;
+	return s_jkDemoLoopEnabled ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoGetLoop( void ) {
+	return s_jkDemoLoopEnabled ? 1 : 0;
+}
+
+extern int g_jkSeekTargetServerTime;
+extern "C" void CL_ResetSeekEntityCache( void );
+extern "C" void CL_MaterializeSeekSnapshot( clSnapshot_t *snap );
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoSeekToMs( int targetOffsetMs ) {
+	if ( !clc.demoplaying && g_jkLastDemoName[0] ) {
+		Cbuf_AddText( va( "demo \"%s\"\n", g_jkLastDemoName ) );
+		Cbuf_Execute();
+	}
+	if ( !clc.demoplaying ) {
+		return -1;
+	}
+	if ( targetOffsetMs < 0 ) {
+		targetOffsetMs = 0;
+	}
+	int duration = JK_DemoGetDurationMs();
+	if ( duration > 0 && targetOffsetMs > duration ) {
+		targetOffsetMs = duration;
+	}
+	int wasPaused = ( JK_DemoIsPaused() && !g_jkDemoCompleted ) ? 1 : 0;
+	g_jkDemoCompleted = qfalse;
+
+	if ( demoIsMMEPlaying() ) {
+#ifdef __EMSCRIPTEN__
+		CG_MME_SetTimeMs( targetOffsetMs );
+#else
+		demoSeek( targetOffsetMs );
+#endif
+		cl.serverTime = JK_DemoGetStartTimeMs() + targetOffsetMs;
+		FX_Stop();
+		JK_DemoSetPaused( wasPaused );
+		com_frameTime = Com_Milliseconds();
+		return JK_DemoGetCurrentTimeMs();
+	}
+
+	if ( !clc.demofile ) {
+		return -1;
+	}
+	int targetServerTime = s_jkDemoStartTimeMs + targetOffsetMs;
+
+	g_jkDemoSeeking = qtrue;
+	g_jkDemoSeekingRewind = qtrue;
+	g_jkSeekTargetServerTime = targetServerTime;
+	s_jkDemoSeekHitEof = qfalse;
+
+	if ( targetOffsetMs == 0 || !cl.snap.valid || targetServerTime < cl.snap.serverTime ) {
+		CL_DemoRewind( clc.demofile );
+		CL_ResetSeekEntityCache();
+		Com_Memset( cl.snapshots, 0, sizeof( cl.snapshots ) );
+		Com_Memset( &cl.snap, 0, sizeof( cl.snap ) );
+		Com_Memset( cl.parseEntities, 0, sizeof( cl.parseEntities ) );
+		cl.parseEntitiesNum = 0;
+		clc.firstDemoFrameSkipped = qfalse;
+
+		int safety = 0;
+		while ( ( !cl.snap.valid || ( cl.snap.snapFlags & SNAPFLAG_NOT_ACTIVE ) ) && clc.demoplaying && !s_jkDemoSeekHitEof && safety < 200000 ) {
+			CL_ReadDemoMessage();
+			// Drain serverCommands via CL_GetServerCommand (CG_ExecuteNewServerCommands synced via CG_ResetForDemoSeek)
+			while ( clc.lastExecutedServerCommand < clc.serverCommandSequence ) {
+				CL_GetServerCommand( clc.lastExecutedServerCommand + 1 );
+			}
+			safety++;
+		}
+	}
+
+	if ( cl.snap.valid && cl.snap.serverTime < targetServerTime && s_jkDemoMemBuf && s_jkDemoMemLen > 0 && clc.demofile == s_jkDemoMemHandle && s_jkDemoPktsCount > 0 ) {
+		int startIdx = -1;
+		for ( int i = 0; i < s_jkDemoPktsCount; i++ ) {
+			if ( s_jkDemoPkts[i].fileOffset == s_jkDemoMemPos ) {
+				startIdx = i;
+				break;
+			}
+		}
+		int targetIdx = -1;
+		if ( startIdx >= 0 ) {
+			for ( int i = startIdx; i < s_jkDemoPktsCount; i++ ) {
+				if ( s_jkDemoPkts[i].snapTime >= targetServerTime ) {
+					targetIdx = i;
+					break;
+				}
+			}
+			if ( targetIdx < 0 ) {
+				targetIdx = s_jkDemoPktsCount - 1;
+			}
+		}
+		if ( startIdx >= 0 && targetIdx >= startIdx ) {
+			for ( int i = startIdx; i <= targetIdx; i++ ) {
+				s_jkDemoPkts[i].needSnap = 0;
+			}
+			int tailStart = ( targetIdx - 64 > startIdx ) ? ( targetIdx - 64 ) : startIdx;
+			for ( int i = tailStart; i <= targetIdx; i++ ) {
+				if ( s_jkDemoPkts[i].snapTime > 0 ) {
+					s_jkDemoPkts[i].needSnap = 1;
+				}
+			}
+			for ( int i = targetIdx; i >= startIdx; i-- ) {
+				if ( s_jkDemoPkts[i].needSnap && s_jkDemoPkts[i].deltaNum >= 0 ) {
+					int wantSeq = s_jkDemoPkts[i].deltaNum;
+					for ( int j = i - 1; j >= startIdx && i - j <= 64; j-- ) {
+						if ( s_jkDemoPkts[j].messageSeq == wantSeq ) {
+							s_jkDemoPkts[j].needSnap = 1;
+							break;
+						}
+					}
+				}
+			}
+			for ( int i = startIdx; i <= targetIdx && clc.demoplaying && !s_jkDemoSeekHitEof; i++ ) {
+				if ( !s_jkDemoPkts[i].needSnap && !s_jkDemoPkts[i].hasNonSnap ) {
+					s_jkDemoMemPos = s_jkDemoPkts[i].nextOffset;
+					clc.serverMessageSequence = s_jkDemoPkts[i].messageSeq;
+					continue;
+				}
+				s_jkDemoMemPos = s_jkDemoPkts[i].fileOffset;
+				g_jkDemoSkipSnapshot = s_jkDemoPkts[i].needSnap ? qfalse : qtrue;
+				CL_ReadDemoMessage();
+				g_jkDemoSkipSnapshot = qfalse;
+				while ( clc.lastExecutedServerCommand < clc.serverCommandSequence ) {
+					CL_GetServerCommand( clc.lastExecutedServerCommand + 1 );
+				}
+				if ( cl.snap.valid && cl.snap.serverTime >= targetServerTime ) {
+					break;
+				}
+			}
+		}
+	}
+
+	int safety = 0;
+	while ( cl.snap.valid && cl.snap.serverTime < targetServerTime && clc.demoplaying && !s_jkDemoSeekHitEof && safety < 200000 ) {
+		CL_ReadDemoMessage();
+		// Drain serverCommands via CL_GetServerCommand (CG_ExecuteNewServerCommands synced via CG_ResetForDemoSeek)
+		while ( clc.lastExecutedServerCommand < clc.serverCommandSequence ) {
+			CL_GetServerCommand( clc.lastExecutedServerCommand + 1 );
+		}
+		safety++;
+	}
+
+	g_jkDemoSkipSnapshot = qfalse;
+	g_jkDemoSeeking = qfalse;
+	g_jkDemoSeekingRewind = qfalse;
+
+	if ( cl.snap.valid ) {
+		int baseMsgNum = cl.snap.messageNum;
+		int baseServerTime = cl.snap.serverTime;
+		CL_MaterializeSeekSnapshot( &cl.snapshots[baseMsgNum & PACKET_MASK] );
+		cl.snap = cl.snapshots[baseMsgNum & PACKET_MASK];
+		if ( !wasPaused && !s_jkDemoSeekHitEof && clc.demoplaying ) {
+			int lookaheadSafety = 0;
+			while ( clc.demoplaying && !s_jkDemoSeekHitEof && cl.snap.valid && cl.snap.serverTime <= baseServerTime && lookaheadSafety < 16 ) {
+				g_jkDemoSeeking = qtrue;
+				CL_ReadDemoMessage();
+				g_jkDemoSeeking = qfalse;
+				while ( clc.lastExecutedServerCommand < clc.serverCommandSequence ) {
+					CL_GetServerCommand( clc.lastExecutedServerCommand + 1 );
+				}
+				lookaheadSafety++;
+			}
+			if ( cl.snap.valid ) {
+				CL_MaterializeSeekSnapshot( &cl.snapshots[cl.snap.messageNum & PACKET_MASK] );
+				cl.snap = cl.snapshots[cl.snap.messageNum & PACKET_MASK];
+			}
+		}
+		cl.newSnapshots = qfalse;
+		cl.serverTime = ( wasPaused || s_jkDemoSeekHitEof ) ? ( baseServerTime - 1 ) : baseServerTime;
+		cl.oldServerTime = cl.serverTime;
+		cl.oldFrameServerTime = baseServerTime;
+		cl.serverTimeDelta = cl.serverTime - cls.realtime;
+		g_jkPinnedServerTime = cl.serverTime;
+		g_jkPinServerTimeFrames = 1;
+		clc.firstDemoFrameSkipped = qtrue;
+		if ( cls.state >= CA_PRIMED ) {
+			cls.state = CA_ACTIVE;
+		}
+		FX_Stop();
+#ifdef __EMSCRIPTEN__
+		if ( cls.cgameStarted ) {
+			CG_ResetForDemoSeek( clc.serverCommandSequence, ( baseMsgNum > 0 ) ? ( baseMsgNum - 1 ) : 0 );
+		}
+#endif
+	}
+
+	s_jkDemoSeekHitEof = qfalse;
+	Cvar_Set( "cl_freezeDemo", wasPaused ? "1" : "0" );
+	com_frameTime = Com_Milliseconds();
+	return JK_DemoGetCurrentTimeMs();
+}
+
+EMSCRIPTEN_KEEPALIVE const char *JK_DemoGetDebugJSON( void ) {
+	static char s_debugJson[1024];
+	float d[20];
+	Com_Memset( d, 0, sizeof( d ) );
+#ifdef __EMSCRIPTEN__
+	if ( cls.cgameStarted ) {
+		CG_GetDemoDebugState( d, 20 );
+	}
+#endif
+	int clSrvTime = JK_DemoGetServerTime();
+	int clSnapT = cl.snap.valid ? cl.snap.serverTime : (int)d[1];
+	int clSnapM = cl.snap.valid ? cl.snap.messageNum : (int)d[0];
+	float clOx = cl.snap.valid ? cl.snap.ps.origin[0] : d[4];
+	float clOy = cl.snap.valid ? cl.snap.ps.origin[1] : d[5];
+	float clOz = cl.snap.valid ? cl.snap.ps.origin[2] : d[6];
+	Com_sprintf(
+		s_debugJson,
+		sizeof( s_debugJson ),
+		"{\"clServerTime\":%d,\"clSnapTime\":%d,\"clSnapMsg\":%d,\"clSnapOrigin\":[%.2f,%.2f,%.2f],"
+		"\"cgTime\":%d,\"cgSnapTime\":%d,\"cgNextSnapTime\":%d,\"cgClientNum\":%d,"
+		"\"cgSnapOrigin\":[%.2f,%.2f,%.2f],\"ppsOrigin\":[%.2f,%.2f,%.2f],"
+		"\"viewOrg\":[%.2f,%.2f,%.2f],\"centLerpOrigin\":[%.2f,%.2f,%.2f],"
+		"\"bryarFrontFlash\":%d,\"bryarShotEffect\":%d,\"bryarPowerupShotEffect\":%d,\"thirdPerson\":%d}",
+		clSrvTime,
+		clSnapT,
+		clSnapM,
+		clOx, clOy, clOz,
+		(int)d[0], (int)d[1], (int)d[2], (int)d[3],
+		d[4], d[5], d[6],
+		d[7], d[8], d[9],
+		d[10], d[11], d[12],
+		d[13], d[14], d[15],
+		(int)d[16], (int)d[17], (int)d[18], (int)d[19]
+	);
+	return s_debugJson;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoTogglePause( void ) {
+	return JK_DemoTogglePaused();
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoGetPK3RangeRequests( void ) {
+	return JK_DemoGetPk3RangeRequests();
+}
+
+EMSCRIPTEN_KEEPALIVE double JK_DemoGetPK3BytesTransferred( void ) {
+	return JK_DemoGetPk3BytesTransferred();
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoGetLoadedPackCount( void ) {
+#ifdef __EMSCRIPTEN__
+	return FS_GetLoadedPackCount();
+#else
+	return 0;
+#endif
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoGetServerTimeMs( void ) {
+	return JK_DemoGetServerTime();
+}
+
+} // extern "C"
+
 

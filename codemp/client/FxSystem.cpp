@@ -98,9 +98,11 @@ qboolean SFxHelper::GetOriginAxisFromBolt(CGhoul2Info_v *pGhoul2, int mEntNum, i
 	data->mEntityNum = mEntNum;
 	VM_Call(cgvm, CG_GET_LERP_DATA);//this func will zero out pitch and roll for players, and ridable vehicles
 	//Fixme: optimize these VM calls away by storing 
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
 	//WTF IS THIS, Crashes otherwise, FIX ME!
-	LOGI("GetOriginAxisFromBolt %x",pGhoul2);
+	if (!pGhoul2)
+		return qfalse;
+#else
 	if (!pGhoul2)
 		return qfalse;
 #endif

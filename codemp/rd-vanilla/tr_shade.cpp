@@ -160,6 +160,14 @@ instead of using the single glDrawElements call that may be inefficient
 without compiled vertex arrays.
 ==================
 */
+#ifdef __EMSCRIPTEN__
+static const vec4_t *s_emXyzPtr = NULL;
+static const byte *s_emColorPtr = NULL;
+static const vec2_t *s_emTexCoord0Ptr = NULL;
+static const vec2_t *s_emTexCoord1Ptr = NULL;
+static int s_emVertexCount = 0;
+#endif
+
 static void R_DrawElements( int numIndexes, const glIndex_t *indexes ) {
 	int		primitives;
 
@@ -167,20 +175,96 @@ static void R_DrawElements( int numIndexes, const glIndex_t *indexes ) {
 
 	// default is to use triangles if compiled vertex arrays are present
 	if ( primitives == 0 ) {
+#ifdef __EMSCRIPTEN__
+		primitives = 2;
+#else
 		if ( qglLockArraysEXT ) {
 			primitives = 2;
 		} else {
 			primitives = 1;
 		}
+#endif
 	}
 
 
 	if ( primitives == 2 ) {
+#ifdef __EMSCRIPTEN__
+		struct EmVert {
+			float xyz[3];
+			byte color[4];
+			float st0[2];
+			float st1[2];
+		};
+		static EmVert s_emVerts[SHADER_MAX_VERTEXES];
+		static unsigned short s_emIndexes[SHADER_MAX_INDEXES];
+		const vec4_t *xyzPtr = s_emXyzPtr ? s_emXyzPtr : tess.xyz;
+		const byte *colorPtr = s_emColorPtr ? s_emColorPtr : (const byte *)tess.svars.colors;
+		const vec2_t *tc0Ptr = s_emTexCoord0Ptr ? s_emTexCoord0Ptr : tess.svars.texcoords[0];
+		const vec2_t *tc1Ptr = s_emTexCoord1Ptr ? s_emTexCoord1Ptr : tess.svars.texcoords[1];
+		int nv = s_emVertexCount > 0 ? s_emVertexCount : tess.numVertexes;
+		if ( nv > SHADER_MAX_VERTEXES ) {
+			nv = SHADER_MAX_VERTEXES;
+		}
+		int savedTMU = glState.currenttmu;
+		if ( savedTMU == 1 ) {
+			for ( int i = 0; i < nv; i++ ) {
+				s_emVerts[i].xyz[0] = xyzPtr[i][0];
+				s_emVerts[i].xyz[1] = xyzPtr[i][1];
+				s_emVerts[i].xyz[2] = xyzPtr[i][2];
+				memcpy( s_emVerts[i].color, colorPtr + i * 4, 4 );
+				s_emVerts[i].st0[0] = tc0Ptr[i][0];
+				s_emVerts[i].st0[1] = tc0Ptr[i][1];
+				s_emVerts[i].st1[0] = tc1Ptr[i][0];
+				s_emVerts[i].st1[1] = tc1Ptr[i][1];
+			}
+		} else {
+			for ( int i = 0; i < nv; i++ ) {
+				s_emVerts[i].xyz[0] = xyzPtr[i][0];
+				s_emVerts[i].xyz[1] = xyzPtr[i][1];
+				s_emVerts[i].xyz[2] = xyzPtr[i][2];
+				memcpy( s_emVerts[i].color, colorPtr + i * 4, 4 );
+				s_emVerts[i].st0[0] = tc0Ptr[i][0];
+				s_emVerts[i].st0[1] = tc0Ptr[i][1];
+			}
+		}
+		int ni = numIndexes;
+		if ( ni > SHADER_MAX_INDEXES ) {
+			ni = SHADER_MAX_INDEXES;
+		}
+		for ( int i = 0; i < ni; i++ ) {
+			s_emIndexes[i] = (unsigned short)indexes[i];
+		}
+		static qboolean s_emTex1Init = qfalse;
+		if ( !s_emTex1Init && qglClientActiveTextureARB ) {
+			s_emTex1Init = qtrue;
+			qglClientActiveTextureARB( GL_TEXTURE1_ARB );
+			qglTexCoordPointer( 2, GL_FLOAT, sizeof( EmVert ), s_emVerts[0].st1 );
+			qglClientActiveTextureARB( savedTMU == 1 ? GL_TEXTURE1_ARB : GL_TEXTURE0_ARB );
+		}
+		qglVertexPointer( 3, GL_FLOAT, sizeof( EmVert ), s_emVerts[0].xyz );
+		qglColorPointer( 4, GL_UNSIGNED_BYTE, sizeof( EmVert ), s_emVerts[0].color );
+		if ( savedTMU != 0 && qglClientActiveTextureARB ) {
+			qglClientActiveTextureARB( GL_TEXTURE0_ARB );
+		}
+		qglTexCoordPointer( 2, GL_FLOAT, sizeof( EmVert ), s_emVerts[0].st0 );
+		if ( savedTMU == 1 && qglClientActiveTextureARB ) {
+			qglClientActiveTextureARB( GL_TEXTURE1_ARB );
+			qglTexCoordPointer( 2, GL_FLOAT, sizeof( EmVert ), s_emVerts[0].st1 );
+		}
+		glDrawRangeElements( GL_TRIANGLES,
+						0,
+						(nv > 1 ? nv - 1 : 1),
+						ni,
+						GL_UNSIGNED_SHORT,
+						s_emIndexes );
+		return;
+#else
 		qglDrawElements( GL_TRIANGLES, 
 						numIndexes,
 						GL_INDEX_TYPE,
 						indexes );
 		return;
+#endif
 	}
 
 #if defined(HAVE_GLES)
@@ -409,7 +493,7 @@ static void DrawMultitextured( shaderCommands_t *input, int stage ) {
 
 	GL_State( pStage->stateBits );
 
-#ifndef HAVE_GLES
+#if !defined(HAVE_GLES) && !defined(__EMSCRIPTEN__)
 	// this is an ugly hack to work around a GeForce driver
 	// bug with multitexture and clip planes
 	if ( backEnd.viewParms.isPortal ) {
@@ -421,7 +505,9 @@ static void DrawMultitextured( shaderCommands_t *input, int stage ) {
 	// base
 	//
 	GL_SelectTexture( 0 );
+#ifndef __EMSCRIPTEN__
 	qglTexCoordPointer( 2, GL_FLOAT, 0, input->svars.texcoords[0] );
+#endif
 	R_BindAnimatedImage( &pStage->bundle[0] );
 
 	//
@@ -437,7 +523,9 @@ static void DrawMultitextured( shaderCommands_t *input, int stage ) {
 		GL_TexEnv( tess.shader->multitextureEnv );
 	}
 
+#ifndef __EMSCRIPTEN__
 	qglTexCoordPointer( 2, GL_FLOAT, 0, input->svars.texcoords[1] );
+#endif
 
 	R_BindAnimatedImage( &pStage->bundle[1] );
 
@@ -446,7 +534,7 @@ static void DrawMultitextured( shaderCommands_t *input, int stage ) {
 	//
 	// disable texturing on TEXTURE1, then select TEXTURE0
 	//
-	//qglDisableClientState( GL_TEXTURE_COORD_ARRAY );
+	qglDisableClientState( GL_TEXTURE_COORD_ARRAY );
 	qglDisable( GL_TEXTURE_2D );
 
 	GL_SelectTexture( 0 );
@@ -774,13 +862,17 @@ static void ProjectDlightTexture2( void ) {
 				GLimp_LogComment( "glUnlockArraysEXT\n" );
 			}
 		}
+#ifndef __EMSCRIPTEN__
 		qglVertexPointer (3, GL_FLOAT, 16, vertCoordsArray);	// padded for SIMD
+#endif
 
 		if (dStage)
 		{
 			GL_SelectTexture( 0 );
 			GL_State(0);
+#ifndef __EMSCRIPTEN__
 			qglTexCoordPointer( 2, GL_FLOAT, 0, oldTexCoordsArray[0] );
+#endif
 			if (dStage->bundle[0].image && !dStage->bundle[0].isLightmap && !dStage->bundle[0].numTexMods && dStage->bundle[0].tcGen != TCGEN_ENVIRONMENT_MAPPED && dStage->bundle[0].tcGen != TCGEN_FOG)
 			{
 				R_BindAnimatedImage( &dStage->bundle[0] );
@@ -793,27 +885,50 @@ static void ProjectDlightTexture2( void ) {
 			GL_SelectTexture( 1 );
 			qglEnable( GL_TEXTURE_2D );
 			qglEnableClientState( GL_TEXTURE_COORD_ARRAY );
+#ifndef __EMSCRIPTEN__
 			qglTexCoordPointer( 2, GL_FLOAT, 0, texCoordsArray[0] );
+#endif
 			qglEnableClientState( GL_COLOR_ARRAY );
+#ifndef __EMSCRIPTEN__
 			qglColorPointer( 4, GL_UNSIGNED_BYTE, 0, colorArray );
+#endif
 			GL_Bind( tr.dlightImage );
 			GL_TexEnv( GL_MODULATE );
 
 
 			GL_State(GLS_SRCBLEND_ONE | GLS_DSTBLEND_ONE | GLS_DEPTHFUNC_EQUAL);// | GLS_ATEST_GT_0);
 
+#ifdef __EMSCRIPTEN__
+			s_emXyzPtr = vertCoordsArray;
+			s_emColorPtr = (const byte *)colorArray;
+			s_emTexCoord0Ptr = oldTexCoordsArray;
+			s_emTexCoord1Ptr = texCoordsArray;
+			s_emVertexCount = numIndexes;
+#endif
 			R_DrawElements( numIndexes, hitIndexes );
+#ifdef __EMSCRIPTEN__
+			s_emXyzPtr = NULL;
+			s_emColorPtr = NULL;
+			s_emTexCoord0Ptr = NULL;
+			s_emTexCoord1Ptr = NULL;
+			s_emVertexCount = 0;
+#endif
 
+			qglDisableClientState( GL_TEXTURE_COORD_ARRAY );
 			qglDisable( GL_TEXTURE_2D );
 			GL_SelectTexture(0);
 		}
 		else
 		{
 			qglEnableClientState( GL_TEXTURE_COORD_ARRAY );
+#ifndef __EMSCRIPTEN__
 			qglTexCoordPointer( 2, GL_FLOAT, 0, texCoordsArray[0] );
+#endif
 
 			qglEnableClientState( GL_COLOR_ARRAY );
+#ifndef __EMSCRIPTEN__
 			qglColorPointer( 4, GL_UNSIGNED_BYTE, 0, colorArray );
+#endif
 
 			GL_Bind( tr.dlightImage );
 			// include GLS_DEPTHFUNC_EQUAL so alpha tested surfaces don't add light
@@ -825,7 +940,21 @@ static void ProjectDlightTexture2( void ) {
 				GL_State( GLS_SRCBLEND_DST_COLOR | GLS_DSTBLEND_ONE | GLS_DEPTHFUNC_EQUAL );
 			}
 
+#ifdef __EMSCRIPTEN__
+			s_emXyzPtr = vertCoordsArray;
+			s_emColorPtr = (const byte *)colorArray;
+			s_emTexCoord0Ptr = texCoordsArray;
+			s_emTexCoord1Ptr = NULL;
+			s_emVertexCount = numIndexes;
+#endif
 			R_DrawElements( numIndexes, hitIndexes );
+#ifdef __EMSCRIPTEN__
+			s_emXyzPtr = NULL;
+			s_emColorPtr = NULL;
+			s_emTexCoord0Ptr = NULL;
+			s_emTexCoord1Ptr = NULL;
+			s_emVertexCount = 0;
+#endif
 		}
 
 		if (fogging)
@@ -836,6 +965,7 @@ static void ProjectDlightTexture2( void ) {
 		backEnd.pc.c_totalIndexes += numIndexes;
 		backEnd.pc.c_dlightIndexes += numIndexes;
 	}
+#ifndef __EMSCRIPTEN__
 	if (needResetVerts)
 	{
 		qglVertexPointer (3, GL_FLOAT, 16, tess.xyz);	// padded for SIMD
@@ -845,6 +975,7 @@ static void ProjectDlightTexture2( void ) {
 			GLimp_LogComment( "glLockArraysEXT\n" );
 		}
 	}
+#endif
 }
 
 static void ProjectDlightTexture( void ) {
@@ -1143,8 +1274,23 @@ static void ProjectDlightTexture( void ) {
 
 			GL_State(GLS_SRCBLEND_ONE | GLS_DSTBLEND_ONE | GLS_DEPTHFUNC_EQUAL);// | GLS_ATEST_GT_0);
 
+#ifdef __EMSCRIPTEN__
+			s_emXyzPtr = tess.xyz;
+			s_emColorPtr = (const byte *)colorArray;
+			s_emTexCoord0Ptr = tess.svars.texcoords[0];
+			s_emTexCoord1Ptr = texCoordsArray;
+			s_emVertexCount = tess.numVertexes;
+#endif
 			R_DrawElements( numIndexes, hitIndexes );
+#ifdef __EMSCRIPTEN__
+			s_emXyzPtr = NULL;
+			s_emColorPtr = NULL;
+			s_emTexCoord0Ptr = NULL;
+			s_emTexCoord1Ptr = NULL;
+			s_emVertexCount = 0;
+#endif
 
+			qglDisableClientState( GL_TEXTURE_COORD_ARRAY );
 			qglDisable( GL_TEXTURE_2D );
 			GL_SelectTexture(0);
 		}
@@ -1166,7 +1312,21 @@ static void ProjectDlightTexture( void ) {
 				GL_State( GLS_SRCBLEND_DST_COLOR | GLS_DSTBLEND_ONE | GLS_DEPTHFUNC_EQUAL );
 			}
 
+#ifdef __EMSCRIPTEN__
+			s_emXyzPtr = tess.xyz;
+			s_emColorPtr = (const byte *)colorArray;
+			s_emTexCoord0Ptr = texCoordsArray;
+			s_emTexCoord1Ptr = NULL;
+			s_emVertexCount = tess.numVertexes;
+#endif
 			R_DrawElements( numIndexes, hitIndexes );
+#ifdef __EMSCRIPTEN__
+			s_emXyzPtr = NULL;
+			s_emColorPtr = NULL;
+			s_emTexCoord0Ptr = NULL;
+			s_emTexCoord1Ptr = NULL;
+			s_emVertexCount = 0;
+#endif
 		}
 
 		if (fogging)
@@ -1194,10 +1354,14 @@ static void RB_FogPass( void ) {
 	int			i;
 
 	qglEnableClientState( GL_COLOR_ARRAY );
+#ifndef __EMSCRIPTEN__
 	qglColorPointer( 4, GL_UNSIGNED_BYTE, 0, tess.svars.colors );
+#endif
 
 	qglEnableClientState( GL_TEXTURE_COORD_ARRAY);
+#ifndef __EMSCRIPTEN__
 	qglTexCoordPointer( 2, GL_FLOAT, 0, tess.svars.texcoords[0] );
+#endif
 
 	fog = tr.world->fogs + tess.fogNum;
 
@@ -1857,9 +2021,13 @@ static void RB_IterateStagesGeneric( shaderCommands_t *input )
 			if ( (tess.shader == tr.distortionShader) || 
 				 (backEnd.currentEntity && (backEnd.currentEntity->e.renderfx & RF_DISTORTION)) )
 			{ //special distortion effect -rww
+#ifdef __EMSCRIPTEN__
+				continue;
+#else
 				//tr.screenImage should have been set for this specific entity before we got in here.
 				GL_Bind( tr.screenImage );
 				GL_Cull(CT_TWO_SIDED);
+#endif
 			}
 			else if ( pStage->bundle[0].vertexLightmap && ( r_vertexLight->integer && !r_uiFullScreen->integer ) && r_lightmap->integer )
 			{
@@ -1965,6 +2133,11 @@ void RB_StageIteratorGeneric( void )
 	// to avoid compiling those arrays since they will change
 	// during multipass rendering
 	//
+#ifdef __EMSCRIPTEN__
+	setArraysOnce = qtrue;
+	qglEnableClientState( GL_COLOR_ARRAY );
+	qglEnableClientState( GL_TEXTURE_COORD_ARRAY );
+#else
 	if ( tess.numPasses > 1 || input->shader->multitextureEnv )
 	{
 		setArraysOnce = qfalse;
@@ -2000,6 +2173,7 @@ void RB_StageIteratorGeneric( void )
 		qglEnableClientState( GL_TEXTURE_COORD_ARRAY );
 		qglEnableClientState( GL_COLOR_ARRAY );
 	}
+#endif
 
 	//
 	// call shader function

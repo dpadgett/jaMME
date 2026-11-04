@@ -257,7 +257,7 @@ VIRTUAL MACHINE
 ==============================================================
 */
 
-typedef intptr_t (QDECL *entryPoint_t) (int, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t);
+typedef intptr_t (QDECL *entryPoint_t) (int, int, int, int, int, int, int, int, int, int, int, int, int);
 
 typedef enum vmSlots_e {
 	VM_GAME=0,

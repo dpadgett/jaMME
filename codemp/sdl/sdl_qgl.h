@@ -70,7 +70,11 @@
 #define qglDisable glDisable
 #define qglDisableClientState glDisableClientState
 #define qglDrawArrays glDrawArrays
+#ifdef __EMSCRIPTEN__
+#define qglDrawBuffer(a) ((void)0)
+#else
 #define qglDrawBuffer glDrawBuffer
+#endif
 #define qglDrawElements glDrawElements
 #define qglDrawPixels glDrawPixels
 #define qglEdgeFlag glEdgeFlag
@@ -202,7 +206,11 @@
 #define qglPixelTransferi glPixelTransferi
 #define qglPixelZoom glPixelZoom
 #define qglPointSize glPointSize
+#ifdef __EMSCRIPTEN__
+#define qglPolygonMode(a, b) ((void)0)
+#else
 #define qglPolygonMode glPolygonMode
+#endif
 #define qglPolygonOffset glPolygonOffset
 #define qglPolygonStipple glPolygonStipple
 #define qglPopAttrib glPopAttrib
@@ -238,7 +246,11 @@
 #define qglRasterPos4iv glRasterPos4iv
 #define qglRasterPos4s glRasterPos4s
 #define qglRasterPos4sv glRasterPos4sv
+#ifdef __EMSCRIPTEN__
+#define qglReadBuffer(a) ((void)0)
+#else
 #define qglReadBuffer glReadBuffer
+#endif
 #define qglReadPixels glReadPixels
 #define qglRectd glRectd
 #define qglRectdv glRectdv

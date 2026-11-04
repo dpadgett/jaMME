@@ -11,7 +11,7 @@
 #include "navigator.h"
 #include "../../game/g_nav.h"
 #include <time.h>
-#ifdef __linux__
+#if defined(__linux__) || defined(__EMSCRIPTEN__)
 DWORD timeGetTime(void);
 #endif
 

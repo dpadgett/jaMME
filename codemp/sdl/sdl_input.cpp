@@ -13,6 +13,7 @@ static qboolean mouseActive = qfalse;
 
 static cvar_t *in_mouse             = NULL;
 static cvar_t *in_nograb;
+static cvar_t *in_InteractiveMode   = NULL;
 
 cvar_t *in_joystick          		= NULL;
 static cvar_t *in_joystickDebug     = NULL;
@@ -285,6 +286,11 @@ static void IN_ActivateMouse( void )
 	if (!mouseAvailable || !SDL_WasInit( SDL_INIT_VIDEO ) )
 		return;
 
+#ifdef __EMSCRIPTEN__
+	if ( !in_InteractiveMode || !in_InteractiveMode->integer )
+		return;
+#endif
+
 	if( !mouseActive )
 	{
 		SDL_SetRelativeMouseMode( SDL_TRUE );
@@ -482,12 +488,15 @@ void IN_Init( void *windowData )
 	// mouse variables
 	in_mouse = Cvar_Get( "in_mouse", "1", CVAR_ARCHIVE );
 	in_nograb = Cvar_Get( "in_nograb", "0", CVAR_ARCHIVE );
+	in_InteractiveMode = Cvar_Get( "in_InteractiveMode", "0", 0 );
 
 #ifdef MACOS_X_ACCELERATION_HACK
 	in_disablemacosxmouseaccel = Cvar_Get( "in_disablemacosxmouseaccel", "1", CVAR_ARCHIVE );
 #endif
 
+#ifndef __EMSCRIPTEN__
 	SDL_StartTextInput( );
+#endif
 
 	mouseAvailable = (qboolean)( in_mouse->value != 0 );
 	IN_DeactivateMouse( );
@@ -579,6 +588,14 @@ static void IN_ProcessEvents( void ) {
 	if(!SDL_WasInit(SDL_INIT_VIDEO))
 			return;
 	while(SDL_PollEvent(&e)) {
+#ifdef __EMSCRIPTEN__
+		if ( (!in_InteractiveMode || !in_InteractiveMode->integer) &&
+			 (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP || e.type == SDL_TEXTINPUT ||
+			  e.type == SDL_MOUSEMOTION || e.type == SDL_MOUSEBUTTONDOWN ||
+			  e.type == SDL_MOUSEBUTTONUP || e.type == SDL_MOUSEWHEEL) ) {
+			continue;
+		}
+#endif
 		switch(e.type) {
 			case SDL_KEYDOWN:
 #ifdef __ANDROID__

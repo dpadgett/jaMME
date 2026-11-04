@@ -25,7 +25,9 @@ CG_LoadingString
 void CG_LoadingString( const char *s ) {
 	Q_strncpyz( cg.infoScreenText, s, sizeof( cg.infoScreenText ) );
 
+#ifndef __EMSCRIPTEN__
 	trap_UpdateScreen();
+#endif
 }
 
 /*

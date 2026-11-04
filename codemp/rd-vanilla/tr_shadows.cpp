@@ -597,6 +597,9 @@ void RB_ProjectionShadowDeform( void ) {
 //update tr.screenImage
 void RB_CaptureScreenImage(void)
 {
+#ifdef __EMSCRIPTEN__
+	return;
+#else
 	int radX = 2048;
 	int radY = 2048;
 	int x = glConfig.vidWidth/2;
@@ -659,6 +662,7 @@ void RB_CaptureScreenImage(void)
 	qglCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cX, cY, radX, radY, 0);
 #else
 	qglCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16, cX, cY, radX, radY, 0);
+#endif
 #endif
 }
 

@@ -125,7 +125,7 @@ itemFlagsDef_t itemFlags [] = {
 NULL,					(int) NULL
 };
 
-char *styles [] = {
+static char *styles [] = {
 "WINDOW_STYLE_EMPTY",
 "WINDOW_STYLE_FILLED",
 "WINDOW_STYLE_GRADIENT",
@@ -135,14 +135,14 @@ char *styles [] = {
 NULL
 };
 
-char *alignment [] = {
+static char *alignment [] = {
 "ITEM_ALIGN_LEFT",
 "ITEM_ALIGN_CENTER",
 "ITEM_ALIGN_RIGHT",
 NULL
 };
 
-char *types [] = {
+static char *types [] = {
 "ITEM_TYPE_TEXT",
 "ITEM_TYPE_BUTTON",
 "ITEM_TYPE_RADIOBUTTON",
@@ -5159,8 +5159,8 @@ int BindingIDFromName(const char *name) {
 	return -1;
 }
 
-char g_nameBind1[32];
-char g_nameBind2[32];
+static char g_nameBind1[32];
+static char g_nameBind2[32];
 
 void BindingFromName(const char *cvar) {
 	int		i, b1, b2;
@@ -8312,7 +8312,7 @@ qboolean ItemParse_cvarFloat( itemDef_t *item, int handle ) {
 	return qfalse;
 }
 
-char currLanguage[32][128];
+static char currLanguage[32][128];
 static const char languageString[32] = "@MENUS_MYLANGUAGE";
 
 qboolean ItemParse_cvarStrList( itemDef_t *item, int handle ) {

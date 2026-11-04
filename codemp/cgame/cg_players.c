@@ -864,6 +864,11 @@ void CG_LoadCISounds(clientInfo_t *ci, qboolean modelloaded) {
 
 	trap_S_ShutUp(qtrue);
 
+#ifdef __EMSCRIPTEN__
+	trap_S_ShutUp(qfalse);
+	return;
+#endif
+
 	for ( i = 0 ; i < MAX_CUSTOM_SOUNDS ; i++ ) {
 		s = cg_customSoundNames[i];
 		if ( !s ) {
@@ -1745,7 +1750,20 @@ void CG_NewClientInfo( int clientNum, qboolean entitiesInitialized ) {
 	// model
 //	v = Info_ValueForKey( configstring, "model" );
 	v = ConfigValue( strings, "model");
-#if 0
+#ifdef __EMSCRIPTEN__
+	Q_strncpyz( newInfo.modelName, "kyle", sizeof( newInfo.modelName ) );
+	if ( cgs.gametype >= GT_TEAM ) {
+		if ( newInfo.team == TEAM_BLUE ) {
+			Q_strncpyz( newInfo.skinName, "blue", sizeof( newInfo.skinName ) );
+		} else if ( newInfo.team == TEAM_RED ) {
+			Q_strncpyz( newInfo.skinName, "red", sizeof( newInfo.skinName ) );
+		} else {
+			Q_strncpyz( newInfo.skinName, "default", sizeof( newInfo.skinName ) );
+		}
+	} else {
+		Q_strncpyz( newInfo.skinName, "default", sizeof( newInfo.skinName ) );
+	}
+#elif 0
 	if ( cg_forceModel.integer ) {
 		// forcemodel makes everyone use a single model
 		// to prevent load hitches
@@ -1872,6 +1890,9 @@ void CG_NewClientInfo( int clientNum, qboolean entitiesInitialized ) {
 
 	//saber being used
 	v = ConfigValue( strings, "st");
+#ifdef __EMSCRIPTEN__
+	v = DEFAULT_SABER;
+#endif
 	if (v && Q_stricmp(v, ci->saberName))
 	{
 		Q_strncpyz( newInfo.saberName, v, 64 );
@@ -1886,6 +1907,13 @@ void CG_NewClientInfo( int clientNum, qboolean entitiesInitialized ) {
 	}
 
 	v = ConfigValue( strings, "st2");
+#ifdef __EMSCRIPTEN__
+	if (v && v[0] && Q_stricmp(v, "none")) {
+		v = DEFAULT_SABER;
+	} else {
+		v = "none";
+	}
+#endif
 	if (v && Q_stricmp(v, ci->saber2Name))
 	{
 		Q_strncpyz( newInfo.saber2Name, v, 64 );

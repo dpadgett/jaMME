@@ -73,6 +73,33 @@ static void CL_DeltaEntity(msg_t *msg, clSnapshot_t *frame, int newnum, entitySt
 	frame->numEntities++;
 }
 
+extern qboolean g_jkDemoSeeking;
+extern qboolean g_jkDemoSeekingRewind;
+int g_jkSeekTargetServerTime = 0;
+
+#define SEEK_ENT_POOL_SIZE 16384
+#define SEEK_ENT_POOL_MASK (SEEK_ENT_POOL_SIZE - 1)
+static entityState_t s_seekEntPool[SEEK_ENT_POOL_SIZE];
+static int s_seekSnapPoolIdx[PACKET_BACKUP][MAX_GENTITIES];
+static int s_seekEntPoolCursor = 0;
+
+extern "C" void CL_ResetSeekEntityCache( void ) {
+	s_seekEntPoolCursor = 0;
+}
+
+extern "C" void CL_MaterializeSeekSnapshot( clSnapshot_t *snap ) {
+	if ( !snap || !snap->valid || snap->parseEntitiesNum != -1 ) {
+		return;
+	}
+	const int *poolIdxs = s_seekSnapPoolIdx[snap->messageNum & PACKET_MASK];
+	snap->parseEntitiesNum = cl.parseEntitiesNum;
+	for ( int k = 0; k < snap->numEntities; k++ ) {
+		int pIdx = poolIdxs[k];
+		cl.parseEntities[cl.parseEntitiesNum & (MAX_PARSE_ENTITIES - 1)] = s_seekEntPool[pIdx & SEEK_ENT_POOL_MASK];
+		cl.parseEntitiesNum++;
+	}
+}
+
 /*
 ==================
 CL_ParsePacketEntities
@@ -83,6 +110,86 @@ void CL_ParsePacketEntities( msg_t *msg, clSnapshot_t *oldframe, clSnapshot_t *n
 	int			newnum;
 	entityState_t	*oldstate;
 	int			oldindex, oldnum;
+
+	if ( g_jkDemoSeeking ) {
+		if ( oldframe && oldframe->parseEntitiesNum >= 0 ) {
+			int *oPool = s_seekSnapPoolIdx[oldframe->messageNum & PACKET_MASK];
+			for ( int k = 0; k < oldframe->numEntities; k++ ) {
+				const entityState_t *es = &cl.parseEntities[(oldframe->parseEntitiesNum + k) & (MAX_PARSE_ENTITIES - 1)];
+				int pIdx = s_seekEntPoolCursor++;
+				s_seekEntPool[pIdx & SEEK_ENT_POOL_MASK] = *es;
+				oPool[k] = pIdx;
+			}
+			oldframe->parseEntitiesNum = -1;
+		}
+
+		if ( !oldframe || oldframe->parseEntitiesNum == -1 ) {
+			newframe->parseEntitiesNum = -1;
+			newframe->numEntities = 0;
+			int *newPool = s_seekSnapPoolIdx[newframe->messageNum & PACKET_MASK];
+			const int *oldPool = oldframe ? s_seekSnapPoolIdx[oldframe->messageNum & PACKET_MASK] : NULL;
+			oldindex = 0;
+			oldnum = ( oldframe && oldindex < oldframe->numEntities ) ? s_seekEntPool[oldPool[oldindex] & SEEK_ENT_POOL_MASK].number : 99999;
+
+			while ( 1 ) {
+				newnum = MSG_ReadBits( msg, GENTITYNUM_BITS );
+				if ( newnum == (MAX_GENTITIES-1) ) {
+					break;
+				}
+				if ( msg->readcount > msg->cursize ) {
+					Com_Error( ERR_DROP, "CL_ParsePacketEntities: end of message" );
+				}
+				while ( oldnum < newnum ) {
+					int pIdx = oldPool[oldindex];
+					if ( s_seekEntPoolCursor - pIdx >= SEEK_ENT_POOL_SIZE - 2048 ) {
+						int newIdx = s_seekEntPoolCursor++;
+						s_seekEntPool[newIdx & SEEK_ENT_POOL_MASK] = s_seekEntPool[pIdx & SEEK_ENT_POOL_MASK];
+						pIdx = newIdx;
+					}
+					newPool[newframe->numEntities++] = pIdx;
+					oldindex++;
+					oldnum = ( oldindex >= oldframe->numEntities ) ? 99999 : s_seekEntPool[oldPool[oldindex] & SEEK_ENT_POOL_MASK].number;
+				}
+				if ( oldnum == newnum ) {
+					const entityState_t *fromState = &s_seekEntPool[oldPool[oldindex] & SEEK_ENT_POOL_MASK];
+					int newIdx = s_seekEntPoolCursor++;
+					entityState_t *toState = &s_seekEntPool[newIdx & SEEK_ENT_POOL_MASK];
+					MSG_ReadDeltaEntity( msg, (entityState_t *)fromState, toState, newnum );
+					if ( toState->number != (MAX_GENTITIES-1) ) {
+						newPool[newframe->numEntities++] = newIdx;
+					}
+					oldindex++;
+					oldnum = ( oldindex >= oldframe->numEntities ) ? 99999 : s_seekEntPool[oldPool[oldindex] & SEEK_ENT_POOL_MASK].number;
+					continue;
+				}
+				if ( oldnum > newnum ) {
+					int newIdx = s_seekEntPoolCursor++;
+					entityState_t *toState = &s_seekEntPool[newIdx & SEEK_ENT_POOL_MASK];
+					MSG_ReadDeltaEntity( msg, &cl.entityBaselines[newnum], toState, newnum );
+					if ( toState->number != (MAX_GENTITIES-1) ) {
+						newPool[newframe->numEntities++] = newIdx;
+					}
+					continue;
+				}
+			}
+			while ( oldnum != 99999 ) {
+				int pIdx = oldPool[oldindex];
+				if ( s_seekEntPoolCursor - pIdx >= SEEK_ENT_POOL_SIZE - 2048 ) {
+					int newIdx = s_seekEntPoolCursor++;
+					s_seekEntPool[newIdx & SEEK_ENT_POOL_MASK] = s_seekEntPool[pIdx & SEEK_ENT_POOL_MASK];
+					pIdx = newIdx;
+				}
+				newPool[newframe->numEntities++] = pIdx;
+				oldindex++;
+				oldnum = ( oldindex >= oldframe->numEntities ) ? 99999 : s_seekEntPool[oldPool[oldindex] & SEEK_ENT_POOL_MASK].number;
+			}
+			return;
+		}
+	}
+
+	if ( oldframe && oldframe->parseEntitiesNum == -1 ) {
+		CL_MaterializeSeekSnapshot( oldframe );
+	}
 
 	newframe->parseEntitiesNum = cl.parseEntitiesNum;
 	newframe->numEntities = 0;
@@ -390,6 +497,34 @@ new information out of it.  This will happen at every
 gamestate, and possibly during gameplay.
 ==================
 */
+#ifdef __EMSCRIPTEN__
+extern "C" void FS_WasmPrepareDemoPaks(
+	const char *referencedSums,
+	const char *referencedNames,
+	const char *loadedSums,
+	const char *loadedNames,
+	const char *mapName
+);
+void CL_WasmPrepareCurrentGamestatePaks( void ) {
+	if ( g_jkDemoSeekingRewind ) {
+		return;
+	}
+	const char *systemInfo = cl.gameState.stringData + cl.gameState.stringOffsets[ CS_SYSTEMINFO ];
+	const char *serverInfo = cl.gameState.stringData + cl.gameState.stringOffsets[ CS_SERVERINFO ];
+	static char refSums[BIG_INFO_VALUE];
+	static char refNames[BIG_INFO_VALUE];
+	static char pakSums[BIG_INFO_VALUE];
+	static char pakNames[BIG_INFO_VALUE];
+	static char mapName[MAX_QPATH];
+	Q_strncpyz( refSums, Info_ValueForKey( systemInfo, "sv_referencedPaks" ), sizeof(refSums) );
+	Q_strncpyz( refNames, Info_ValueForKey( systemInfo, "sv_referencedPakNames" ), sizeof(refNames) );
+	Q_strncpyz( pakSums, Info_ValueForKey( systemInfo, "sv_paks" ), sizeof(pakSums) );
+	Q_strncpyz( pakNames, Info_ValueForKey( systemInfo, "sv_pakNames" ), sizeof(pakNames) );
+	Q_strncpyz( mapName, Info_ValueForKey( serverInfo, "mapname" ), sizeof(mapName) );
+	FS_WasmPrepareDemoPaks( refSums, refNames, pakSums, pakNames, mapName );
+}
+#endif
+
 void CL_SystemInfoChanged( void ) {
 	char			*systemInfo;
 	const char		*s, *t;
@@ -402,6 +537,12 @@ void CL_SystemInfoChanged( void ) {
 	// https://zerowing.idsoftware.com/bugzilla/show_bug.cgi?id=475
 	// in some cases, outdated cp commands might get sent with this news serverId
 	cl.serverId = atoi( Info_ValueForKey( systemInfo, "sv_serverid" ) );
+
+#ifdef __EMSCRIPTEN__
+	if ( !g_jkDemoSeekingRewind && cls.state < CA_PRIMED ) {
+		CL_WasmPrepareCurrentGamestatePaks();
+	}
+#endif
 
 	// don't set any vars when playing a demo
 	if ( clc.demoplaying ) {

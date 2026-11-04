@@ -239,14 +239,14 @@ static float GLimp_GetDisplayScale(int display)
 #if SDL_VERSION_ATLEAST(2, 0, 4)
     const char *driver = SDL_GetCurrentVideoDriver();
 
-    if (!strcmp(driver, "windows")) {
+    if (driver && !strcmp(driver, "windows")) {
         float ddpi;
 
         // on windows driver dpi is always 96 * desktop scaling
         if (!SDL_GetDisplayDPI(display, &ddpi, NULL, NULL)) {
             scale = ddpi / 96.0f;
         }
-    } else if (!strcmp(driver, "x11")) {
+    } else if (driver && !strcmp(driver, "x11")) {
         float ddpi;
 
         // this is a hack: some environments return real display DPI,
@@ -484,9 +484,13 @@ static rserr_t GLimp_SetMode(int mode, qboolean fullscreen, qboolean noborder)
 
 		SDL_GL_SetAttribute( SDL_GL_DOUBLEBUFFER, 1 );
 
+#ifdef __EMSCRIPTEN__
+		SDL_GL_SetAttribute( SDL_GL_ACCELERATED_VISUAL, 0 );
+#else
 		// If not allowing software GL, demand accelerated
 		if( !r_allowSoftwareGL->integer )
 			SDL_GL_SetAttribute( SDL_GL_ACCELERATED_VISUAL, 1 );
+#endif
 
 		if( ( screen = SDL_CreateWindow( CLIENT_WINDOW_TITLE, x, y,
                                         width, height, flags ) ) == 0 )
@@ -533,7 +537,9 @@ static rserr_t GLimp_SetMode(int mode, qboolean fullscreen, qboolean noborder)
 			continue;
 		}
 
+#ifndef __EMSCRIPTEN__
 		SDL_GL_SetSwapInterval( r_swapInterval->integer );
+#endif
 
 		glConfig.colorBits = testColorBits;
 		glConfig.depthBits = testDepthBits;
@@ -545,6 +551,10 @@ static rserr_t GLimp_SetMode(int mode, qboolean fullscreen, qboolean noborder)
 	}
     
     SDL_GL_GetDrawableSize( screen, &glConfig.vidWidth, &glConfig.vidHeight );
+    if ( glConfig.vidWidth <= 0 || glConfig.vidHeight <= 0 ) {
+        glConfig.vidWidth = width;
+        glConfig.vidHeight = height;
+    }
     Com_Printf( "...renderer size: %d %d\n", glConfig.vidWidth, glConfig.vidHeight );
     
     glConfig.displayScale = GLimp_GetDisplayScale(display);
@@ -552,7 +562,9 @@ static rserr_t GLimp_SetMode(int mode, qboolean fullscreen, qboolean noborder)
     
 	/*SDL_FreeSurface( icon );*/
 
+#ifndef __EMSCRIPTEN__
 	GLimp_DetectAvailableModes();
+#endif
 
 	glstring = (char *) qglGetString (GL_RENDERER);
 	Com_Printf( "GL_RENDERER: %s\n", glstring );
@@ -1039,6 +1051,52 @@ static void GLimp_InitExtensions( void )
 
 	Com_Printf ("Initializing OpenGL extensions\n" );
 
+#ifdef __EMSCRIPTEN__
+	glConfig.textureCompression = TC_NONE;
+	glConfig.textureEnvAddAvailable = qtrue;
+	glConfig.maxTextureFilterAnisotropy = 0;
+	ri.Cvar_Set( "r_ext_texture_filter_anisotropic_avail", "0" );
+	glConfig.clampToEdgeAvailable = qtrue;
+	qglMultiTexCoord2fARB = NULL;
+	qglActiveTextureARB = NULL;
+	qglClientActiveTextureARB = NULL;
+	glConfig.maxActiveTextures = 1;
+	if ( r_ext_multitexture->integer )
+	{
+		qglActiveTextureARB = glActiveTexture;
+		qglClientActiveTextureARB = glClientActiveTexture;
+		qglGetIntegerv( GL_MAX_ACTIVE_TEXTURES_ARB, &glConfig.maxActiveTextures );
+		if ( glConfig.maxActiveTextures > 1 )
+		{
+			Com_Printf( "...using GL_ARB_multitexture\n" );
+		}
+		else
+		{
+			qglMultiTexCoord2fARB = NULL;
+			qglActiveTextureARB = NULL;
+			qglClientActiveTextureARB = NULL;
+			Com_Printf( "...not using GL_ARB_multitexture, < 2 texture units\n" );
+		}
+	}
+	else
+	{
+		Com_Printf( "...ignoring GL_ARB_multitexture\n" );
+	}
+	qglLockArraysEXT = NULL;
+	qglUnlockArraysEXT = NULL;
+	qglPointParameterfEXT = NULL;
+	qglPointParameterfvEXT = NULL;
+	qglTexImage3DEXT = NULL;
+	qglTexSubImage3DEXT = NULL;
+	g_bDynamicGlowSupported = false;
+	ri.Cvar_Set( "r_DynamicGlow", "0" );
+	glMMEConfig.maxAnisotropy = 0;
+	glMMEConfig.framebufferObject = qfalse;
+	glMMEConfig.shaderSupport = qfalse;
+	glMMEConfig.framebufferMultiSample = qfalse;
+	return;
+#endif
+
 	// Select our tc scheme
 	GLW_InitTextureCompression();
 
@@ -1482,6 +1540,9 @@ success:
 	// This values force the UI to disable driver selection
 	//	glConfig.driverType = GLDRV_ICD;
 	//	glConfig.hardwareType = GLHW_GENERIC;
+#ifdef __EMSCRIPTEN__
+	glConfig.deviceSupportsGamma = qfalse;
+#else
 	glConfig.deviceSupportsGamma = (qboolean)(SDL_SetGamma( screen, 1.0f, 1.0f, 1.0f ) >= 0);
 
 	// Mysteriously, if you use an NVidia graphics card and multiple monitors,
@@ -1489,6 +1550,7 @@ success:
 	// again and you get the correct answer. This is a suspected driver bug, see
 	// http://bugzilla.icculus.org/show_bug.cgi?id=4316
 	glConfig.deviceSupportsGamma = (qboolean)(SDL_SetGamma( screen, 1.0f, 1.0f, 1.0f ) >= 0);
+#endif
 
 	if ( -1 == r_ignorehwgamma->integer)
 		glConfig.deviceSupportsGamma = qtrue;
@@ -1496,25 +1558,21 @@ success:
 	if ( 1 == r_ignorehwgamma->integer)
 		glConfig.deviceSupportsGamma = qfalse;
 
-	// get our config strings
-/*	Q_strncpyz( glConfig.vendor_string, (char *) qglGetString (GL_VENDOR), sizeof( glConfig.vendor_string ) );
-	Q_strncpyz( glConfig.renderer_string, (char *) qglGetString (GL_RENDERER), sizeof( glConfig.renderer_string ) );
-	if (*glConfig.renderer_string && glConfig.renderer_string[strlen(glConfig.renderer_string) - 1] == '\n')
-		glConfig.renderer_string[strlen(glConfig.renderer_string) - 1] = 0;
-	Q_strncpyz( glConfig.version_string, (char *) qglGetString (GL_VERSION), sizeof( glConfig.version_string ) );
-	Q_strncpyz( glConfig.extensions_string, (char *) qglGetString (GL_EXTENSIONS), sizeof( glConfig.extensions_string ) );*/
-
     glConfig.vendor_string = (const char *) qglGetString (GL_VENDOR);
 	glConfig.renderer_string = (const char *) qglGetString (GL_RENDERER);
 	glConfig.version_string = (const char *) qglGetString (GL_VERSION);
 	glConfig.extensions_string = (const char *) qglGetString (GL_EXTENSIONS);
+	if (!glConfig.vendor_string) glConfig.vendor_string = "";
+	if (!glConfig.renderer_string) glConfig.renderer_string = "";
+	if (!glConfig.version_string) glConfig.version_string = "";
+	if (!glConfig.extensions_string) glConfig.extensions_string = "";
 
 	// OpenGL driver constants
 	qglGetIntegerv( GL_MAX_TEXTURE_SIZE, &glConfig.maxTextureSize );
 	// stubbed or broken drivers may have reported 0...
 	if ( glConfig.maxTextureSize <= 0 )
 	{
-		glConfig.maxTextureSize = 0;
+		glConfig.maxTextureSize = 2048;
 	}
 
 	// initialize extensions

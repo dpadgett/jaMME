@@ -206,6 +206,11 @@ int MSG_ReadBits( msg_t *msg, int bits ) {
 	int			get;
 	qboolean	sgn;
 	int			i, nbits;
+
+	if ( msg->readcount > msg->cursize ) {
+		return 0;
+	}
+
 	value = 0;
 
 	if ( bits < 0 ) {
@@ -216,6 +221,11 @@ int MSG_ReadBits( msg_t *msg, int bits ) {
 	}
 
 	if (msg->oob) {
+		if (msg->readcount + (bits>>3) > msg->cursize) {
+			msg->readcount = msg->cursize + 1;
+			return 0;
+		}
+
 		if (bits==8) {
 			value = msg->data[msg->readcount];
 			msg->readcount += 1;
@@ -235,26 +245,56 @@ int MSG_ReadBits( msg_t *msg, int bits ) {
 			Com_Error(ERR_DROP, "can't read %d bits\n", bits);
 		}
 	} else {
+		int bit = msg->bit;
+		int maxBit = msg->cursize << 3;
+		const byte *fin = msg->data;
 		nbits = 0;
 		if (bits&7) {
 			nbits = bits&7;
+			if (bit + nbits > maxBit) {
+				msg->readcount = msg->cursize + 1;
+				return 0;
+			}
 			for(i=0;i<nbits;i++) {
-				value |= (Huff_getBit(msg->data, &msg->bit)<<i);
+				value |= (((fin[bit>>3] >> (bit&7)) & 0x1)<<i);
+				bit++;
 			}
 			bits = bits - nbits;
 		}
 		if (bits) {
+			node_t *treeRoot = msgHuff.decompressor.tree;
 			for(i=0;i<bits;i+=8) {
-				Huff_offsetReceive (msgHuff.decompressor.tree, &get, msg->data, &msg->bit);
+				node_t *node = treeRoot;
+				while (node && node->symbol == INTERNAL_NODE) {
+					if (bit >= maxBit) {
+						msg->bit = maxBit + 1;
+						msg->readcount = msg->cursize + 1;
+						return 0;
+					}
+					if ((fin[bit>>3] >> (bit&7)) & 0x1) {
+						node = node->right;
+					} else {
+						node = node->left;
+					}
+					bit++;
+				}
+				get = node ? node->symbol : 0;
 #ifdef _NEWHUFFTABLE_
 				fwrite(&get, 1, 1, fp);
 #endif // _NEWHUFFTABLE_
 				value |= (get<<(i+nbits));
+
+				if (bit > maxBit) {
+					msg->bit = bit;
+					msg->readcount = msg->cursize + 1;
+					return 0;
+				}
 			}
 		}
-		msg->readcount = (msg->bit>>3)+1;
+		msg->bit = bit;
+		msg->readcount = (bit>>3)+1;
 	}
-	if ( sgn ) {
+	if ( sgn && bits > 0 && bits < 32 ) {
 		if ( value & ( 1 << ( bits - 1 ) ) ) {
 			value |= -1 ^ ( ( 1 << bits ) - 1 );
 		}

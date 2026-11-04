@@ -232,7 +232,7 @@ sfxHandle_t	S_RegisterSound( const char *name) {
 	}
 
 	if ( !name ) {
-		Com_Error (ERR_FATAL, "S_RegisterSound: null name pointer\n");
+		return 0;
 	}
 
 	if (!name[0]) {

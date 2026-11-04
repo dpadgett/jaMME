@@ -25,7 +25,11 @@ glMMEConfig_t	glMMEConfig;
 static void GfxInfo_f( void );
 
 // global now, we share data directly on it.
+#ifdef __EMSCRIPTEN__
+static refexport_t re = {0};
+#else
 refexport_t re = {0};
+#endif
 
 cvar_t	*r_verbose;
 cvar_t	*r_ignore;
@@ -217,7 +221,11 @@ Ghoul2 Insert End
 
 //RAZFIXME: renderer has a copy of this now because stringed is common code and
 // we use it for fonts
+#ifdef __EMSCRIPTEN__
+extern cvar_t *se_language;
+#else
 cvar_t *se_language;
+#endif
 
 #ifdef _WIN32
 void ( APIENTRY * qglMultiTexCoord2fARB )( GLenum texture, GLfloat s, GLfloat t );
@@ -399,7 +407,9 @@ static void InitOpenGL( void )
 		GLimp_Init();
 		// print info the first time only
 		GL_SetDefaultState();
+#ifndef __EMSCRIPTEN__
 		R_Splash();	//get something on screen asap
+#endif
 		GfxInfo_f();
 		glMMEConfig.glWidth = glConfig.vidWidth;
 		glMMEConfig.glHeight = glConfig.vidHeight;
@@ -1014,7 +1024,11 @@ void R_Register( void )
 	r_backEndMegs						= ri.Cvar_Get( "r_backEndMegs",						"2",						CVAR_ARCHIVE | CVAR_LATCH );
 
 	r_overBrightBits					= ri.Cvar_Get( "r_overBrightBits",					"0",						CVAR_ARCHIVE|CVAR_LATCH );
+#ifdef __EMSCRIPTEN__
+	r_mapOverBrightBits					= ri.Cvar_Get( "r_mapOverBrightBits",				"2",						CVAR_ARCHIVE|CVAR_LATCH );
+#else
 	r_mapOverBrightBits					= ri.Cvar_Get( "r_mapOverBrightBits",				"0",						CVAR_ARCHIVE|CVAR_LATCH );
+#endif
 	r_ignorehwgamma						= ri.Cvar_Get( "r_ignorehwgamma",					"0",						CVAR_ARCHIVE|CVAR_LATCH );
 	r_mode								= ri.Cvar_Get( "r_mode",							"4",						CVAR_ARCHIVE|CVAR_LATCH );
 	r_fullscreen						= ri.Cvar_Get( "r_fullscreen",						"1",						CVAR_ARCHIVE|CVAR_LATCH );
@@ -1034,7 +1048,11 @@ void R_Register( void )
 	r_lodCurveError						= ri.Cvar_Get( "r_lodCurveError",					"250",						CVAR_ARCHIVE );
 	r_lodbias							= ri.Cvar_Get( "r_lodbias",							"0",						CVAR_ARCHIVE );
 	r_autolodscalevalue					= ri.Cvar_Get( "r_autolodscalevalue",				"0",						CVAR_ROM );
+#ifdef __EMSCRIPTEN__
+	r_flares							= ri.Cvar_Get( "r_flares",							"0",						CVAR_ARCHIVE );
+#else
 	r_flares							= ri.Cvar_Get( "r_flares",							"1",						CVAR_ARCHIVE );
+#endif
 	r_znear								= ri.Cvar_Get( "r_znear",							"1",						CVAR_ARCHIVE );
 	ri.Cvar_CheckRange( r_znear, 0.001f, 200, qfalse );
 	r_zproj								= ri.Cvar_Get( "r_zproj",							"107",						CVAR_ARCHIVE );
@@ -1059,7 +1077,11 @@ void R_Register( void )
 	r_cullRoofFaces						= ri.Cvar_Get( "r_cullRoofFaces",					"0",						CVAR_CHEAT ); //attempted smart method of culling out upwards facing surfaces on roofs for automap shots -rww
 	r_roofCullCeilDist					= ri.Cvar_Get( "r_roofCullCeilDist",				"256",						CVAR_CHEAT ); //attempted smart method of culling out upwards facing surfaces on roofs for automap shots -rww
 	r_roofCullFloorDist					= ri.Cvar_Get( "r_roofCeilFloorDist",				"128",						CVAR_CHEAT ); //attempted smart method of culling out upwards facing surfaces on roofs for automap shots -rww
+#ifdef __EMSCRIPTEN__
+	r_primitives						= ri.Cvar_Get( "r_primitives",						"2",						CVAR_ARCHIVE );
+#else
 	r_primitives						= ri.Cvar_Get( "r_primitives",						"0",						CVAR_ARCHIVE );
+#endif
 	ri.Cvar_CheckRange( r_primitives, -1, 3, qtrue );
 	r_ambientScale						= ri.Cvar_Get( "r_ambientScale",					"0.6",						CVAR_CHEAT );
 	r_directedScale						= ri.Cvar_Get( "r_directedScale",					"1",						CVAR_CHEAT );
@@ -1070,7 +1092,11 @@ void R_Register( void )
 	r_debugLight						= ri.Cvar_Get( "r_debuglight",						"0",						CVAR_TEMP );
 	r_debugSort							= ri.Cvar_Get( "r_debugSort",						"0",						CVAR_CHEAT );
 	r_dlightStyle						= ri.Cvar_Get( "r_dlightStyle",						"1",						CVAR_ARCHIVE );
+#ifdef __EMSCRIPTEN__
+	r_surfaceSprites					= ri.Cvar_Get( "r_surfaceSprites",					"0",						CVAR_TEMP );
+#else
 	r_surfaceSprites					= ri.Cvar_Get( "r_surfaceSprites",					"1",						CVAR_TEMP );
+#endif
 	r_surfaceWeather					= ri.Cvar_Get( "r_surfaceWeather",					"0",						CVAR_TEMP );
 	r_windSpeed							= ri.Cvar_Get( "r_windSpeed",						"0",						CVAR_NONE );
 	r_windAngle							= ri.Cvar_Get( "r_windAngle",						"0",						CVAR_NONE );
@@ -1081,7 +1107,11 @@ void R_Register( void )
 	r_windPointY						= ri.Cvar_Get( "r_windPointY",						"0",						CVAR_NONE );
 	r_nocurves							= ri.Cvar_Get( "r_nocurves",						"0",						CVAR_CHEAT );
 	r_drawworld							= ri.Cvar_Get( "r_drawworld",						"1",						CVAR_CHEAT );
+#ifdef __EMSCRIPTEN__
+	r_drawfog							= ri.Cvar_Get( "r_drawfog",							"0",						CVAR_CHEAT );
+#else
 	r_drawfog							= ri.Cvar_Get( "r_drawfog",							"2",						CVAR_CHEAT );
+#endif
 	r_lightmap							= ri.Cvar_Get( "r_lightmap",						"0",						CVAR_CHEAT );
 	r_portalOnly						= ri.Cvar_Get( "r_portalOnly",						"0",						CVAR_CHEAT );
 	r_skipBackEnd						= ri.Cvar_Get( "r_skipBackEnd",						"0",						CVAR_CHEAT );
@@ -1105,8 +1135,13 @@ void R_Register( void )
 	r_offsetFactor						= ri.Cvar_Get( "r_offsetfactor",					"-1",						CVAR_CHEAT );
 	r_offsetUnits						= ri.Cvar_Get( "r_offsetunits",						"-2",						CVAR_CHEAT );
 	r_lockpvs							= ri.Cvar_Get( "r_lockpvs",							"0",						CVAR_CHEAT );
+#ifdef __EMSCRIPTEN__
+	r_noportals							= ri.Cvar_Get( "r_noportals",						"1",						CVAR_CHEAT );
+	r_shadows							= ri.Cvar_Get( "cg_shadows",						"0",						CVAR_NONE );
+#else
 	r_noportals							= ri.Cvar_Get( "r_noportals",						"0",						CVAR_CHEAT );
 	r_shadows							= ri.Cvar_Get( "cg_shadows",						"1",						CVAR_NONE );
+#endif
 	r_shadowRange						= ri.Cvar_Get( "r_shadowRange",						"1000",						CVAR_NONE );
 	r_maxpolys							= ri.Cvar_Get( "r_maxpolys",						XSTRING( MAX_POLYS ),		CVAR_NONE );
 	r_maxpolyverts						= ri.Cvar_Get( "r_maxpolyverts",					XSTRING( MAX_POLYVERTS ),	CVAR_NONE );
@@ -1134,7 +1169,11 @@ Ghoul2 Insert Start
 /*
 Ghoul2 Insert End
 */
+#ifdef __EMSCRIPTEN__
+	r_modelpoolmegs = ri.Cvar_Get("r_modelpoolmegs", "64", CVAR_ARCHIVE);
+#else
 	r_modelpoolmegs = ri.Cvar_Get("r_modelpoolmegs", "20", CVAR_ARCHIVE);
+#endif
 	if (ri.Sys_LowPhysicalMemory() )
 		ri.Cvar_Set("r_modelpoolmegs", "0");
 
@@ -1271,8 +1310,8 @@ void R_Init( void ) {
 		Com_Printf ( "glGetError() = 0x%x\n", err);
 
 //	Com_Printf ("----- finished R_Init -----\n" );
-#ifndef HAVE_GLES
-	{
+#if !defined(HAVE_GLES) && !defined(__EMSCRIPTEN__)
+	if ( qglGenBuffersARB && qglBindBufferARB && qglBufferDataARB ) {
 		// create 2 pixel buffer objects, you need to delete them when program exits.
 		// glBufferDataARB with NULL pointer reserves only memory space.
 		int dataSize = glConfig.vidWidth * glConfig.vidHeight * 3;
@@ -1388,9 +1427,11 @@ Touch all images to make sure they are resident
 */
 void RE_EndRegistration( void ) {
 	R_SyncRenderThread();
+#ifndef __EMSCRIPTEN__
 	if (!ri.Sys_LowPhysicalMemory()) {
 		RB_ShowImages();
 	}
+#endif
 }
 
 void RE_GetLightStyle(int style, color4ub_t color)
@@ -1449,6 +1490,17 @@ static float GetDistanceCull( void ) { return tr.distanceCull; }
 static void GetRealRes( int *w, int *h ) {
 	*w = glConfig.vidWidth;
 	*h = glConfig.vidHeight;
+}
+
+extern "C" void R_UpdateVideoSize( int width, int height ) {
+	if ( width < 64 ) width = 64;
+	if ( height < 64 ) height = 64;
+	if ( glConfig.vidWidth > 0 ) {
+		glConfig.vidWidth = width;
+		glConfig.vidHeight = height;
+		glMMEConfig.glWidth = width;
+		glMMEConfig.glHeight = height;
+	}
 }
 
 extern void R_SVModelInit( void ); //tr_model.cpp
@@ -1676,5 +1728,14 @@ Q_EXPORT refexport_t* QDECL GetRefAPI( int apiVersion, refimport_t *rimp ) {
 
 	return &re;
 }
+
+#ifdef __EMSCRIPTEN__
+GLAPI void GLAPIENTRY glCallList( GLuint list ) { (void)list; }
+GLAPI void GLAPIENTRY glDeleteLists( GLuint list, GLsizei range ) { (void)list; (void)range; }
+GLAPI GLuint GLAPIENTRY glGenLists( GLsizei range ) { (void)range; return 0; }
+GLAPI void GLAPIENTRY glNewList( GLuint list, GLenum mode ) { (void)list; (void)mode; }
+GLAPI void GLAPIENTRY glEndList( void ) {}
+GLAPI void GLAPIENTRY glArrayElement( GLint i ) { (void)i; }
+#endif
 
 } //extern "C"

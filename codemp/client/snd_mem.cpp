@@ -53,7 +53,11 @@ tryDefaultLanguage:
 	while (ext[i]) {
         COM_StripExtension(fileName, fileNameCopy, MAX_QPATH);
 		COM_DefaultExtension(fileNameCopy, MAX_QPATH, ext[i]);
+#ifdef __EMSCRIPTEN__
+		FS_FOpenFileRead(fileNameCopy, &f, qfalse);
+#else
 		FS_FOpenFileRead(fileNameCopy, &f, qtrue);
+#endif
 		if (f)
 			break;
 		i++;
@@ -1307,13 +1311,53 @@ static openSound_t *S_FlacOpen( const char *fileName, FLAC__bool is_ogg ) {
 }
 #endif
 
+#ifdef __EMSCRIPTEN__
+static void S_WasmClose( openSound_t *open ) {
+	(void)open;
+}
+
+static int S_WasmSeek( struct openSound_s *open, int samples ) {
+	(void)open;
+	return samples;
+}
+
+static int S_WasmRead( openSound_t *open, qboolean stereo, int size, short *data ) {
+	int i;
+	(void)open;
+	if ( stereo ) {
+		for ( i = 0; i < size; i++ ) {
+			short v = (short)( i & 511 );
+			data[i * 2 + 0] = v;
+			data[i * 2 + 1] = v;
+		}
+	} else {
+		for ( i = 0; i < size; i++ ) {
+			data[i] = (short)( i & 511 );
+		}
+	}
+	return size;
+}
+#endif
+
 openSound_t *S_SoundOpen( const char *fileName ) {
 	const char *fileExt;
 
 	if (!fileName || !fileName[0]) {
 		Com_Printf("SoundOpen:Filename is empty\n" );
 		return 0;
-	}	
+	}
+#ifdef __EMSCRIPTEN__
+	{
+		openSound_t *open = (openSound_t *)Z_Malloc( sizeof( openSound_t ), TAG_SND_RAWDATA );
+		memset( open, 0, sizeof( openSound_t ) );
+		open->rate = 22050;
+		open->totalSamples = 512;
+		open->read = S_WasmRead;
+		open->seek = S_WasmSeek;
+		open->close = S_WasmClose;
+		return open;
+	}
+#endif
 	fileExt = Q_strrchr( fileName, '.' );
 	if (!fileExt) {
 		Com_Printf("SoundOpen:File %s has no extension\n", fileName );

@@ -63,7 +63,13 @@ set(MPUIRendererFiles
 source_group("renderer" FILES ${MPUIRendererFiles})
 set(MPUIFiles ${MPUIFiles} ${MPUIRendererFiles})
 
-add_library(${jaMMEUI} SHARED ${MPUIFiles})
+if(EMSCRIPTEN)
+	list(REMOVE_ITEM MPUIFiles "${MPDir}/qcommon/q_math.c")
+	add_library(${jaMMEUI} STATIC ${MPUIFiles})
+	target_compile_options(${jaMMEUI} PRIVATE -include "${MPDir}/ui/ui_sym_prefix.h")
+else()
+	add_library(${jaMMEUI} SHARED ${MPUIFiles})
+endif()
 
 if(NOT WIN32)
 	# remove "lib" prefix for .so/.dylib files
@@ -72,7 +78,7 @@ endif(NOT WIN32)
 
 if(WIN32)
 	install(TARGETS ${jaMMEUI} RUNTIME DESTINATION "${jaMMEInstallDir}/mme")
-else(WIN32)
+elseif(NOT EMSCRIPTEN)
 	install(TARGETS ${jaMMEUI} LIBRARY DESTINATION "${jaMMEInstallDir}/mme")
 endif(WIN32)
 set_target_properties(${jaMMEUI} PROPERTIES COMPILE_DEFINITIONS "${MPUIDefines}")

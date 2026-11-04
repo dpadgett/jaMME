@@ -7,6 +7,53 @@ endif(NOT InjaMME)
 
 set(MPSharedDefines ${SharedDefines})
 
+if(UseInternalZlib AND NOT WIN32)
+	set(BundledZlibFiles
+		"${MPDir}/zlib/adler32.c"
+		"${MPDir}/zlib/compress.c"
+		"${MPDir}/zlib/crc32.c"
+		"${MPDir}/zlib/deflate.c"
+		"${MPDir}/zlib/gzclose.c"
+		"${MPDir}/zlib/gzlib.c"
+		"${MPDir}/zlib/gzread.c"
+		"${MPDir}/zlib/gzwrite.c"
+		"${MPDir}/zlib/infback.c"
+		"${MPDir}/zlib/inffast.c"
+		"${MPDir}/zlib/inflate.c"
+		"${MPDir}/zlib/inftrees.c"
+		"${MPDir}/zlib/trees.c"
+		"${MPDir}/zlib/uncompr.c"
+		"${MPDir}/zlib/zutil.c"
+	)
+	add_library(bundled_zlib STATIC ${BundledZlibFiles})
+	set_target_properties(bundled_zlib PROPERTIES POSITION_INDEPENDENT_CODE ON)
+	set_target_properties(bundled_zlib PROPERTIES INCLUDE_DIRECTORIES "${MPDir}/zlib")
+endif()
+
+if(NOT WIN32 AND NOT APPLE)
+	set(BundledMadFiles
+		"${CMAKE_SOURCE_DIR}/android/jni/libmad/version.c"
+		"${CMAKE_SOURCE_DIR}/android/jni/libmad/fixed.c"
+		"${CMAKE_SOURCE_DIR}/android/jni/libmad/bit.c"
+		"${CMAKE_SOURCE_DIR}/android/jni/libmad/timer.c"
+		"${CMAKE_SOURCE_DIR}/android/jni/libmad/stream.c"
+		"${CMAKE_SOURCE_DIR}/android/jni/libmad/frame.c"
+		"${CMAKE_SOURCE_DIR}/android/jni/libmad/synth.c"
+		"${CMAKE_SOURCE_DIR}/android/jni/libmad/decoder.c"
+		"${CMAKE_SOURCE_DIR}/android/jni/libmad/layer12.c"
+		"${CMAKE_SOURCE_DIR}/android/jni/libmad/layer3.c"
+		"${CMAKE_SOURCE_DIR}/android/jni/libmad/huffman.c"
+	)
+	add_library(bundled_mad STATIC ${BundledMadFiles})
+	set_target_properties(bundled_mad PROPERTIES POSITION_INDEPENDENT_CODE ON)
+	if(EMSCRIPTEN)
+		set_target_properties(bundled_mad PROPERTIES COMPILE_DEFINITIONS "HAVE_CONFIG_H;FPM_DEFAULT")
+	else()
+		set_target_properties(bundled_mad PROPERTIES COMPILE_DEFINITIONS "HAVE_CONFIG_H;FPM_64BIT")
+	endif()
+	set_target_properties(bundled_mad PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/android/jni/libmad;${CMAKE_SOURCE_DIR}/android/jni/libmad/android")
+endif()
+
 #    Add Game Project
 if(BuildGame)
 	add_subdirectory("${MPDir}/game")
@@ -132,8 +179,12 @@ if(BuildEngine)
 	
 	if(UseInternalZlib)
 		set(MPEngineAndDedIncludeDirectories ${MPEngineAndDedIncludeDirectories} "${MPDir}/zlib")
-		find_library(ZlibLibrary NAMES zlib PATHS "${MPDir}/libs/win32/lib")
-		set(MPEngineAndDedLibraries ${MPEngineAndDedLibraries} ${ZlibLibrary})
+		if(WIN32)
+			find_library(ZlibLibrary NAMES zlib PATHS "${MPDir}/libs/win32/lib")
+			set(MPEngineAndDedLibraries ${MPEngineAndDedLibraries} ${ZlibLibrary})
+		else()
+			set(MPEngineAndDedLibraries ${MPEngineAndDedLibraries} bundled_zlib)
+		endif()
 	else(UseInternalZlib)
 		find_package(ZLIB REQUIRED)
 		set(MPEngineAndDedIncludeDirectories ${MPEngineAndDedIncludeDirectories} ${ZLIB_INCLUDE_DIR})
@@ -388,14 +439,14 @@ if(BuildEngine)
 				set(MPEngineLibraries ${MPEngineLibraries} curl)
 			endif(BuildCurl)
 		else(APPLE)
-			set(MPEngineLibraries ${MPEngineLibraries} mad)
+			set(MPEngineLibraries ${MPEngineLibraries} bundled_mad)
 			if(BuildCurl)
 				set(MPEngineLibraries ${MPEngineLibraries} curl)
 			endif(BuildCurl)
 		endif(APPLE)
 	endif(UNIX)
 	
-	if(NOT WIN32)
+	if(NOT WIN32 AND NOT EMSCRIPTEN)
 		find_package(SDL2 REQUIRED)
 		set(MPEngineIncludeDirectories ${MPEngineIncludeDirectories} ${SDL2_INCLUDE_DIR})
 		set(MPEngineLibraries ${MPEngineLibraries} ${SDL2_LIBRARY})
@@ -404,7 +455,7 @@ if(BuildEngine)
 		find_package(OpenGL REQUIRED)
 		set(MPEngineIncludeDirectories ${MPEngineIncludeDirectories} ${OPENGL_INCLUDE_DIR})
 		set(MPEngineLibraries ${MPEngineLibraries} ${OPENGL_LIBRARIES})
-	endif(NOT WIN32)
+	endif(NOT WIN32 AND NOT EMSCRIPTEN)
 
 	set(MPEngineIncludeDirectories ${MPEngineIncludeDirectories} ${MPDir}/libs/win32/include)
 
@@ -564,5 +615,12 @@ if(BuildEngine)
 	set_target_properties(${jaMMEEngine} PROPERTIES COMPILE_DEFINITIONS "${MPEngineDefines}")
 	set_target_properties(${jaMMEEngine} PROPERTIES INCLUDE_DIRECTORIES "${MPEngineIncludeDirectories}")
 
-	target_link_libraries(${jaMMEEngine} ${MPEngineLibraries})
+	if(EMSCRIPTEN)
+		set_target_properties(${jaMMEEngine} PROPERTIES OUTPUT_NAME "openjk" SUFFIX ".js")
+		target_link_libraries(${jaMMEEngine} ${MPEngineLibraries} ${jaMMERenderer} ${jaMMECGame} ${jaMMEUI})
+		target_compile_options(${jaMMEEngine} PRIVATE -sUSE_SDL=2)
+		set_target_properties(${jaMMEEngine} PROPERTIES LINK_FLAGS "--profiling-funcs -sUSE_SDL=2 -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=1048576 -sASYNCIFY_ONLY=[] -sLEGACY_GL_EMULATION=1 -sGL_FFP_ONLY=1 -sGL_UNSAFE_OPTS=0 -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=268435456 -sSTACK_SIZE=5242880 -sDISABLE_EXCEPTION_CATCHING=0 -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString,stringToUTF8,FS,HEAPU8,Asyncify -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_JK_DemoSetPaused,_JK_DemoPause,_JK_DemoResume,_JK_DemoTogglePaused,_JK_DemoTogglePause,_JK_DemoIsPaused,_JK_DemoSetSpeed,_JK_DemoGetSpeed,_JK_DemoSetMuted,_JK_DemoMute,_JK_DemoUnmute,_JK_DemoIsMuted,_JK_DemoSetVolume,_JK_DemoGetVolume,_JK_DemoLoad,_JK_DemoGetState,_JK_DemoIsPlaying,_JK_DemoIsReady,_JK_DemoIsCompleted,_JK_DemoHasEnded,_JK_DemoGetCompletedCount,_JK_DemoGetServerTime,_JK_DemoGetServerTimeMs,_JK_DemoGetRealtime,_JK_DemoGetFrameCount,_JK_DemoGetName,_JK_DemoGetCurrentName,_JK_DemoGetMapName,_JK_DemoIsAudioActive,_JK_DemoGetAudioSamplesMixed,_JK_DemoGetPk3BytesTransferred,_JK_DemoGetPK3BytesTransferred,_JK_DemoGetPk3RangeRequests,_JK_DemoGetPK3RangeRequests,_JK_DemoGetLoadedPackCount,_JK_DemoSetInteractive,_JK_DemoResizeViewport,_JK_DemoGetViewportWidth,_JK_DemoGetViewportHeight,_JK_DemoExecCommand,_JK_DemoPrewarmAssets,_JK_DemoGetStartTimeMs,_JK_DemoGetEndTimeMs,_JK_DemoGetDurationMs,_JK_DemoGetCurrentTimeMs,_JK_DemoSeekToMs,_JK_DemoSetLoop,_JK_DemoGetLoop,_JK_DemoGetDebugJSON")
+	else()
+		target_link_libraries(${jaMMEEngine} ${MPEngineLibraries})
+	endif()
 endif(BuildEngine)
