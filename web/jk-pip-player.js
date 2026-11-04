@@ -818,14 +818,15 @@
     }
 
     // Configure player.js to prewarm in background muted without auto-playing 1.51ef9.dm_26
+    const ASSET_VERSION = '20261104a';
     window.JKDemoConfig = Object.assign(
       {
         preload: true,
         preloadOnly: true,
         autoPlay: false,
         muted: true,
-        scriptUrl: '/jkplayer/openjk.js',
-        wasmUrl: '/jkplayer/openjk.wasm',
+        scriptUrl: `/jkplayer/openjk.js?v=${ASSET_VERSION}`,
+        wasmUrl: `/jkplayer/openjk.wasm?v=${ASSET_VERSION}`,
       },
       window.JKDemoConfig || {}
     );
@@ -843,7 +844,7 @@
         return;
       }
       const script = document.createElement('script');
-      script.src = '/jkplayer/player.js';
+      script.src = `/jkplayer/player.js?v=${ASSET_VERSION}`;
       script.async = true;
       script.onload = () => {
         pipState.playerScriptLoaded = true;

@@ -3286,9 +3286,13 @@
       engineArgs.push('+demo', bootShortName);
     }
 
+    const DEFAULT_ASSET_VERSION = '20261104a';
     const cfg = window.JKDemoConfig || {};
-    const scriptUrl = typeof cfg.scriptUrl === 'string' && cfg.scriptUrl ? cfg.scriptUrl : '/openjk.js';
-    const wasmDir = scriptUrl.includes('/') ? scriptUrl.slice(0, scriptUrl.lastIndexOf('/') + 1) : '/';
+    const rawScriptUrl = typeof cfg.scriptUrl === 'string' && cfg.scriptUrl ? cfg.scriptUrl : `/openjk.js?v=${DEFAULT_ASSET_VERSION}`;
+    const scriptUrl = rawScriptUrl.includes('?') ? rawScriptUrl : `${rawScriptUrl}?v=${DEFAULT_ASSET_VERSION}`;
+    const scriptPathOnly = scriptUrl.split('?')[0];
+    const scriptQuery = scriptUrl.includes('?') ? scriptUrl.slice(scriptUrl.indexOf('?')) : `?v=${DEFAULT_ASSET_VERSION}`;
+    const wasmDir = scriptPathOnly.includes('/') ? scriptPathOnly.slice(0, scriptPathOnly.lastIndexOf('/') + 1) : '/';
 
     window.Module = {
       canvas: canvas,
@@ -3296,9 +3300,9 @@
       arguments: engineArgs,
       locateFile: function (path) {
         if (path.endsWith('.wasm') && typeof cfg.wasmUrl === 'string' && cfg.wasmUrl) {
-          return cfg.wasmUrl;
+          return cfg.wasmUrl.includes('?') ? cfg.wasmUrl : `${cfg.wasmUrl}${scriptQuery}`;
         }
-        return wasmDir + path;
+        return wasmDir + path + (path.includes('?') ? '' : scriptQuery);
       },
       preRun: [
         function () {
