@@ -3627,12 +3627,15 @@ static /*const*/ char *FindShaderInShaderText( const char *shadername ) {
 
 	hash = generateHashValue(shadername, MAX_SHADERTEXT_HASH);
 
-	for (i = 0; shaderTextHashTable[hash][i]; i++) {
-		p = shaderTextHashTable[hash][i];
-		token = Shader_ParseExt(&p, qtrue);
-		if ( !Q_stricmp( token, shadername ) ) {
-			return (char *)p;
+	if ( shaderTextHashTable[hash] ) {
+		for (i = 0; shaderTextHashTable[hash][i]; i++) {
+			p = shaderTextHashTable[hash][i];
+			token = Shader_ParseExt(&p, qtrue);
+			if ( !Q_stricmp( token, shadername ) ) {
+				return (char *)p;
+			}
 		}
+		return NULL;
 	}
 
 	p = s_shaderText;

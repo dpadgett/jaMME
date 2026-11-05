@@ -3860,7 +3860,151 @@ static void WasmPK3_MarkPrefixInMountedPaks( const char *prefix ) {
 	}
 }
 
-static void WasmPK3_CollectModelFiles( const char *modelName, const char *extraShaderText ) {
+static void WasmPK3_CollectSkinFile( const char *skinPath, const char *extraShaderText, qboolean *outAllReady ) {
+	if ( !skinPath || !skinPath[0] ) return;
+	pack_t *skinPak = NULL;
+	fileInPack_t *skinPf = NULL;
+	if ( !WasmPK3_MarkExactFile( skinPath, &skinPak, &skinPf ) ) {
+		return;
+	}
+	if ( !skinPak || !skinPf || !WasmPK3_IsPakFileCached( skinPak, skinPf ) ) {
+		if ( outAllReady ) *outAllReady = qfalse;
+		return;
+	}
+	void *skinBuf = NULL;
+	int skinLen = FS_ReadFile( skinPath, &skinBuf );
+	if ( skinBuf && skinLen > 0 ) {
+		const char *cur = (const char *)skinBuf;
+		const char *end = cur + skinLen;
+		while ( cur < end ) {
+			const char *nl = (const char *)memchr( cur, '\n', (size_t)(end - cur) );
+			size_t lineLen = nl ? (size_t)(nl - cur) : (size_t)(end - cur);
+			const char *comma = (const char *)memchr( cur, ',', lineLen );
+			if ( comma ) {
+				const char *rhs = comma + 1;
+				size_t rlen = (size_t)((cur + lineLen) - rhs);
+				while ( rlen > 0 && (*rhs == ' ' || *rhs == '\t') ) {
+					rhs++;
+					rlen--;
+				}
+				while ( rlen > 0 && (rhs[rlen - 1] == '\r' || rhs[rlen - 1] == ' ' || rhs[rlen - 1] == '\t') ) {
+					rlen--;
+				}
+				if ( rlen > 0 && rlen < MAX_QPATH && rhs[0] != '*' ) {
+					char shName[MAX_QPATH];
+					memcpy( shName, rhs, rlen );
+					shName[rlen] = '\0';
+					R_WasmCollectShaderFiles( shName, extraShaderText, WasmPK3_MarkImageOrSoundOrFile );
+				}
+			}
+			if ( !nl ) break;
+			cur = nl + 1;
+		}
+	}
+	if ( skinBuf ) {
+		FS_FreeFile( skinBuf );
+	}
+}
+
+static void WasmPK3_CollectSoundCfg( const char *cfgPath, qboolean *outAllReady ) {
+	if ( !cfgPath || !cfgPath[0] ) return;
+	pack_t *cfgPak = NULL;
+	fileInPack_t *cfgPf = NULL;
+	if ( !WasmPK3_MarkExactFile( cfgPath, &cfgPak, &cfgPf ) ) {
+		return;
+	}
+	if ( !cfgPak || !cfgPf || !WasmPK3_IsPakFileCached( cfgPak, cfgPf ) ) {
+		if ( outAllReady ) *outAllReady = qfalse;
+		return;
+	}
+	void *cfgBuf = NULL;
+	int cfgLen = FS_ReadFile( cfgPath, &cfgBuf );
+	if ( cfgBuf && cfgLen > 0 ) {
+		const char *p = (const char *)cfgBuf;
+		int n = 0;
+		char sndDir[64];
+		while ( n < cfgLen && n < (int)sizeof(sndDir) - 1 && p[n] && p[n] != '\r' && p[n] != '\n' && p[n] != ' ' && p[n] != '\t' ) {
+			sndDir[n] = p[n];
+			n++;
+		}
+		sndDir[n] = '\0';
+		if ( sndDir[0] ) {
+			WasmPK3_MarkPrefixInMountedPaks( va( "sound/chars/%s/misc/", sndDir ) );
+		}
+	}
+	if ( cfgBuf ) {
+		FS_FreeFile( cfgBuf );
+	}
+}
+
+static void WasmPK3_CollectPlayerFiles( const char *modelVal, const char *extraShaderText, qboolean *outAllReady ) {
+	if ( !modelVal || !modelVal[0] ) return;
+	char charName[64];
+	char skinSpec[128];
+	const char *slash = strchr( modelVal, '/' );
+	if ( slash ) {
+		size_t clen = (size_t)(slash - modelVal);
+		if ( clen >= sizeof(charName) ) clen = sizeof(charName) - 1;
+		memcpy( charName, modelVal, clen );
+		charName[clen] = '\0';
+		Q_strncpyz( skinSpec, slash + 1, sizeof(skinSpec) );
+	} else {
+		Q_strncpyz( charName, modelVal, sizeof(charName) );
+		Q_strncpyz( skinSpec, "default", sizeof(skinSpec) );
+	}
+	if ( !charName[0] ) return;
+	if ( !skinSpec[0] ) Q_strncpyz( skinSpec, "default", sizeof(skinSpec) );
+
+	WasmPK3_MarkExactFile( va( "models/players/%s/model.glm", charName ), NULL, NULL );
+	WasmPK3_MarkExactFile( va( "models/players/%s/animation.cfg", charName ), NULL, NULL );
+	WasmPK3_MarkExactFile( va( "models/players/%s/animevents.cfg", charName ), NULL, NULL );
+	WasmPK3_MarkExactFile( va( "models/players/%s/playerchoice.txt", charName ), NULL, NULL );
+
+	// Multiplayer character sounds only ever load from sound/chars/<dir>/misc/ (never SP dialogue folders)
+	WasmPK3_MarkPrefixInMountedPaks( va( "sound/chars/%s/misc/", charName ) );
+	WasmPK3_CollectSoundCfg( va( "models/players/%s/sounds.cfg", charName ), outAllReady );
+	WasmPK3_CollectSoundCfg( va( "models/players/%s/sounds_default.cfg", charName ), outAllReady );
+	WasmPK3_CollectSoundCfg( va( "models/players/%s/sounds_red.cfg", charName ), outAllReady );
+	WasmPK3_CollectSoundCfg( va( "models/players/%s/sounds_blue.cfg", charName ), outAllReady );
+
+	// Default and team skins + icons
+	WasmPK3_CollectSkinFile( va( "models/players/%s/model_default.skin", charName ), extraShaderText, outAllReady );
+	WasmPK3_CollectSkinFile( va( "models/players/%s/model_red.skin", charName ), extraShaderText, outAllReady );
+	WasmPK3_CollectSkinFile( va( "models/players/%s/model_blue.skin", charName ), extraShaderText, outAllReady );
+	WasmPK3_MarkExactFile( va( "models/players/%s/model_default.g2skin", charName ), NULL, NULL );
+	WasmPK3_MarkExactFile( va( "models/players/%s/model_red.g2skin", charName ), NULL, NULL );
+	WasmPK3_MarkExactFile( va( "models/players/%s/model_blue.g2skin", charName ), NULL, NULL );
+	WasmPK3_MarkImageOrSoundOrFile( va( "models/players/%s/icon_default", charName ) );
+	WasmPK3_MarkImageOrSoundOrFile( va( "models/players/%s/icon_red", charName ) );
+	WasmPK3_MarkImageOrSoundOrFile( va( "models/players/%s/icon_blue", charName ) );
+
+	if ( strchr( skinSpec, '|' ) ) {
+		const char *p = skinSpec;
+		while ( *p ) {
+			const char *bar = strchr( p, '|' );
+			size_t plen = bar ? (size_t)(bar - p) : strlen( p );
+			if ( plen > 0 && plen < 64 ) {
+				char part[64];
+				memcpy( part, p, plen );
+				part[plen] = '\0';
+				WasmPK3_CollectSkinFile( va( "models/players/%s/%s.skin", charName, part ), extraShaderText, outAllReady );
+				WasmPK3_CollectSkinFile( va( "models/players/%s/%s_red.skin", charName, part ), extraShaderText, outAllReady );
+				WasmPK3_CollectSkinFile( va( "models/players/%s/%s_blue.skin", charName, part ), extraShaderText, outAllReady );
+				WasmPK3_MarkExactFile( va( "models/players/%s/%s.g2skin", charName, part ), NULL, NULL );
+				WasmPK3_MarkImageOrSoundOrFile( va( "models/players/%s/icon_%s", charName, part ) );
+			}
+			if ( !bar ) break;
+			p = bar + 1;
+		}
+	} else {
+		WasmPK3_CollectSoundCfg( va( "models/players/%s/sounds_%s.cfg", charName, skinSpec ), outAllReady );
+		WasmPK3_CollectSkinFile( va( "models/players/%s/model_%s.skin", charName, skinSpec ), extraShaderText, outAllReady );
+		WasmPK3_MarkExactFile( va( "models/players/%s/model_%s.g2skin", charName, skinSpec ), NULL, NULL );
+		WasmPK3_MarkImageOrSoundOrFile( va( "models/players/%s/icon_%s", charName, skinSpec ) );
+	}
+}
+
+static void WasmPK3_CollectModelFiles( const char *modelName, const char *extraShaderText, qboolean *outAllReady ) {
 	if ( !modelName || !modelName[0] || modelName[0] == '*' || modelName[0] == '$' || modelName[0] == '@' ) {
 		return;
 	}
@@ -3871,7 +4015,7 @@ static void WasmPK3_CollectModelFiles( const char *modelName, const char *extraS
 	pack_t *modPak = NULL;
 	fileInPack_t *modPf = NULL;
 	WasmPK3_MarkExactFile( cleanModel, &modPak, &modPf );
-	if ( !Q_stricmpn( cleanModel, "models/map_objects/", 19 ) || !Q_stricmpn( cleanModel, "models/mapobjects/", 18 ) ) {
+	if ( !Q_stricmpn( cleanModel, "models/weapons2/", 16 ) ) {
 		char dirPrefix[MAX_QPATH];
 		Q_strncpyz( dirPrefix, cleanModel, sizeof( dirPrefix ) );
 		char *lastSlash = strrchr( dirPrefix, '/' );
@@ -3880,7 +4024,11 @@ static void WasmPK3_CollectModelFiles( const char *modelName, const char *extraS
 			WasmPK3_MarkPrefixInMountedPaks( dirPrefix );
 		}
 	}
-	if ( modPak && modPf && WasmPK3_IsPakFileCached( modPak, modPf ) && Q_stristr( cleanModel, ".md3" ) ) {
+	if ( modPak && modPf && Q_stristr( cleanModel, ".md3" ) ) {
+		if ( !WasmPK3_IsPakFileCached( modPak, modPf ) ) {
+			if ( outAllReady ) *outAllReady = qfalse;
+			return;
+		}
 		void *modBuf = NULL;
 		int modLen = FS_ReadFile( cleanModel, &modBuf );
 		if ( modBuf && modLen >= (int)sizeof(md3Header_t) ) {
@@ -3910,6 +4058,77 @@ static void WasmPK3_CollectModelFiles( const char *modelName, const char *extraS
 			FS_FreeFile( modBuf );
 		}
 	}
+}
+
+static void WasmPK3_CollectEfxFile( const char *fxName, const char *extraShaderText, qboolean *outAllReady, int depth ) {
+	if ( !fxName || !fxName[0] || fxName[0] == '*' || depth > 3 ) {
+		return;
+	}
+	char efxPath[MAX_QPATH];
+	if ( !Q_stricmpn( fxName, "effects/", 8 ) ) {
+		COM_StripExtension( fxName, efxPath, sizeof( efxPath ) );
+	} else {
+		char tmp[MAX_QPATH];
+		COM_StripExtension( fxName, tmp, sizeof( tmp ) );
+		Com_sprintf( efxPath, sizeof( efxPath ), "effects/%s", tmp );
+	}
+	Q_strcat( efxPath, sizeof( efxPath ), ".efx" );
+
+	pack_t *efxPak = NULL;
+	fileInPack_t *efxPf = NULL;
+	if ( !WasmPK3_MarkExactFile( efxPath, &efxPak, &efxPf ) ) {
+		return;
+	}
+	if ( !efxPak || !efxPf || !WasmPK3_IsPakFileCached( efxPak, efxPf ) ) {
+		if ( outAllReady ) *outAllReady = qfalse;
+		return;
+	}
+	void *rawBuf = NULL;
+	int rawLen = FS_ReadFile( efxPath, &rawBuf );
+	if ( !rawBuf || rawLen <= 0 ) {
+		if ( rawBuf ) FS_FreeFile( rawBuf );
+		return;
+	}
+	char *efxCopy = (char *)malloc( (size_t)rawLen + 1 );
+	if ( !efxCopy ) {
+		FS_FreeFile( rawBuf );
+		return;
+	}
+	memcpy( efxCopy, rawBuf, (size_t)rawLen );
+	efxCopy[rawLen] = '\0';
+	FS_FreeFile( rawBuf );
+
+	const char *p = efxCopy;
+	while ( 1 ) {
+		char *tok = COM_ParseExt( &p, qtrue );
+		if ( !tok[0] ) break;
+		int listKind = 0;
+		if ( !Q_stricmp( tok, "shaders" ) ) listKind = 1;
+		else if ( !Q_stricmp( tok, "models" ) ) listKind = 2;
+		else if ( !Q_stricmp( tok, "sounds" ) ) listKind = 3;
+		else if ( !Q_stricmp( tok, "emitfx" ) || !Q_stricmp( tok, "impactfx" ) || !Q_stricmp( tok, "deathfx" ) || !Q_stricmp( tok, "playfx" ) ) listKind = 4;
+		if ( listKind != 0 ) {
+			tok = COM_ParseExt( &p, qtrue );
+			if ( tok[0] == '[' ) {
+				while ( 1 ) {
+					tok = COM_ParseExt( &p, qtrue );
+					if ( !tok[0] || tok[0] == ']' ) break;
+					char entry[MAX_QPATH];
+					Q_strncpyz( entry, tok, sizeof( entry ) );
+					if ( listKind == 1 ) {
+						R_WasmCollectShaderFiles( entry, extraShaderText, WasmPK3_MarkImageOrSoundOrFile );
+					} else if ( listKind == 2 ) {
+						WasmPK3_CollectModelFiles( entry, extraShaderText, outAllReady );
+					} else if ( listKind == 3 ) {
+						WasmPK3_MarkImageOrSoundOrFile( entry );
+					} else if ( listKind == 4 ) {
+						WasmPK3_CollectEfxFile( entry, extraShaderText, outAllReady, depth + 1 );
+					}
+				}
+			}
+		}
+	}
+	free( efxCopy );
 }
 
 extern "C" const char *FS_WasmPlanDemoChunks(
@@ -4044,7 +4263,11 @@ extern "C" const char *FS_WasmPlanDemoChunks(
 									Q_strncpyz( key, tok, sizeof( key ) );
 									tok = COM_ParseExt( &p, qfalse );
 									if ( !Q_stricmp( key, "model" ) && tok[0] && tok[0] != '*' ) {
-										WasmPK3_CollectModelFiles( tok, extraShaderText );
+										WasmPK3_CollectModelFiles( tok, extraShaderText, &bspReady );
+									} else if ( !Q_stricmp( key, "fxFile" ) && tok[0] && tok[0] != '*' ) {
+										WasmPK3_CollectEfxFile( tok, extraShaderText, &bspReady, 0 );
+									} else if ( !Q_stricmp( key, "noise" ) && tok[0] && tok[0] != '*' ) {
+										WasmPK3_MarkImageOrSoundOrFile( tok );
 									}
 								}
 							}
@@ -4057,20 +4280,140 @@ extern "C" const char *FS_WasmPlanDemoChunks(
 		}
 	}
 
-	// 4. Configstrings from gamestate (CS_MODELS=298, CS_SOUNDS=811, CS_ICONS=1067, CS_PLAYERS=1131, CS_EFFECTS=1355)
-	WasmPK3_MarkPrefixInMountedPaks( "sound/items/" );
-	WasmPK3_MarkPrefixInMountedPaks( "sound/interface/" );
-	WasmPK3_MarkPrefixInMountedPaks( "sound/player/" );
-	WasmPK3_MarkPrefixInMountedPaks( "sound/effects/" );
-	WasmPK3_MarkPrefixInMountedPaks( "sound/weapons/" );
-	WasmPK3_MarkPrefixInMountedPaks( "sound/movers/switches/" );
-	WasmPK3_MarkPrefixInMountedPaks( "sound/movers/objects/" );
-	WasmPK3_MarkPrefixInMountedPaks( "sound/chars/protocol/misc/" );
+	// 4. MP-common assets + configstrings from gamestate (CS_MODELS=298, CS_SOUNDS=811, CS_ICONS=1067, CS_PLAYERS=1131, CS_EFFECTS=1355)
+	static const char * const s_mpCommonPrefixes[] = {
+		"models/players/_humanoid/",
+		"models/map_objects/mp/",
+		"models/weapons2/",
+		"models/weaphits/",
+		"models/flags/",
+		"models/chunks/",
+		"models/items/",
+		"effects/",
+		"ext_data/sabers/",
+		"ui/assets/",
+		"ui/jamp/",
+		"gfx/2d/",
+		"gfx/hud/",
+		"gfx/mp/",
+		"gfx/mp_automap/",
+		"gfx/menus/radar/",
+		"gfx/effects/",
+		"gfx/exp/",
+		"gfx/chunks/",
+		"gfx/damage/",
+		"gfx/misc/",
+		"gfx/sprites/",
+		"fonts/",
+		"sound/items/",
+		"sound/interface/",
+		"sound/player/",
+		"sound/weapons/",
+		"sound/movers/switches/",
+		"sound/chars/protocol/misc/",
+		"sound/chars/kyle/misc/",
+		"sound/chars/jaden_fmle/misc/",
+		"sound/chars/turret/"
+	};
+	for ( size_t i = 0; i < sizeof( s_mpCommonPrefixes ) / sizeof( s_mpCommonPrefixes[0] ); i++ ) {
+		WasmPK3_MarkPrefixInMountedPaks( s_mpCommonPrefixes[i] );
+	}
+	static const char * const s_mpCommonExactFiles[] = {
+		"models/players/stormtrooper/caps.tga",
+		"models/map_objects/imp_mine/turret_chair_dmg.tga",
+		"sound/movers/objects/saber_slam.mp3",
+		"sound/movers/objects/objectHit.wav",
+		"sound/ambience/spark5.wav",
+		"sound/chars/seeker/misc/hiss.wav",
+		"sound/effects/glassbreak1.wav",
+		"sound/effects/energy_crackle.wav",
+		"sound/effects/fire_lp.wav",
+		"sound/effects/grate_destroy.mp3",
+		"sound/effects/metal_bounce.mp3",
+		"sound/effects/metal_bounce2.mp3",
+		"sound/effects/stone_bounce.wav",
+		"sound/effects/stone_bounce2.wav",
+		"sound/effects/wall_smash.mp3",
+		"sound/effects/hitsound.wav",
+		"sound/effects/hitsound2.wav",
+		"sound/effects/hitsound3.wav",
+		"sound/effects/hitsound4.wav",
+		"sound/effects/hitsoundteam.wav",
+		"music/goodsmall.mp3",
+		"music/badsmall.mp3"
+	};
+	for ( size_t i = 0; i < sizeof( s_mpCommonExactFiles ) / sizeof( s_mpCommonExactFiles[0] ); i++ ) {
+		WasmPK3_MarkExactFile( s_mpCommonExactFiles[i], NULL, NULL );
+	}
+	WasmPK3_MarkImageOrSoundOrFile( "menu/art/3_cursor2" );
+	WasmPK3_CollectPlayerFiles( "kyle/default", extraShaderText, &bspReady );
+
+	static const char * const s_mpCommonEffects[] = {
+		"effects/mp/test_sparks.efx",
+		"effects/mp/test_wall_impact.efx",
+		"materials/mud",
+		"materials/sand",
+		"materials/snow",
+		"materials/gravel",
+		"materials/mud_large",
+		"materials/sand_large",
+		"materials/dirt_large",
+		"materials/snow_large",
+		"materials/gravel_large",
+		"env/water_impact",
+		"env/lava_splash",
+		"env/acid_splash",
+		"turret/shot",
+		"emplaced/dead_smoke.efx",
+		"emplaced/explode.efx",
+		"turret/explode.efx",
+		"sparks/spark_explosion.efx",
+		"tripMine/explosion.efx",
+		"detpack/explosion.efx",
+		"flechette/alt_blow.efx",
+		"stunBaton/flesh_impact.efx",
+		"demp2/altDetonate.efx",
+		"sparks/spark_exp_nosnd",
+		"tripMine/laser.efx",
+		"effects/emplaced/muzzle_flash",
+		"concussion/alt_ring",
+		"ships/hyperspace_stars",
+		"volumetric/black_smoke",
+		"effects/ships/dest_destroyed.efx",
+		"effects/ships/dest_burning.efx",
+		"effects/boba/jet.efx",
+		"mp/itemcone.efx",
+		"effects/turret/muzzle_flash.efx",
+		"sparks/spark_nosnd.efx",
+		"saber/saber_cut.efx",
+		"saber/saber_block.efx",
+		"saber/blood_sparks_mp.efx",
+		"saber/blood_sparks_25_mp.efx",
+		"saber/blood_sparks_50_mp.efx",
+		"mp/spawn.efx",
+		"mp/jedispawn.efx",
+		"blaster/deflect.efx",
+		"blaster/smoke_bolton",
+		"force/confusion_old.efx",
+		"effects/force/lightning.efx",
+		"effects/force/lightningwide.efx",
+		"effects/mp/drain.efx",
+		"effects/mp/drainwide.efx",
+		"effects/mp/drainhit.efx",
+		"disruptor/death_smoke",
+		"force/force_touch",
+		"saber/fizz.efx",
+		"effects/rain"
+	};
+	for ( size_t i = 0; i < sizeof( s_mpCommonEffects ) / sizeof( s_mpCommonEffects[0] ); i++ ) {
+		WasmPK3_CollectEfxFile( s_mpCommonEffects[i], extraShaderText, &bspReady, 0 );
+	}
+
 	if ( gs ) {
 		for ( int i = 1; i < MAX_MODELS; i++ ) {
 			int ofs = gs->stringOffsets[298 + i];
 			if ( ofs > 0 && gs->stringData[ofs] ) {
-				WasmPK3_CollectModelFiles( gs->stringData + ofs, extraShaderText );
+				WasmPK3_CollectModelFiles( gs->stringData + ofs, extraShaderText, &bspReady );
 			}
 		}
 		for ( int i = 1; i < MAX_SOUNDS; i++ ) {
@@ -4091,31 +4434,18 @@ extern "C" const char *FS_WasmPlanDemoChunks(
 				const char *pinfo = gs->stringData + ofs;
 				const char *model = Info_ValueForKey( pinfo, "model" );
 				if ( model && model[0] ) {
-					char charName[64];
-					Q_strncpyz( charName, model, sizeof( charName ) );
-					char *slash = strchr( charName, '/' );
-					if ( slash ) *slash = '\0';
-					if ( charName[0] ) {
-						WasmPK3_MarkPrefixInMountedPaks( va( "models/players/%s/", charName ) );
-						WasmPK3_MarkPrefixInMountedPaks( va( "sound/chars/%s/", charName ) );
-					}
+					WasmPK3_CollectPlayerFiles( model, extraShaderText, &bspReady );
+				}
+				const char *hmodel = Info_ValueForKey( pinfo, "hmodel" );
+				if ( hmodel && hmodel[0] && ( !model || Q_stricmp( hmodel, model ) ) ) {
+					WasmPK3_CollectPlayerFiles( hmodel, extraShaderText, &bspReady );
 				}
 			}
 		}
 		for ( int i = 1; i < MAX_FX; i++ ) {
 			int ofs = gs->stringOffsets[1355 + i];
 			if ( ofs > 0 && gs->stringData[ofs] && gs->stringData[ofs] != '*' ) {
-				const char *fx = gs->stringData + ofs;
-				char efxPath[MAX_QPATH];
-				if ( !Q_stricmpn( fx, "effects/", 8 ) ) {
-					COM_StripExtension( fx, efxPath, sizeof( efxPath ) );
-				} else {
-					char tmp[MAX_QPATH];
-					COM_StripExtension( fx, tmp, sizeof( tmp ) );
-					Com_sprintf( efxPath, sizeof( efxPath ), "effects/%s", tmp );
-				}
-				Q_strcat( efxPath, sizeof( efxPath ), ".efx" );
-				WasmPK3_MarkExactFile( efxPath, NULL, NULL );
+				WasmPK3_CollectEfxFile( gs->stringData + ofs, extraShaderText, &bspReady, 0 );
 			}
 		}
 	}

@@ -1907,6 +1907,7 @@
   const pk3ChunkCache = new Map(); // "<pk3Name>:<chunkIdx>" -> Uint8Array
   const pk3CdCache = new Map(); // "<pk3Name>:<start>-<end>" -> Uint8Array
   const demoByteCache = new Map(); // "<fileName>" -> Uint8Array
+  const idbKnownKeys = new Set(); // "chunk:<pk3Name>:<chunkIdx>" | "cd:<pk3Name>:<start>-<end>"
   const hotChunkSet = new Set(); // "<pk3Name>:<chunkIdx>"
   let idbInstance = null;
   let idbOpenPromise = null;
@@ -1914,9 +1915,24 @@
   let idbFlushTimer = 0;
   let hotChunksSaveTimer = 0;
 
+  const STARTUP_CORE_CHUNK_KEYS = new Set([
+    'chunk:assets0.pk3:2',
+    'chunk:assets1.pk3:1180',
+    'chunk:assets1.pk3:1188',
+    'chunk:assets1.pk3:1189',
+    'chunk:assets1.pk3:1205',
+    'chunk:assets1.pk3:1208',
+    'chunk:assets1.pk3:1209',
+    'chunk:assets1.pk3:1347',
+    'chunk:assets1.pk3:2487',
+    'chunk:assets2.pk3:4',
+    'chunk:assets3.pk3:35',
+  ]);
+
   window.__jkPk3ChunkCache = pk3ChunkCache;
   window.__jkPk3CdCache = pk3CdCache;
   window.__jkDemoCache = demoByteCache;
+  window.__jkIdbKnownKeys = idbKnownKeys;
 
   function loadHotChunkList() {
     try {
@@ -1987,25 +2003,36 @@
   }
 
   function flushIdbWriteQueue() {
-    idbFlushTimer = 0;
-    if (state.bypassCache || idbWriteQueue.length === 0) return;
+    if (idbFlushTimer) {
+      clearTimeout(idbFlushTimer);
+      idbFlushTimer = 0;
+    }
+    if (state.bypassCache || idbWriteQueue.length === 0) return Promise.resolve();
     const batch = idbWriteQueue;
     idbWriteQueue = [];
-    openCacheDB().then((db) => {
+    return openCacheDB().then((db) => {
       if (!db) return;
-      try {
-        const tx = db.transaction(['chunks'], 'readwrite');
-        const store = tx.objectStore('chunks');
-        const now = Date.now();
-        for (const item of batch) {
-          store.put({ key: item.key, data: item.data, ts: now });
+      return new Promise((resolve) => {
+        try {
+          const tx = db.transaction(['chunks'], 'readwrite');
+          const store = tx.objectStore('chunks');
+          const now = Date.now();
+          for (const item of batch) {
+            store.put({ key: item.key, data: item.data, ts: now });
+          }
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => resolve();
+          tx.onabort = () => resolve();
+        } catch (_) {
+          resolve();
         }
-      } catch (_) {}
+      });
     });
   }
 
   function queueIdbChunkWrite(key, uint8Data) {
     if (state.bypassCache) return;
+    idbKnownKeys.add(key);
     idbWriteQueue.push({ key, data: uint8Data });
     if (!idbFlushTimer) {
       idbFlushTimer = setTimeout(flushIdbWriteQueue, 120);
@@ -2062,47 +2089,45 @@
     if (db) {
       await new Promise((resolve) => {
         try {
-          const tx = db.transaction(['chunks', 'demos'], 'readonly');
+          const tx = db.transaction(['chunks'], 'readonly');
           const chunkStore = tx.objectStore('chunks');
-          const demoStore = tx.objectStore('demos');
-          const chunkReq = chunkStore.getAll();
-          const demoReq = demoStore.getAll();
+          const keysReq = chunkStore.getAllKeys();
           let hydratedChunks = 0;
           let hydratedBytes = 0;
 
-          chunkReq.onsuccess = function () {
-            const rows = chunkReq.result || [];
-            for (const row of rows) {
-              if (!row || !row.key || !row.data) continue;
-              const bytes =
-                row.data instanceof Uint8Array ? row.data : new Uint8Array(row.data);
-              if (row.key.startsWith('chunk:')) {
-                const subKey = row.key.slice(6);
-                pk3ChunkCache.set(subKey, bytes);
-                hydratedChunks++;
-                hydratedBytes += bytes.byteLength;
-              } else if (row.key.startsWith('cd:')) {
-                const subKey = row.key.slice(3);
-                pk3CdCache.set(subKey, bytes);
-                hydratedBytes += bytes.byteLength;
+          keysReq.onsuccess = function () {
+            const keys = keysReq.result || [];
+            for (const k of keys) {
+              if (typeof k !== 'string') continue;
+              idbKnownKeys.add(k);
+              if (k.startsWith('cd:') || STARTUP_CORE_CHUNK_KEYS.has(k)) {
+                const getReq = chunkStore.get(k);
+                getReq.onsuccess = function () {
+                  const row = getReq.result;
+                  if (!row || !row.data) return;
+                  const bytes =
+                    row.data instanceof Uint8Array ? row.data : new Uint8Array(row.data);
+                  if (k.startsWith('chunk:')) {
+                    pk3ChunkCache.set(k.slice(6), bytes);
+                    hydratedChunks++;
+                    hydratedBytes += bytes.byteLength;
+                  } else if (k.startsWith('cd:')) {
+                    pk3CdCache.set(k.slice(3), bytes);
+                    hydratedBytes += bytes.byteLength;
+                  }
+                };
               }
-            }
-            state.metrics.idbHydratedChunks = hydratedChunks;
-            state.metrics.idbHydratedBytes = hydratedBytes;
-          };
-          demoReq.onsuccess = function () {
-            const rows = demoReq.result || [];
-            for (const row of rows) {
-              if (!row || !row.name || !row.data) continue;
-              const bytes =
-                row.data instanceof Uint8Array ? row.data : new Uint8Array(row.data);
-              demoByteCache.set(row.name, bytes);
             }
           };
           tx.oncomplete = function () {
+            state.metrics.idbHydratedChunks += hydratedChunks;
+            state.metrics.idbHydratedBytes += hydratedBytes;
             resolve();
           };
           tx.onerror = function () {
+            resolve();
+          };
+          tx.onabort = function () {
             resolve();
           };
         } catch (_) {
@@ -2113,6 +2138,80 @@
     await manifestPromise;
     const t1 = typeof performance !== 'undefined' ? performance.now() : Date.now();
     state.metrics.idbHydrateDurationMs = Math.round((t1 - t0) * 100) / 100;
+  }
+
+  async function loadChunksFromIdb(subKeys) {
+    if (state.bypassCache || !subKeys || subKeys.length === 0) return 0;
+    const needed = [];
+    for (const sk of subKeys) {
+      if (!pk3ChunkCache.has(sk) && idbKnownKeys.has('chunk:' + sk)) {
+        needed.push(sk);
+      }
+    }
+    if (needed.length === 0) return 0;
+    const db = await openCacheDB();
+    if (!db) return 0;
+    return new Promise((resolve) => {
+      let loadedCount = 0;
+      let loadedBytes = 0;
+      try {
+        const tx = db.transaction(['chunks'], 'readonly');
+        const store = tx.objectStore('chunks');
+        for (const sk of needed) {
+          const req = store.get('chunk:' + sk);
+          req.onsuccess = function () {
+            const row = req.result;
+            if (row && row.data) {
+              const bytes =
+                row.data instanceof Uint8Array ? row.data : new Uint8Array(row.data);
+              pk3ChunkCache.set(sk, bytes);
+              loadedCount++;
+              loadedBytes += bytes.byteLength;
+            }
+          };
+        }
+        tx.oncomplete = function () {
+          state.metrics.idbHydratedChunks += loadedCount;
+          state.metrics.idbHydratedBytes += loadedBytes;
+          resolve(loadedCount);
+        };
+        tx.onerror = function () {
+          resolve(loadedCount);
+        };
+        tx.onabort = function () {
+          resolve(loadedCount);
+        };
+      } catch (_) {
+        resolve(0);
+      }
+    });
+  }
+
+  async function loadDemoFromIdb(cacheKey) {
+    if (state.bypassCache || !cacheKey) return null;
+    const db = await openCacheDB();
+    if (!db) return null;
+    return new Promise((resolve) => {
+      try {
+        const tx = db.transaction(['demos'], 'readonly');
+        const req = tx.objectStore('demos').get(cacheKey);
+        req.onsuccess = function () {
+          const row = req.result;
+          if (row && row.data) {
+            const bytes =
+              row.data instanceof Uint8Array ? row.data : new Uint8Array(row.data);
+            demoByteCache.set(cacheKey, bytes);
+            resolve(bytes);
+          } else {
+            resolve(null);
+          }
+        };
+        req.onerror = () => resolve(null);
+        tx.onerror = () => resolve(null);
+      } catch (_) {
+        resolve(null);
+      }
+    });
   }
 
   // Hooks called by C++ EM_JS in codemp/qcommon/files.cpp
@@ -2199,7 +2298,10 @@
     const key = name + ':' + chunkIdx;
     if (pk3ChunkCache.has(key) || asyncChunkPrefetchInFlight.has(key)) return;
     asyncChunkPrefetchInFlight.add(key);
-    fetchPk3SpanIntoCache(name, chunkIdx, chunkIdx, archSize || 0)
+    const task = idbKnownKeys.has('chunk:' + key)
+      ? loadChunksFromIdb([key])
+      : fetchPk3SpanIntoCache(name, chunkIdx, chunkIdx, archSize || 0);
+    task
       .catch(() => {})
       .finally(() => {
         asyncChunkPrefetchInFlight.delete(key);
@@ -2484,6 +2586,13 @@
     if (!fileName) return null;
 
     const cacheKey = isQueryUrl ? raw : fileName;
+    if (!demoByteCache.has(cacheKey) && !state.bypassCache) {
+      await loadDemoFromIdb(cacheKey);
+      if (!demoByteCache.has(cacheKey) && cacheKey !== fileName) {
+        const byFile = await loadDemoFromIdb(fileName);
+        if (byFile) demoByteCache.set(cacheKey, byFile);
+      }
+    }
     if (demoByteCache.has(cacheKey)) {
       const cachedBytes = demoByteCache.get(cacheKey);
       if (cachedBytes && cachedBytes.byteLength >= 16) {
@@ -3273,7 +3382,8 @@
       }
     }
     const addTarget = (pk3Name, cIdx) => {
-      if (pk3ChunkCache.has(pk3Name + ':' + cIdx)) return;
+      const subKey = pk3Name + ':' + cIdx;
+      if (pk3ChunkCache.has(subKey) || idbKnownKeys.has('chunk:' + subKey)) return;
       if (!byArchive.has(pk3Name)) byArchive.set(pk3Name, new Set());
       byArchive.get(pk3Name).add(cIdx);
     };
@@ -3287,29 +3397,17 @@
       }
     };
 
-    addTargetRanges('assets0.pk3', [2, [537, 549], 1694]);
+    // Pure MP-common sound, HUD, font, effect, and weapon chunks (no SP campaign or map-specific planet folders)
+    addTargetRanges('assets0.pk3', [
+      2, 429, 451, [537, 549], 925, [1038, 1041], [1064, 1066], 1662,
+      [1664, 1665], [1669, 1670], 1677, [1682, 1683], [1689, 1694], [1707, 1728],
+    ]);
     addTargetRanges('assets1.pk3', [
-      [2, 4], 7, [34, 35], 48, 59, [62, 65], [72, 73], [75, 77], 80, [83, 84],
-      [147, 148], [152, 154], 175, [195, 225], [254, 256], 258, 313, 371,
-      [479, 481], [493, 494], [522, 523], [530, 531], 533, 535, [537, 538],
-      [541, 542], [613, 614], [618, 619], [623, 624], 634, 706, [712, 713],
-      785, [787, 789], 802, [814, 815], 1008, 1026, [1048, 1050], 1059,
-      [1076, 1077], [1179, 1183], 1185, [1187, 1189], [1192, 1199], [1201, 1209],
-      [1342, 1343], [1345, 1354], 1356, [1359, 1360], 1366, 1371, [1374, 1376],
-      1378, [1592, 1593], [1625, 1629], [1824, 1825], [1845, 1846], [2085, 2088],
-      [2318, 2351], [2459, 2480], [2485, 2487],
+      [1179, 1209], [1342, 1343], [1345, 1351], [1359, 1366], [1374, 1378],
+      [1623, 1629], [2085, 2088], [2318, 2351], [2459, 2487],
     ]);
     addTargetRanges('assets2.pk3', [4]);
     addTargetRanges('assets3.pk3', [35]);
-    for (const key of hotChunkSet) {
-      const sep = key.lastIndexOf(':');
-      if (sep <= 0) continue;
-      const pk3Name = key.slice(0, sep);
-      const cIdx = parseInt(key.slice(sep + 1), 10);
-      if (Number.isFinite(cIdx) && cIdx >= 0) {
-        addTarget(pk3Name, cIdx);
-      }
-    }
   }
 
   async function prefetchCommonChunksAsync() {
@@ -3354,7 +3452,8 @@
             const item = spans[cursor++];
             let allCached = true;
             for (let c = item.cStart; c <= item.cEnd; c++) {
-              if (!pk3ChunkCache.has(item.pk3Name + ':' + c)) {
+              const subKey = item.pk3Name + ':' + c;
+              if (!pk3ChunkCache.has(subKey) && !idbKnownKeys.has('chunk:' + subKey)) {
                 allCached = false;
                 break;
               }
@@ -3430,7 +3529,7 @@
   async function executePlanPass(shortName, labelPrefix, basePct, spanPct, silentProgress, includeCommonChunks) {
     const rawPlan = callWasm('JK_DemoPlanLoadChunks', 'string', ['string'], [shortName]);
     if (!rawPlan && !includeCommonChunks) {
-      return { bspReady: 1, fetchedSpans: 0, fetchedBytes: 0, mapName: '' };
+      return { bspReady: 1, fetchedSpans: 0, fetchedBytes: 0, hydratedFromIdb: 0, mapName: '' };
     }
     let plan = null;
     if (rawPlan) {
@@ -3440,11 +3539,11 @@
     }
     const rawSpans = plan && Array.isArray(plan.spans) ? plan.spans : [];
     const mapName = String((plan && plan.mapName) || '');
-    const byArchive = new Map();
+    const candidateByArchive = new Map();
     const sizeMap = new Map();
 
     if (includeCommonChunks) {
-      populateCommonChunkTargets(byArchive, sizeMap);
+      populateCommonChunkTargets(candidateByArchive, sizeMap);
     }
 
     for (const row of rawSpans) {
@@ -3456,6 +3555,30 @@
       if (!pk3Name || !Number.isFinite(cStart) || !Number.isFinite(cEnd) || cEnd < cStart) continue;
       if (archSize > 0) sizeMap.set(pk3Name, archSize);
       for (let c = cStart; c <= cEnd; c++) {
+        if (!pk3ChunkCache.has(pk3Name + ':' + c)) {
+          if (!candidateByArchive.has(pk3Name)) candidateByArchive.set(pk3Name, new Set());
+          candidateByArchive.get(pk3Name).add(c);
+        }
+      }
+    }
+
+    // Hydrate any already-persisted chunks for this demo from IndexedDB on demand
+    const toHydrateFromIdb = [];
+    for (const [pk3Name, idxSet] of candidateByArchive.entries()) {
+      for (const c of idxSet) {
+        const subKey = pk3Name + ':' + c;
+        if (!pk3ChunkCache.has(subKey) && idbKnownKeys.has('chunk:' + subKey)) {
+          toHydrateFromIdb.push(subKey);
+        }
+      }
+    }
+    const hydratedFromIdb =
+      toHydrateFromIdb.length > 0 ? await loadChunksFromIdb(toHydrateFromIdb) : 0;
+
+    // Only issue HTTP Range requests for chunks still absent from pk3ChunkCache
+    const byArchive = new Map();
+    for (const [pk3Name, idxSet] of candidateByArchive.entries()) {
+      for (const c of idxSet) {
         if (!pk3ChunkCache.has(pk3Name + ':' + c)) {
           if (!byArchive.has(pk3Name)) byArchive.set(pk3Name, new Set());
           byArchive.get(pk3Name).add(c);
@@ -3494,9 +3617,10 @@
 
     if (spans.length === 0) {
       return {
-        bspReady: Number(plan.bspReady || 0),
+        bspReady: Number((plan && plan.bspReady) || 0),
         fetchedSpans: 0,
         fetchedBytes: 0,
+        hydratedFromIdb,
         mapName,
       };
     }
@@ -3548,27 +3672,28 @@
       );
     }
     await Promise.all(workers);
-    flushIdbWriteQueue();
+    await flushIdbWriteQueue();
     return {
       bspReady: Number((plan && plan.bspReady) || 0),
       fetchedSpans: spans.length,
       fetchedBytes: loadedBytes,
+      hydratedFromIdb,
       mapName,
     };
   }
 
   async function planAndPrefetchDemoChunks(shortName) {
     if (!state.engineStarted) return;
-    // Up to 3 passes:
-    // Pass 1: Common MP chunks + custom PK3 central directories + BSP header & lumps + configstring models/sounds/players
-    // Pass 2: BSP textures/shaders & static models (once BSP chunks are in cache)
-    // Pass 3: Any textures referenced by custom PK3s mounted in Pass 2
-    for (let pass = 0; pass < 3; pass++) {
+    // Up to 4 passes:
+    // Pass 1: Exact MP-common assets + custom PK3s + BSP header & lumps + configstring models/sounds/player skins
+    // Pass 2: BSP textures/shaders & static models (once BSP chunks & player .skin/.cfg files are in cache)
+    // Pass 3+: Any textures referenced by static .md3 models or custom PK3s mounted in earlier passes
+    for (let pass = 0; pass < 4; pass++) {
       const label = pass === 0 ? 'Loading map & models' : 'Loading map textures & sounds';
       const basePct = pass === 0 ? 35 : 58;
       const spanPct = pass === 0 ? 23 : 20;
-      const res = await executePlanPass(shortName, label, basePct, spanPct, false, pass === 0);
-      if (res.bspReady === 1 && res.fetchedSpans === 0) {
+      const res = await executePlanPass(shortName, label, basePct, spanPct, false, false);
+      if (res.bspReady === 1 && res.fetchedSpans === 0 && res.hydratedFromIdb === 0) {
         break;
       }
     }
@@ -3590,6 +3715,7 @@
     return {
       cachedChunks: pk3ChunkCache.size,
       cachedChunkBytes: chunkBytes,
+      idbKnownChunks: idbKnownKeys.size,
       cachedCentralDirs: pk3CdCache.size,
       cachedCentralDirBytes: cdBytes,
       cachedDemos: demoByteCache.size,
@@ -3606,6 +3732,7 @@
     pk3ChunkCache.clear();
     pk3CdCache.clear();
     demoByteCache.clear();
+    idbKnownKeys.clear();
     hotChunkSet.clear();
     try {
       localStorage.removeItem(LS_MANIFEST_KEY);
@@ -4509,7 +4636,7 @@
 
     const canvas = document.getElementById('jk-canvas');
     const initialDims = resize();
-    const DEFAULT_ASSET_VERSION = '20261104g';
+    const DEFAULT_ASSET_VERSION = '20261104i';
     const cfg = window.JKDemoConfig || {};
     const rawScriptUrl = typeof cfg.scriptUrl === 'string' && cfg.scriptUrl ? cfg.scriptUrl : `/openjk.js?v=${DEFAULT_ASSET_VERSION}`;
     const scriptUrl = rawScriptUrl.includes('?') ? rawScriptUrl : `${rawScriptUrl}?v=${DEFAULT_ASSET_VERSION}`;
