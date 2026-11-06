@@ -15,7 +15,45 @@
 
   const BOOT_START_MS = typeof performance !== 'undefined' ? performance.now() : Date.now();
   const DEFAULT_ENGINE_VERSION = '20261105c';
-  const DEFAULT_PLAYER_VERSION = '20261105e';
+  const DEFAULT_PLAYER_VERSION = '20261105g';
+
+  function installDocumentTitleGuard() {
+    if (typeof document === 'undefined' || document.__jkTitleGuardInstalled) return;
+    try {
+      const proto =
+        (typeof Document !== 'undefined' && Document.prototype) ||
+        Object.getPrototypeOf(document);
+      const desc = proto ? Object.getOwnPropertyDescriptor(proto, 'title') : null;
+      if (!desc || typeof desc.get !== 'function' || typeof desc.set !== 'function') return;
+      const isEngineWindowTitle = (val) => {
+        const s = String(val == null ? '' : val).trim();
+        if (!s) return true;
+        return (
+          /^jedi\s*knight/i.test(s) ||
+          /^openjk(?:\s*\(mp\))?$/i.test(s) ||
+          /^jamme$/i.test(s) ||
+          /^unnamed window$/i.test(s)
+        );
+      };
+      Object.defineProperty(document, 'title', {
+        configurable: true,
+        enumerable: desc.enumerable !== false,
+        get() {
+          return desc.get.call(document);
+        },
+        set(nextVal) {
+          const cfg = window.JKDemoConfig || {};
+          if (cfg.preserveDocumentTitle !== false && isEngineWindowTitle(nextVal)) {
+            return;
+          }
+          desc.set.call(document, nextVal);
+        },
+      });
+      document.__jkTitleGuardInstalled = true;
+    } catch (_) {}
+  }
+
+  installDocumentTitleGuard();
   const EXPECTED_OPENJK_JS_BYTES = 307440;
   const EXPECTED_OPENJK_WASM_BYTES = 5190856;
   const WASM_PK3_CHUNK_SIZE = 256 * 1024;

@@ -5,6 +5,44 @@
     return;
   }
 
+  function installDocumentTitleGuard() {
+    if (typeof document === 'undefined' || document.__jkTitleGuardInstalled) return;
+    try {
+      const proto =
+        (typeof Document !== 'undefined' && Document.prototype) ||
+        Object.getPrototypeOf(document);
+      const desc = proto ? Object.getOwnPropertyDescriptor(proto, 'title') : null;
+      if (!desc || typeof desc.get !== 'function' || typeof desc.set !== 'function') return;
+      const isEngineWindowTitle = (val) => {
+        const s = String(val == null ? '' : val).trim();
+        if (!s) return true;
+        return (
+          /^jedi\s*knight/i.test(s) ||
+          /^openjk(?:\s*\(mp\))?$/i.test(s) ||
+          /^jamme$/i.test(s) ||
+          /^unnamed window$/i.test(s)
+        );
+      };
+      Object.defineProperty(document, 'title', {
+        configurable: true,
+        enumerable: desc.enumerable !== false,
+        get() {
+          return desc.get.call(document);
+        },
+        set(nextVal) {
+          const cfg = window.JKDemoConfig || {};
+          if (cfg.preserveDocumentTitle !== false && isEngineWindowTitle(nextVal)) {
+            return;
+          }
+          desc.set.call(document, nextVal);
+        },
+      });
+      document.__jkTitleGuardInstalled = true;
+    } catch (_) {}
+  }
+
+  installDocumentTitleGuard();
+
   const STORAGE_KEY_LAYOUT = 'jk_pip_layout_v1';
   const STORAGE_KEY_PLAYER_PREFS = 'openjk_player_prefs_v1';
 
@@ -37,10 +75,10 @@
     default: { width: 560, height: 376 },
     large: { width: 760, height: 496 },
   };
-  const MIN_WIDTH = 320;
-  const MIN_HEIGHT = 220;
-  const HARD_MIN_WIDTH = 240;
-  const HARD_MIN_HEIGHT = 180;
+  const MIN_WIDTH = 220;
+  const MIN_HEIGHT = 204;
+  const HARD_MIN_WIDTH = 220;
+  const HARD_MIN_HEIGHT = 204;
 
   const ICON_FULLSCREEN_ENTER =
     '<svg class="jk-icon-svg" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10"/></svg>';
@@ -77,6 +115,10 @@
     resizeStartY: 0,
     resizeStartW: 0,
     resizeStartH: 0,
+    resizeStartCardX: 0,
+    resizeStartCardY: 0,
+    resizeDir: 'se',
+    resizeHandleEl: null,
     scrubbing: false,
     currentDemoUrl: '',
     currentDemoTitle: '',
@@ -218,7 +260,7 @@
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === 'object') {
         pipState.hasSavedLayout = true;
-        if (parsed.preset && SIZE_PRESETS[parsed.preset]) {
+        if (parsed.preset === 'custom' || (parsed.preset && SIZE_PRESETS[parsed.preset])) {
           pipState.preset = parsed.preset;
         }
         if (typeof parsed.width === 'number' && parsed.width >= HARD_MIN_WIDTH) {
@@ -293,6 +335,7 @@
       }
       #jk-pip-card {
         --jk-ui-scale: 1;
+        container: jk-card / inline-size;
         position: fixed;
         right: 16px;
         bottom: 16px;
@@ -309,6 +352,7 @@
         border-radius: calc(8px * var(--jk-ui-scale, 1));
         box-shadow: 0 12px 32px rgba(0, 0, 0, 0.65);
         overflow: hidden;
+        overflow: clip;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         font-size: calc(12px * var(--jk-ui-scale, 1));
         box-sizing: border-box;
@@ -324,9 +368,6 @@
       #jk-pip-card #jk-pip-tap-indicator .jk-icon-svg {
         width: calc(24px * var(--jk-ui-scale, 1));
         height: calc(24px * var(--jk-ui-scale, 1));
-      }
-      #jk-pip-card.jk-pip-narrow #jk-pip-volume {
-        display: none;
       }
       #jk-pip-card.jk-pip-open {
         display: flex;
@@ -379,9 +420,9 @@
       #jk-pip-card:fullscreen .jk-pip-drag-grip,
       #jk-pip-card:-webkit-full-screen .jk-pip-drag-grip,
       #jk-pip-card.jk-pip-pseudo-fullscreen .jk-pip-drag-grip,
-      #jk-pip-card:fullscreen #jk-pip-resize-handle,
-      #jk-pip-card:-webkit-full-screen #jk-pip-resize-handle,
-      #jk-pip-card.jk-pip-pseudo-fullscreen #jk-pip-resize-handle {
+      #jk-pip-card:fullscreen .jk-pip-resize-zone,
+      #jk-pip-card:-webkit-full-screen .jk-pip-resize-zone,
+      #jk-pip-card.jk-pip-pseudo-fullscreen .jk-pip-resize-zone {
         display: none !important;
       }
       #jk-pip-card:fullscreen #jk-pip-header,
@@ -457,9 +498,9 @@
       }
       #jk-pip-header {
         display: flex;
-        align-items: center;
+        align-items: safe center;
         justify-content: space-between;
-        gap: calc(8px * var(--jk-ui-scale, 1));
+        gap: calc(6px * var(--jk-ui-scale, 1));
         min-block-size: calc(34px * var(--jk-ui-scale, 1));
         padding: calc(3px * var(--jk-ui-scale, 1)) calc(8px * var(--jk-ui-scale, 1));
         background: #161b22;
@@ -470,7 +511,6 @@
         user-select: none;
         flex-shrink: 0;
         box-sizing: border-box;
-        translate: 0 0;
       }
       #jk-pip-header:active {
         cursor: grabbing;
@@ -529,6 +569,8 @@
         pointer-events: none;
       }
       .jk-pip-hdr-btn {
+        position: relative;
+        z-index: 12;
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -655,23 +697,25 @@
         display: flex;
         flex-direction: column;
         gap: calc(5px * var(--jk-ui-scale, 1));
-        padding: calc(6px * var(--jk-ui-scale, 1)) calc(8px * var(--jk-ui-scale, 1));
+        padding: calc(6px * var(--jk-ui-scale, 1)) calc(14px * var(--jk-ui-scale, 1)) calc(12px * var(--jk-ui-scale, 1));
         background: #161b22;
         border-top: 1px solid #30363d;
         flex-shrink: 0;
         -webkit-user-select: none;
         user-select: none;
         box-sizing: border-box;
-        translate: 0 0;
       }
       .jk-pip-timeline-row {
         display: flex;
-        align-items: center;
+        align-items: safe center;
         gap: calc(6px * var(--jk-ui-scale, 1));
-        width: 100%;
+        inline-size: 100%;
       }
       #jk-pip-seek {
+        position: relative;
+        z-index: 12;
         flex: 1 1 auto;
+        min-inline-size: 0;
         min-block-size: calc(18px * var(--jk-ui-scale, 1));
         margin: 0;
         cursor: pointer;
@@ -681,33 +725,47 @@
         font-variant-numeric: tabular-nums;
         font-size: calc(11px * var(--jk-ui-scale, 1));
         color: #8b949e;
-        min-inline-size: calc(74px * var(--jk-ui-scale, 1));
+        min-inline-size: calc(68px * var(--jk-ui-scale, 1));
         text-align: right;
+        flex-shrink: 0;
       }
       .jk-pip-buttons-row {
         display: flex;
-        align-items: center;
+        align-items: safe center;
         justify-content: space-between;
-        gap: calc(6px * var(--jk-ui-scale, 1));
+        gap: calc(5px * var(--jk-ui-scale, 1));
         flex-wrap: wrap;
+        flex-wrap: balance;
       }
       .jk-pip-btn-group {
         display: flex;
-        align-items: center;
+        align-items: safe center;
         gap: calc(5px * var(--jk-ui-scale, 1));
+        min-inline-size: 0;
       }
       .jk-pip-primary-group {
-        margin-inline-end: calc(12px * var(--jk-ui-scale, 1));
+        margin-inline-end: calc(8px * var(--jk-ui-scale, 1));
+      }
+      .jk-pip-secondary-group {
+        flex-wrap: wrap;
+        flex-wrap: balance;
+      }
+      .jk-pip-audio-group {
+        margin-inline-start: auto;
+        flex: 1 1 auto;
+        justify-content: flex-end;
       }
       #jk-pip-play-pause {
-        min-inline-size: calc(58px * var(--jk-ui-scale, 1));
+        min-inline-size: calc(54px * var(--jk-ui-scale, 1));
         font-weight: 600;
       }
       #jk-pip-camera {
-        min-inline-size: calc(64px * var(--jk-ui-scale, 1));
+        min-inline-size: calc(62px * var(--jk-ui-scale, 1));
         font-variant-numeric: tabular-nums;
       }
       .jk-pip-ctrl-btn {
+        position: relative;
+        z-index: 12;
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -733,6 +791,8 @@
         color: #ffffff;
       }
       .jk-pip-select {
+        position: relative;
+        z-index: 12;
         box-sizing: border-box;
         min-block-size: calc(24px * var(--jk-ui-scale, 1));
         min-inline-size: calc(24px * var(--jk-ui-scale, 1));
@@ -745,56 +805,257 @@
         cursor: pointer;
       }
       #jk-pip-volume {
-        width: calc(56px * var(--jk-ui-scale, 1));
+        position: relative;
+        z-index: 12;
+        flex: 1 1 calc(46px * var(--jk-ui-scale, 1));
+        min-inline-size: calc(44px * var(--jk-ui-scale, 1));
+        max-inline-size: calc(88px * var(--jk-ui-scale, 1));
         min-block-size: calc(18px * var(--jk-ui-scale, 1));
         margin: 0;
         cursor: pointer;
         accent-color: #58a6ff;
       }
-      #jk-pip-resize-handle {
+      .jk-pip-resize-zone {
         position: absolute;
-        right: 0;
-        bottom: 0;
-        width: calc(18px * var(--jk-ui-scale, 1));
-        height: calc(18px * var(--jk-ui-scale, 1));
-        cursor: nwse-resize;
         touch-action: none;
         -webkit-user-select: none;
         user-select: none;
         z-index: 10;
-        background: linear-gradient(135deg, transparent 50%, #58a6ff 50%);
-        opacity: 0.7;
       }
-      #jk-pip-resize-handle:hover {
+      .jk-pip-resize-se {
+        right: 0;
+        bottom: 0;
+        min-inline-size: calc(24px * var(--jk-ui-scale, 1));
+        min-block-size: calc(24px * var(--jk-ui-scale, 1));
+        cursor: nwse-resize;
+      }
+      .jk-pip-resize-sw {
+        left: 0;
+        bottom: 0;
+        min-inline-size: calc(24px * var(--jk-ui-scale, 1));
+        min-block-size: calc(24px * var(--jk-ui-scale, 1));
+        cursor: nesw-resize;
+      }
+      .jk-pip-resize-se::after,
+      .jk-pip-resize-sw::after {
+        content: "";
+        position: absolute;
+        bottom: 0;
+        inline-size: calc(13px * var(--jk-ui-scale, 1));
+        block-size: calc(13px * var(--jk-ui-scale, 1));
+        opacity: 0.72;
+        pointer-events: none;
+        transition: opacity 0.12s ease;
+      }
+      .jk-pip-resize-se::after {
+        right: 0;
+        background: linear-gradient(135deg, transparent 52%, #58a6ff 52%);
+      }
+      .jk-pip-resize-sw::after {
+        left: 0;
+        background: linear-gradient(225deg, transparent 52%, #58a6ff 52%);
+      }
+      .jk-pip-resize-se:hover::after,
+      .jk-pip-resize-sw:hover::after {
         opacity: 1;
+      }
+      .jk-pip-resize-nw {
+        left: 0;
+        top: 0;
+        min-inline-size: calc(20px * var(--jk-ui-scale, 1));
+        min-block-size: calc(20px * var(--jk-ui-scale, 1));
+        cursor: nwse-resize;
+      }
+      .jk-pip-resize-ne {
+        right: 0;
+        top: 0;
+        min-inline-size: calc(14px * var(--jk-ui-scale, 1));
+        min-block-size: calc(14px * var(--jk-ui-scale, 1));
+        cursor: nesw-resize;
+      }
+      .jk-pip-resize-n {
+        top: 0;
+        left: calc(20px * var(--jk-ui-scale, 1));
+        right: calc(14px * var(--jk-ui-scale, 1));
+        min-block-size: calc(6px * var(--jk-ui-scale, 1));
+        cursor: ns-resize;
+      }
+      .jk-pip-resize-s {
+        bottom: 0;
+        left: calc(24px * var(--jk-ui-scale, 1));
+        right: calc(24px * var(--jk-ui-scale, 1));
+        min-block-size: calc(8px * var(--jk-ui-scale, 1));
+        cursor: ns-resize;
+      }
+      .jk-pip-resize-w {
+        left: 0;
+        top: calc(20px * var(--jk-ui-scale, 1));
+        bottom: calc(24px * var(--jk-ui-scale, 1));
+        min-inline-size: calc(8px * var(--jk-ui-scale, 1));
+        cursor: ew-resize;
+      }
+      .jk-pip-resize-e {
+        right: 0;
+        top: calc(14px * var(--jk-ui-scale, 1));
+        bottom: calc(24px * var(--jk-ui-scale, 1));
+        min-inline-size: calc(8px * var(--jk-ui-scale, 1));
+        cursor: ew-resize;
+      }
+      #jk-pip-card.jk-pip-narrow .jk-pip-header-divider {
+        margin-inline: calc(6px * var(--jk-ui-scale, 1));
+      }
+      #jk-pip-card.jk-pip-narrow .jk-pip-primary-group,
+      #jk-pip-card.jk-pip-narrow .jk-pip-secondary-group {
+        display: contents;
+      }
+      #jk-pip-card.jk-pip-narrow .jk-pip-buttons-row {
+        justify-content: flex-start;
+      }
+      #jk-pip-card.jk-pip-narrow .jk-pip-buttons-row,
+      #jk-pip-card.jk-pip-narrow .jk-pip-btn-group {
+        gap: calc(4px * var(--jk-ui-scale, 1));
+      }
+      #jk-pip-card.jk-pip-narrow .jk-pip-ctrl-btn {
+        padding: calc(2px * var(--jk-ui-scale, 1)) calc(6px * var(--jk-ui-scale, 1));
+        font-size: calc(10.5px * var(--jk-ui-scale, 1));
+      }
+      #jk-pip-card.jk-pip-narrow .jk-pip-select {
+        padding: calc(2px * var(--jk-ui-scale, 1)) calc(4px * var(--jk-ui-scale, 1));
+        font-size: calc(10.5px * var(--jk-ui-scale, 1));
+      }
+      #jk-pip-card.jk-pip-narrow #jk-pip-play-pause {
+        min-inline-size: calc(46px * var(--jk-ui-scale, 1));
+      }
+      #jk-pip-card.jk-pip-narrow #jk-pip-camera {
+        min-inline-size: calc(54px * var(--jk-ui-scale, 1));
+      }
+      #jk-pip-card.jk-pip-xs #jk-pip-controls {
+        padding: calc(5px * var(--jk-ui-scale, 1)) calc(14px * var(--jk-ui-scale, 1)) calc(12px * var(--jk-ui-scale, 1));
+        gap: calc(4px * var(--jk-ui-scale, 1));
+      }
+      #jk-pip-card.jk-pip-xs #jk-pip-header {
+        padding: calc(2px * var(--jk-ui-scale, 1)) calc(6px * var(--jk-ui-scale, 1));
+        gap: calc(4px * var(--jk-ui-scale, 1));
+      }
+      #jk-pip-card.jk-pip-xs .jk-pip-hdr-btn {
+        padding: calc(2px * var(--jk-ui-scale, 1)) calc(5px * var(--jk-ui-scale, 1));
+      }
+      #jk-pip-card.jk-pip-xs #jk-pip-time {
+        min-inline-size: calc(60px * var(--jk-ui-scale, 1));
+        font-size: calc(10px * var(--jk-ui-scale, 1));
+      }
+      @container jk-card (max-width: 340px) {
+        .jk-pip-header-divider {
+          margin-inline: calc(6px * var(--jk-ui-scale, 1));
+        }
+        .jk-pip-hdr-btn {
+          padding: calc(2px * var(--jk-ui-scale, 1)) calc(5px * var(--jk-ui-scale, 1));
+        }
+      }
+      @container jk-card (max-width: 450px) {
+        .jk-pip-primary-group,
+        .jk-pip-secondary-group {
+          display: contents;
+        }
+        .jk-pip-buttons-row {
+          justify-content: flex-start;
+        }
+        .jk-pip-buttons-row,
+        .jk-pip-btn-group {
+          gap: calc(4px * var(--jk-ui-scale, 1));
+        }
+        .jk-pip-ctrl-btn {
+          padding: calc(2px * var(--jk-ui-scale, 1)) calc(6px * var(--jk-ui-scale, 1));
+          font-size: calc(10.5px * var(--jk-ui-scale, 1));
+        }
+        .jk-pip-select {
+          padding: calc(2px * var(--jk-ui-scale, 1)) calc(4px * var(--jk-ui-scale, 1));
+          font-size: calc(10.5px * var(--jk-ui-scale, 1));
+        }
+        #jk-pip-play-pause {
+          min-inline-size: calc(46px * var(--jk-ui-scale, 1));
+        }
+        #jk-pip-camera {
+          min-inline-size: calc(54px * var(--jk-ui-scale, 1));
+        }
+      }
+      @container jk-card (max-width: 310px) {
+        #jk-pip-controls {
+          padding: calc(5px * var(--jk-ui-scale, 1)) calc(14px * var(--jk-ui-scale, 1)) calc(12px * var(--jk-ui-scale, 1));
+          gap: calc(4px * var(--jk-ui-scale, 1));
+        }
+        #jk-pip-time {
+          min-inline-size: calc(60px * var(--jk-ui-scale, 1));
+          font-size: calc(10px * var(--jk-ui-scale, 1));
+        }
+        .jk-pip-ctrl-btn {
+          padding: calc(2px * var(--jk-ui-scale, 1)) calc(5px * var(--jk-ui-scale, 1));
+          font-size: calc(10px * var(--jk-ui-scale, 1));
+        }
       }
       @media (pointer: coarse) {
         #jk-pip-header {
-          min-block-size: calc(38px * var(--jk-ui-scale, 1));
+          min-block-size: calc(36px * var(--jk-ui-scale, 1));
           padding: calc(3px * var(--jk-ui-scale, 1)) calc(8px * var(--jk-ui-scale, 1));
         }
+        #jk-pip-controls,
+        #jk-pip-card.jk-pip-xs #jk-pip-controls {
+          padding: calc(5px * var(--jk-ui-scale, 1)) calc(16px * var(--jk-ui-scale, 1)) calc(14px * var(--jk-ui-scale, 1));
+        }
         .jk-pip-header-divider {
-          margin-inline: calc(15px * var(--jk-ui-scale, 1));
+          margin-inline: calc(10px * var(--jk-ui-scale, 1));
           height: calc(18px * var(--jk-ui-scale, 1));
         }
         .jk-pip-hdr-btn,
         .jk-pip-ctrl-btn,
         .jk-pip-select {
-          min-block-size: calc(32px * var(--jk-ui-scale, 1));
-          min-inline-size: calc(32px * var(--jk-ui-scale, 1));
-          padding: calc(3px * var(--jk-ui-scale, 1)) calc(7px * var(--jk-ui-scale, 1));
-          font-size: calc(11.5px * var(--jk-ui-scale, 1));
+          min-block-size: calc(28px * var(--jk-ui-scale, 1));
+          min-inline-size: calc(28px * var(--jk-ui-scale, 1));
+          padding: calc(3px * var(--jk-ui-scale, 1)) calc(6px * var(--jk-ui-scale, 1));
+          font-size: calc(11px * var(--jk-ui-scale, 1));
           border-radius: calc(4px * var(--jk-ui-scale, 1));
         }
+        #jk-pip-card.jk-pip-xs .jk-pip-hdr-btn,
+        #jk-pip-card.jk-pip-xs .jk-pip-ctrl-btn,
+        #jk-pip-card.jk-pip-xs .jk-pip-select {
+          min-block-size: calc(26px * var(--jk-ui-scale, 1));
+          min-inline-size: calc(26px * var(--jk-ui-scale, 1));
+          padding: calc(2px * var(--jk-ui-scale, 1)) calc(5px * var(--jk-ui-scale, 1));
+          font-size: calc(10.5px * var(--jk-ui-scale, 1));
+        }
         #jk-pip-play-pause {
-          min-inline-size: calc(58px * var(--jk-ui-scale, 1));
+          min-inline-size: calc(50px * var(--jk-ui-scale, 1));
         }
         .jk-pip-primary-group {
-          margin-inline-end: calc(8px * var(--jk-ui-scale, 1));
+          margin-inline-end: calc(6px * var(--jk-ui-scale, 1));
         }
         #jk-pip-seek,
         #jk-pip-volume {
           min-block-size: calc(24px * var(--jk-ui-scale, 1));
+        }
+        .jk-pip-resize-se,
+        .jk-pip-resize-sw {
+          min-inline-size: calc(28px * var(--jk-ui-scale, 1));
+          min-block-size: calc(28px * var(--jk-ui-scale, 1));
+        }
+        .jk-pip-resize-se::after,
+        .jk-pip-resize-sw::after {
+          inline-size: calc(15px * var(--jk-ui-scale, 1));
+          block-size: calc(15px * var(--jk-ui-scale, 1));
+        }
+        .jk-pip-resize-nw {
+          min-inline-size: calc(24px * var(--jk-ui-scale, 1));
+          min-block-size: calc(24px * var(--jk-ui-scale, 1));
+        }
+        .jk-pip-resize-s {
+          left: calc(28px * var(--jk-ui-scale, 1));
+          right: calc(28px * var(--jk-ui-scale, 1));
+          min-block-size: calc(12px * var(--jk-ui-scale, 1));
+        }
+        .jk-pip-resize-w,
+        .jk-pip-resize-e {
+          bottom: calc(28px * var(--jk-ui-scale, 1));
+          min-inline-size: calc(12px * var(--jk-ui-scale, 1));
         }
       }
     `;
@@ -803,7 +1064,7 @@
 
   function getVisualUnit(vp) {
     const scale = vp && Number(vp.scale) > 0.05 ? Number(vp.scale) : 1;
-    if (isCoarsePointer() || (vp && vp.width < MIN_WIDTH + 16)) {
+    if (isCoarsePointer() || (vp && vp.width < 340)) {
       return 1 / scale;
     }
     return 1;
@@ -817,19 +1078,19 @@
     if (physVpW < 580) {
       if (presetName === 'compact') {
         return {
-          width: Math.max(HARD_MIN_WIDTH, Math.round(physVpW * 0.78)),
-          height: Math.max(HARD_MIN_HEIGHT, Math.min(232, Math.round(physVpH * 0.44))),
+          width: Math.max(HARD_MIN_WIDTH, Math.round(physVpW * 0.67)),
+          height: Math.max(220, Math.min(240, Math.round(physVpH * 0.30))),
         };
       }
       if (presetName === 'large') {
         return {
           width: Math.max(HARD_MIN_WIDTH, Math.round(physVpW - 8)),
-          height: Math.max(HARD_MIN_HEIGHT, Math.min(340, Math.round(physVpH * 0.62))),
+          height: Math.max(296, Math.min(340, Math.round(physVpH * 0.43))),
         };
       }
       return {
-        width: Math.max(HARD_MIN_WIDTH, Math.round(physVpW * 0.94)),
-        height: Math.max(HARD_MIN_HEIGHT, Math.min(278, Math.round(physVpH * 0.52))),
+        width: Math.max(HARD_MIN_WIDTH, Math.round(physVpW * 0.83)),
+        height: Math.max(256, Math.min(288, Math.round(physVpH * 0.36))),
       };
     }
     return SIZE_PRESETS[presetName] || SIZE_PRESETS.default;
@@ -860,14 +1121,44 @@
 
   function clampSize(physWidth, physHeight, vpOverride) {
     const vp = vpOverride || getViewportRect();
-    const unit = getVisualUnit(vp);
+    const mobileDoc = isMobileDocMode();
+    const unit = mobileDoc && pipState.resizing ? pipState.mobileDocUnit || getVisualUnit(vp) : getVisualUnit(vp);
     const physVpW = vp.width / unit;
     const physVpH = vp.height / unit;
     const margin = physVpW < 440 ? 8 : 16;
-    const availW = Math.max(HARD_MIN_WIDTH, Math.floor(physVpW - margin));
-    const availH = Math.max(HARD_MIN_HEIGHT, Math.floor(physVpH - margin));
+    let availW = Math.max(HARD_MIN_WIDTH, Math.floor(physVpW - margin));
+    let availH = Math.max(HARD_MIN_HEIGHT, Math.floor(physVpH - margin));
+    if (mobileDoc) {
+      const layoutClientW = Math.max(
+        (document.documentElement && document.documentElement.clientWidth) || 0,
+        vp.width
+      );
+      const docMaxW = Math.floor(layoutClientW / unit) - margin;
+      availW = Math.max(
+        availW,
+        docMaxW,
+        pipState.resizing ? Math.ceil(pipState.resizeStartW) : 0
+      );
+      availH = Math.max(
+        availH,
+        pipState.resizing ? Math.ceil(pipState.resizeStartH) : 0
+      );
+    }
+    let minH = MIN_HEIGHT;
+    const cardEl = document.getElementById('jk-pip-card');
+    if (cardEl && !cardEl.hidden) {
+      const hdrEl = document.getElementById('jk-pip-header');
+      const ctrlEl = document.getElementById('jk-pip-controls');
+      if (hdrEl && ctrlEl) {
+        const chromeCssH =
+          hdrEl.getBoundingClientRect().height + ctrlEl.getBoundingClientRect().height;
+        if (chromeCssH > 0) {
+          minH = Math.max(minH, Math.ceil(chromeCssH / unit) + 68);
+        }
+      }
+    }
     const effMinW = Math.min(MIN_WIDTH, availW);
-    const effMinH = Math.min(MIN_HEIGHT, availH);
+    const effMinH = Math.min(minH, availH);
     const w = Math.max(effMinW, Math.min(availW, Math.round(physWidth)));
     const h = Math.max(effMinH, Math.min(availH, Math.round(physHeight)));
     return { width: w, height: h };
@@ -1070,6 +1361,7 @@
       const effW = forceLandscape ? fsH : fsW;
       const effH = forceLandscape ? fsW : fsH;
       card.classList.toggle('jk-pip-narrow', effW < 450);
+      card.classList.toggle('jk-pip-xs', effW < 310);
       targetW = Math.round(effW);
       targetH = Math.round(effH);
     } else if (pseudoFs) {
@@ -1079,6 +1371,7 @@
       const effW = forceLandscape ? physVpH : physVpW;
       const effH = forceLandscape ? physVpW : physVpH;
       card.classList.toggle('jk-pip-narrow', effW < 450);
+      card.classList.toggle('jk-pip-xs', effW < 310);
       card.style.left = Math.round(vp.left * 100) / 100 + 'px';
       card.style.top = Math.round(vp.top * 100) / 100 + 'px';
       card.style.right = 'auto';
@@ -1111,14 +1404,15 @@
     } else if (mobileDoc) {
       card.classList.remove('jk-pip-force-landscape');
       card.style.position = 'absolute';
-      const docUnit = pipState.mobileDocUnit || unit;
-      pipState.mobileDocUnit = docUnit;
       if (typeof pipState.x !== 'number' || typeof pipState.y !== 'number') {
         centerMobileCardInViewport(vp);
       }
+      const docUnit = pipState.mobileDocUnit || unit;
+      pipState.mobileDocUnit = docUnit;
       const cssW = Math.round(pipState.width * docUnit * 100) / 100;
       const cssH = Math.round(pipState.height * docUnit * 100) / 100;
       card.classList.toggle('jk-pip-narrow', pipState.width < 450);
+      card.classList.toggle('jk-pip-xs', pipState.width < 310);
       if (docUnit < 0.999) {
         card.style.setProperty('--jk-ui-scale', '1');
         card.style.width = Math.round(pipState.width * 100) / 100 + 'px';
@@ -1152,6 +1446,7 @@
       const cssH = Math.round(Math.min(vp.height, dims.height * unit) * 100) / 100;
 
       card.classList.toggle('jk-pip-narrow', dims.width < 450);
+      card.classList.toggle('jk-pip-xs', dims.width < 310);
       card.style.setProperty('--jk-ui-scale', '1');
       card.style.transform = 'none';
       card.style.width = cssW + 'px';
@@ -1287,14 +1582,21 @@
             <button type="button" id="jk-pip-camera" class="jk-pip-ctrl-btn${pipState.thirdPerson ? '' : ' active'}" title="Switch camera view (1st / 3rd person)" aria-label="${pipState.thirdPerson ? 'View: 3rd — Switch to first-person camera' : 'View: 1st — Switch to third-person camera'}">${pipState.thirdPerson ? 'View: 3rd' : 'View: 1st'}</button>
             <button type="button" id="jk-pip-start-over" class="jk-pip-ctrl-btn" title="Restart from 0:00" aria-label="0:00 — Restart from beginning">0:00</button>
           </div>
-          <div class="jk-pip-btn-group">
+          <div class="jk-pip-btn-group jk-pip-audio-group">
             <button type="button" id="jk-pip-mute" class="jk-pip-ctrl-btn" title="Mute / Unmute">Mute</button>
             <input type="range" id="jk-pip-volume" min="0" max="1" step="0.01" value="0.8" aria-label="Volume" />
             <button type="button" id="jk-pip-fullscreen" class="jk-pip-ctrl-btn" title="Fullscreen" aria-label="Fullscreen" aria-pressed="false">${ICON_FULLSCREEN_ENTER}</button>
           </div>
         </div>
       </div>
-      <div id="jk-pip-resize-handle" class="jk-pip-resize-handle" title="Resize player"></div>
+      <div class="jk-pip-resize-zone jk-pip-resize-nw" data-resize-dir="nw" aria-hidden="true" title="Resize player"></div>
+      <div class="jk-pip-resize-zone jk-pip-resize-n" data-resize-dir="n" aria-hidden="true"></div>
+      <div class="jk-pip-resize-zone jk-pip-resize-ne" data-resize-dir="ne" aria-hidden="true" title="Resize player"></div>
+      <div class="jk-pip-resize-zone jk-pip-resize-w" data-resize-dir="w" aria-hidden="true"></div>
+      <div class="jk-pip-resize-zone jk-pip-resize-e" data-resize-dir="e" aria-hidden="true"></div>
+      <div class="jk-pip-resize-zone jk-pip-resize-s" data-resize-dir="s" aria-hidden="true"></div>
+      <div id="jk-pip-resize-handle-sw" class="jk-pip-resize-zone jk-pip-resize-sw" data-resize-dir="sw" aria-hidden="true" title="Resize player"></div>
+      <div id="jk-pip-resize-handle" class="jk-pip-resize-zone jk-pip-resize-se" data-resize-dir="se" aria-hidden="true" title="Resize player"></div>
     `;
 
     document.body.appendChild(card);
@@ -1306,7 +1608,7 @@
   function bindPiPEvents(card) {
     const header = card.querySelector('#jk-pip-header');
     const dragHandle = card.querySelector('#jk-pip-drag-handle') || header;
-    const resizeHandle = card.querySelector('#jk-pip-resize-handle');
+    const resizeHandles = Array.from(card.querySelectorAll('.jk-pip-resize-zone'));
     const closeBtn = card.querySelector('#jk-pip-close');
     const playPauseBtn = card.querySelector('#jk-pip-play-pause');
     const startOverBtn = card.querySelector('#jk-pip-start-over');
@@ -1410,53 +1712,136 @@
     header.addEventListener('pointercancel', endHeaderDrag);
     window.addEventListener('pointercancel', endHeaderDrag);
 
-    // Keyboard accessibility on dedicated drag handle (Arrow keys move card by 20px)
+    // Keyboard accessibility on dedicated drag handle (Arrow keys move card by 20px; Shift+Arrow resizes)
     dragHandle.addEventListener('keydown', (e) => {
       if (isCardFullscreen()) return;
       const step = 20;
       if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) {
         syncCoordsFromDOM();
-        if (e.key === 'ArrowLeft') pipState.x -= step;
-        if (e.key === 'ArrowRight') pipState.x += step;
-        if (e.key === 'ArrowUp') pipState.y -= step;
-        if (e.key === 'ArrowDown') pipState.y += step;
+        if (e.shiftKey) {
+          pipState.preset = 'custom';
+          let nextW = pipState.width;
+          let nextH = pipState.height;
+          if (e.key === 'ArrowLeft') nextW -= step;
+          if (e.key === 'ArrowRight') nextW += step;
+          if (e.key === 'ArrowUp') nextH -= step;
+          if (e.key === 'ArrowDown') nextH += step;
+          const dims = clampSize(nextW, nextH);
+          pipState.width = dims.width;
+          pipState.height = dims.height;
+        } else {
+          if (e.key === 'ArrowLeft') pipState.x -= step;
+          if (e.key === 'ArrowRight') pipState.x += step;
+          if (e.key === 'ArrowUp') pipState.y -= step;
+          if (e.key === 'ArrowDown') pipState.y += step;
+        }
         applyCardGeometry();
         saveLayout();
         e.preventDefault();
       }
     });
 
-    // Resize handle via Pointer Events
-    resizeHandle.addEventListener('pointerdown', (e) => {
+    // Multi-edge / multi-corner resize handles via Pointer Events
+    const startResizeDrag = (handleEl, e) => {
       if (isCardFullscreen()) return;
       if (e.button !== 0 && e.pointerType === 'mouse') return;
-      syncCoordsFromDOM();
+      const vp = getViewportRect();
+      if (isMobileDocMode()) {
+        const rect = card.getBoundingClientRect();
+        const scrollX = Number(window.scrollX ?? window.pageXOffset) || 0;
+        const scrollY = Number(window.scrollY ?? window.pageYOffset) || 0;
+        const nextUnit = getVisualUnit(vp);
+        pipState.mobileDocUnit = nextUnit;
+        pipState.x = rect.left + scrollX;
+        pipState.y = rect.top + scrollY;
+        if (rect.width > 0) pipState.width = rect.width / nextUnit;
+        if (rect.height > 0) pipState.height = rect.height / nextUnit;
+      } else {
+        syncCoordsFromDOM();
+      }
       pipState.resizing = true;
+      pipState.resizeDir = (handleEl && handleEl.dataset && handleEl.dataset.resizeDir) || 'se';
+      pipState.resizeHandleEl = handleEl;
       pipState.resizePointerId = e.pointerId;
       pipState.resizeStartX = e.clientX;
       pipState.resizeStartY = e.clientY;
       pipState.resizeStartW = pipState.width;
       pipState.resizeStartH = pipState.height;
+      pipState.resizeStartCardX = pipState.x;
+      pipState.resizeStartCardY = pipState.y;
       pipState.preset = 'custom';
-      if (typeof resizeHandle.setPointerCapture === 'function') {
+      if (handleEl && typeof handleEl.setPointerCapture === 'function') {
         try {
-          resizeHandle.setPointerCapture(e.pointerId);
+          handleEl.setPointerCapture(e.pointerId);
         } catch (_) {}
       }
       e.preventDefault();
       e.stopPropagation();
-    });
+    };
 
     const onResizePointerMove = (e) => {
       if (!pipState.resizing) return;
       if (pipState.resizePointerId !== null && e.pointerId !== pipState.resizePointerId) return;
       const vp = getViewportRect();
-      const unit = isMobileDocMode() ? pipState.mobileDocUnit || getVisualUnit(vp) : getVisualUnit(vp);
-      const dw = (e.clientX - pipState.resizeStartX) / unit;
-      const dh = (e.clientY - pipState.resizeStartY) / unit;
-      const dims = clampSize(pipState.resizeStartW + dw, pipState.resizeStartH + dh, vp);
+      const mobileDoc = isMobileDocMode();
+      const unit = mobileDoc ? pipState.mobileDocUnit || getVisualUnit(vp) : getVisualUnit(vp);
+      const physVpW = vp.width / unit;
+      const marginCss = (physVpW < 440 ? 4 : 8) * unit;
+      const dx = (e.clientX - pipState.resizeStartX) / unit;
+      const dy = (e.clientY - pipState.resizeStartY) / unit;
+      const dir = pipState.resizeDir || 'se';
+      const hasW = dir.indexOf('w') !== -1;
+      const hasE = dir.indexOf('e') !== -1;
+      const hasN = dir.indexOf('n') !== -1;
+      const hasS = dir.indexOf('s') !== -1;
+
+      const anchorRight = pipState.resizeStartCardX + pipState.resizeStartW * unit;
+      const anchorBottom = pipState.resizeStartCardY + pipState.resizeStartH * unit;
+      const minLeft = mobileDoc ? 4 * unit : vp.left + marginCss;
+      const minTop = mobileDoc ? 4 * unit : vp.top + marginCss;
+
+      let rawW = pipState.resizeStartW;
+      if (hasW) {
+        const maxWestW = Math.max(HARD_MIN_WIDTH, (anchorRight - minLeft) / unit);
+        rawW = Math.min(pipState.resizeStartW - dx, maxWestW);
+      } else if (hasE) {
+        rawW = pipState.resizeStartW + dx;
+      }
+
+      let rawH = pipState.resizeStartH;
+      if (hasN) {
+        const maxNorthH = Math.max(HARD_MIN_HEIGHT, (anchorBottom - minTop) / unit);
+        rawH = Math.min(pipState.resizeStartH - dy, maxNorthH);
+      } else if (hasS) {
+        rawH = pipState.resizeStartH + dy;
+      }
+
+      const dims = clampSize(rawW, rawH, vp);
       pipState.width = dims.width;
       pipState.height = dims.height;
+
+      if (hasW) {
+        pipState.x = Math.round(Math.max(0, anchorRight - dims.width * unit) * 100) / 100;
+      } else if (hasE) {
+        if (mobileDoc) {
+          const layoutW = Math.max(
+            (document.documentElement && document.documentElement.clientWidth) || 0,
+            vp.pageLeft + vp.width,
+            pipState.resizeStartCardX + pipState.resizeStartW * unit + 4 * unit
+          );
+          const maxLeft = Math.max(0, layoutW - dims.width * unit - 4 * unit);
+          pipState.x = Math.round(Math.max(0, Math.min(pipState.resizeStartCardX, maxLeft)) * 100) / 100;
+        } else {
+          pipState.x = pipState.resizeStartCardX;
+        }
+      }
+
+      if (hasN) {
+        pipState.y = Math.round(Math.max(0, anchorBottom - dims.height * unit) * 100) / 100;
+      } else if (hasS) {
+        pipState.y = pipState.resizeStartCardY;
+      }
+
       applyCardGeometry();
     };
 
@@ -1466,20 +1851,25 @@
         return;
       }
       pipState.resizing = false;
-      if (e && typeof resizeHandle.releasePointerCapture === 'function' && pipState.resizePointerId !== null) {
+      const activeHandle = pipState.resizeHandleEl;
+      if (e && activeHandle && typeof activeHandle.releasePointerCapture === 'function' && pipState.resizePointerId !== null) {
         try {
-          resizeHandle.releasePointerCapture(pipState.resizePointerId);
+          activeHandle.releasePointerCapture(pipState.resizePointerId);
         } catch (_) {}
       }
+      pipState.resizeHandleEl = null;
       pipState.resizePointerId = null;
       saveLayout();
     };
 
-    resizeHandle.addEventListener('pointermove', onResizePointerMove);
+    resizeHandles.forEach((handleEl) => {
+      handleEl.addEventListener('pointerdown', (e) => startResizeDrag(handleEl, e));
+      handleEl.addEventListener('pointermove', onResizePointerMove);
+      handleEl.addEventListener('pointerup', endResizeDrag);
+      handleEl.addEventListener('pointercancel', endResizeDrag);
+    });
     window.addEventListener('pointermove', onResizePointerMove);
-    resizeHandle.addEventListener('pointerup', endResizeDrag);
     window.addEventListener('pointerup', endResizeDrag);
-    resizeHandle.addEventListener('pointercancel', endResizeDrag);
     window.addEventListener('pointercancel', endResizeDrag);
 
     // Size preset buttons
@@ -1959,13 +2349,14 @@
 
     // Separate engine vs wrapper versions so UI/JS updates do not invalidate cached openjk.wasm
     const ENGINE_ASSET_VERSION = '20261105c';
-    const PLAYER_ASSET_VERSION = '20261105e';
+    const PLAYER_ASSET_VERSION = '20261105g';
     window.JKDemoConfig = Object.assign(
       {
         preload: true,
         preloadOnly: true,
         autoPlay: false,
         muted: true,
+        preserveDocumentTitle: true,
         scriptUrl: `/jkplayer/openjk.js?v=${ENGINE_ASSET_VERSION}`,
         wasmUrl: `/jkplayer/openjk.wasm?v=${ENGINE_ASSET_VERSION}`,
         autoexecUrl: `/jkplayer/autoexec.cfg?v=${PLAYER_ASSET_VERSION}`,
@@ -2384,13 +2775,24 @@
     const pDims = getPresetSize(presetName, vp);
     pipState.width = pDims.width;
     pipState.height = pDims.height;
-    if (isMobileDocMode() && typeof pipState.x === 'number' && typeof pipState.y === 'number') {
+    if (isMobileDocMode()) {
       const nextUnit = getVisualUnit(vp);
       pipState.mobileDocUnit = nextUnit;
-      const cx = pipState.x + (oldW * oldUnit) / 2;
-      const cy = pipState.y + (oldH * oldUnit) / 2;
-      pipState.x = Math.max(0, Math.round((cx - (pDims.width * nextUnit) / 2) * 100) / 100);
-      pipState.y = Math.max(0, Math.round((cy - (pDims.height * nextUnit) / 2) * 100) / 100);
+      const newCssW = pDims.width * nextUnit;
+      const newCssH = pDims.height * nextUnit;
+      if (typeof pipState.x === 'number' && typeof pipState.y === 'number') {
+        const cx = pipState.x + (oldW * oldUnit) / 2;
+        const cy = pipState.y + (oldH * oldUnit) / 2;
+        const minVisX = vp.pageLeft + 4 * nextUnit;
+        const maxVisX = Math.max(minVisX, vp.pageLeft + vp.width - newCssW - 4 * nextUnit);
+        const minVisY = vp.pageTop + 4 * nextUnit;
+        const maxVisY = Math.max(minVisY, vp.pageTop + vp.height - newCssH - 4 * nextUnit);
+        pipState.x = Math.round(Math.max(minVisX, Math.min(maxVisX, cx - newCssW / 2)) * 100) / 100;
+        pipState.y = Math.round(Math.max(minVisY, Math.min(maxVisY, cy - newCssH / 2)) * 100) / 100;
+      } else {
+        pipState.x = Math.round((vp.pageLeft + Math.max(0, (vp.width - newCssW) / 2)) * 100) / 100;
+        pipState.y = Math.round((vp.pageTop + Math.max(0, (vp.height - newCssH) / 2)) * 100) / 100;
+      }
     }
     applyCardGeometry();
     saveLayout();
