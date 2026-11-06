@@ -11034,7 +11034,11 @@ static cvarTable_t		cvarTable[] = {
 
 	{ &ui_selectedModelIndex, "ui_selectedModelIndex", "16", CVAR_ARCHIVE|CVAR_INTERNAL },
 
+#ifdef __EMSCRIPTEN__
+	{ &ui_char_model,			"ui_char_model",		"kyle",CVAR_ROM|CVAR_INTERNAL},
+#else
 	{ &ui_char_model,			"ui_char_model",		"jedi_tf",CVAR_ROM|CVAR_INTERNAL},
+#endif
 	{ &ui_char_skin_head,		"ui_char_skin_head",	"head_a1",CVAR_ROM|CVAR_INTERNAL},
 	{ &ui_char_skin_torso,		"ui_char_skin_torso",	"torso_a1",CVAR_ROM|CVAR_INTERNAL}, 
 	{ &ui_char_skin_legs,		"ui_char_skin_legs",	"lower_a1",CVAR_ROM|CVAR_INTERNAL}, 

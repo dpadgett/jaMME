@@ -560,6 +560,10 @@ void S_Respatialize( int entityNum, const vec3_t head, vec3_t axis[3], int inwat
 	s_underWater = (qboolean)inwater;
 }
 
+#ifdef __EMSCRIPTEN__
+extern "C" qboolean FS_WasmIsFileCached( const char *qpath );
+#endif
+
 /*
 ============
 S_Update
@@ -588,7 +592,21 @@ void S_Update( void ) {
 	s_channelQueueCount = 0;
 	s_loopQueueCount = 0;
 	if ( s_background.override || (s_musicVolume && s_musicVolume->value > 0.0f) ) {
+#ifdef __EMSCRIPTEN__
+		qboolean bgCached = qtrue;
+		if ( s_background.playing ) {
+			if ( s_background.startName[0] && !FS_WasmIsFileCached( s_background.startName ) ) {
+				bgCached = qfalse;
+			} else if ( !s_background.override && s_background.loopName[0] && !FS_WasmIsFileCached( s_background.loopName ) ) {
+				bgCached = qfalse;
+			}
+		}
+		if ( bgCached ) {
+			s_background.reload = qfalse;
+		}
+#else
 		s_background.reload = qfalse;
+#endif
 	}
 	s_underWater = qfalse;
 }
@@ -649,6 +667,10 @@ background music functions
 */
 void S_StartBackgroundTrack( const char *intro, const char *loop, int bCalledByCGameStart ) {
 	qboolean soundExists;
+#ifdef __EMSCRIPTEN__
+	if ( !s_musicVolume || s_musicVolume->value <= 0.0f )
+		return;
+#endif
 	if ( !intro || !intro[0] || s_background.override )
 		return;
 	if ( !loop || !loop[0] ) 

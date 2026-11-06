@@ -554,6 +554,25 @@ void S_MixBackground( mixBackground_t *background, int speed, int count, int *ou
 		}
 		/* Do we need a reload */
 		if ( s_background.reload ) {
+#ifdef __EMSCRIPTEN__
+			if ( s_background.startName[0] && !FS_WasmIsFileCached( s_background.startName ) ) {
+				FS_WasmPrefetchFileAsync( s_background.startName );
+				if ( !s_background.override && s_background.loopName[0] && Q_stricmp( s_background.loopName, s_background.startName ) ) {
+					FS_WasmPrefetchFileAsync( s_background.loopName );
+				}
+				if ( count > 0 ) {
+					Com_Memset( output, 0, count * sizeof(int) * 2 );
+				}
+				return;
+			}
+			if ( !s_background.override && s_background.loopName[0] && !FS_WasmIsFileCached( s_background.loopName ) ) {
+				FS_WasmPrefetchFileAsync( s_background.loopName );
+				if ( count > 0 ) {
+					Com_Memset( output, 0, count * sizeof(int) * 2 );
+				}
+				return;
+			}
+#endif
 			/* Already playing, check if we already have the right one open */
 			if ( background->sound && Q_stricmp( background->soundName, s_background.startName )) {
 				S_SoundClose( background->sound );

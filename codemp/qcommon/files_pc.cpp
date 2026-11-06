@@ -3749,10 +3749,14 @@ static qboolean WasmPK3_IsPakFileCached( pack_t *pak, fileInPack_t *pakFile ) {
 	return qtrue;
 }
 
-EM_JS(void, wasm_js_prefetch_chunk_async, (const char *namePtr, int chunkIdx, int archSize), {
+EM_JS(void, wasm_js_prefetch_span_async, (const char *namePtr, int cStart, int cEnd, int archSize), {
 	try {
-		if (typeof window !== 'undefined' && typeof window.__jkPk3PrefetchChunkAsync === 'function') {
-			window.__jkPk3PrefetchChunkAsync(UTF8ToString(namePtr), chunkIdx, archSize);
+		if (typeof window !== 'undefined' && typeof window.__jkPk3PrefetchSpanAsync === 'function') {
+			window.__jkPk3PrefetchSpanAsync(UTF8ToString(namePtr), cStart, cEnd, archSize);
+		} else if (typeof window !== 'undefined' && typeof window.__jkPk3PrefetchChunkAsync === 'function') {
+			for (var c = cStart; c <= cEnd; c++) {
+				window.__jkPk3PrefetchChunkAsync(UTF8ToString(namePtr), c, archSize);
+			}
 		}
 	} catch (e) {}
 });
@@ -3785,10 +3789,19 @@ extern "C" void FS_WasmPrefetchFileAsync( const char *qpath ) {
 				WasmPk3Archive *arch = NULL;
 				unsigned long cStart = 0, cEnd = 0;
 				if ( WasmPK3_GetPakFileChunks( search->pack, pf, &arch, &cStart, &cEnd ) ) {
-					for ( unsigned long c = cStart; c <= cEnd; c++ ) {
-						if ( !arch->chunks[c] && !wasm_js_has_cached_chunk( arch->name, (int)c ) ) {
-							wasm_js_prefetch_chunk_async( arch->name, (int)c, (int)arch->size );
+					unsigned long c = cStart;
+					while ( c <= cEnd ) {
+						if ( arch->chunks[c] || wasm_js_has_cached_chunk( arch->name, (int)c ) ) {
+							c++;
+							continue;
 						}
+						unsigned long runStart = c;
+						unsigned long runEnd = c;
+						while ( runEnd + 1 <= cEnd && !arch->chunks[runEnd + 1] && !wasm_js_has_cached_chunk( arch->name, (int)(runEnd + 1) ) ) {
+							runEnd++;
+						}
+						wasm_js_prefetch_span_async( arch->name, (int)runStart, (int)runEnd, (int)arch->size );
+						c = runEnd + 1;
 					}
 				}
 				return;
@@ -4057,6 +4070,87 @@ static void WasmPK3_CollectModelFiles( const char *modelName, const char *extraS
 		if ( modBuf ) {
 			FS_FreeFile( modBuf );
 		}
+	} else if ( modPak && modPf && Q_stristr( cleanModel, ".glm" ) ) {
+		// Skinless .glm entities (e.g. CG_General in cg_ents.c:1407) load <dir>/model_default.skin
+		{
+			char skinDir[MAX_QPATH];
+			Q_strncpyz( skinDir, cleanModel, sizeof( skinDir ) );
+			char *lastSlash = strrchr( skinDir, '/' );
+			if ( lastSlash ) {
+				*(lastSlash + 1) = '\0';
+				WasmPK3_CollectSkinFile( va( "%smodel_default.skin", skinDir ), extraShaderText, outAllReady );
+				WasmPK3_MarkExactFile( va( "%smodel_default.g2skin", skinDir ), NULL, NULL );
+			}
+		}
+		if ( !WasmPK3_IsPakFileCached( modPak, modPf ) ) {
+			if ( outAllReady ) *outAllReady = qfalse;
+			return;
+		}
+		struct WasmMdxmHeader {
+			int ident;
+			int version;
+			char name[MAX_QPATH];
+			char animName[MAX_QPATH];
+			int animIndex;
+			int numBones;
+			int numLODs;
+			int ofsLODs;
+			int numSurfaces;
+			int ofsSurfHierarchy;
+			int ofsEnd;
+		};
+		struct WasmMdxmSurfHierarchy {
+			char name[MAX_QPATH];
+			unsigned int flags;
+			char shader[MAX_QPATH];
+			int shaderIndex;
+			int parentIndex;
+			int numChildren;
+			int childIndexes[1];
+		};
+		void *modBuf = NULL;
+		int modLen = FS_ReadFile( cleanModel, &modBuf );
+		if ( modBuf && modLen >= (int)sizeof(WasmMdxmHeader) ) {
+			WasmMdxmHeader *hdr = (WasmMdxmHeader *)modBuf;
+			const int mdxmIdent = ('2') | ('L' << 8) | ('G' << 16) | ('M' << 24);
+			if ( LittleLong( hdr->ident ) == mdxmIdent ) {
+				if ( hdr->animName[0] && Q_stricmp( hdr->animName, "*default" ) ) {
+					WasmPK3_MarkExactFile( va( "%s.gla", hdr->animName ), NULL, NULL );
+				}
+				int numSurfs = LittleLong( hdr->numSurfaces );
+				int ofsSurf = LittleLong( hdr->ofsSurfHierarchy );
+				for ( int s = 0; s < numSurfs && ofsSurf > 0 && ofsSurf + (int)offsetof(WasmMdxmSurfHierarchy, childIndexes) <= modLen; s++ ) {
+					WasmMdxmSurfHierarchy *surf = (WasmMdxmSurfHierarchy *)((byte *)modBuf + ofsSurf);
+					int numChildren = LittleLong( surf->numChildren );
+					if ( numChildren < 0 || numChildren > 1024 ) break;
+					size_t step = offsetof(WasmMdxmSurfHierarchy, childIndexes) + (size_t)numChildren * sizeof(int);
+					if ( ofsSurf + (int)step > modLen ) break;
+					if ( surf->shader[0] && surf->shader[0] != '*' ) {
+						R_WasmCollectShaderFiles( surf->shader, extraShaderText, WasmPK3_MarkImageOrSoundOrFile );
+					}
+					ofsSurf += (int)step;
+				}
+			}
+		}
+		if ( modBuf ) {
+			FS_FreeFile( modBuf );
+		}
+	}
+}
+
+static void WasmPK3_CollectModelsInPrefix( const char *prefix, const char *extraShaderText, qboolean *outAllReady ) {
+	if ( !prefix || !prefix[0] ) return;
+	size_t plen = strlen( prefix );
+	for ( searchpath_t *sp = fs_searchpaths; sp; sp = sp->next ) {
+		if ( !sp->pack || !sp->pack->buildBuffer ) continue;
+		for ( int i = 0; i < sp->pack->numfiles; i++ ) {
+			fileInPack_t *pf = &sp->pack->buildBuffer[i];
+			if ( pf->name && !Q_stricmpn( pf->name, prefix, (int)plen ) ) {
+				if ( Q_stristr( pf->name, ".md3" ) || Q_stristr( pf->name, ".glm" ) ) {
+					WasmPK3_CollectModelFiles( pf->name, extraShaderText, outAllReady );
+				}
+			}
+		}
 	}
 }
 
@@ -4262,7 +4356,7 @@ extern "C" const char *FS_WasmPlanDemoChunks(
 									if ( !tok[0] || tok[0] == '}' ) break;
 									Q_strncpyz( key, tok, sizeof( key ) );
 									tok = COM_ParseExt( &p, qfalse );
-									if ( !Q_stricmp( key, "model" ) && tok[0] && tok[0] != '*' ) {
+									if ( ( !Q_stricmp( key, "model" ) || !Q_stricmp( key, "model2" ) ) && tok[0] && tok[0] != '*' ) {
 										WasmPK3_CollectModelFiles( tok, extraShaderText, &bspReady );
 									} else if ( !Q_stricmp( key, "fxFile" ) && tok[0] && tok[0] != '*' ) {
 										WasmPK3_CollectEfxFile( tok, extraShaderText, &bspReady, 0 );
@@ -4320,7 +4414,6 @@ extern "C" const char *FS_WasmPlanDemoChunks(
 	}
 	static const char * const s_mpCommonExactFiles[] = {
 		"models/players/stormtrooper/caps.tga",
-		"models/map_objects/imp_mine/turret_chair_dmg.tga",
 		"sound/movers/objects/saber_slam.mp3",
 		"sound/movers/objects/objectHit.wav",
 		"sound/ambience/spark5.wav",
@@ -4345,7 +4438,20 @@ extern "C" const char *FS_WasmPlanDemoChunks(
 	for ( size_t i = 0; i < sizeof( s_mpCommonExactFiles ) / sizeof( s_mpCommonExactFiles[0] ); i++ ) {
 		WasmPK3_MarkExactFile( s_mpCommonExactFiles[i], NULL, NULL );
 	}
-	WasmPK3_MarkImageOrSoundOrFile( "menu/art/3_cursor2" );
+	static const char * const s_mpCommonShaders[] = {
+		"models/map_objects/imp_mine/turret_chair_dmg",
+		"menu/art/3_cursor2",
+		"menu/art/unknownmap_mp",
+		"menu/new/crosshairb",
+		"menu/new/slider",
+		"menu/new/sliderthumb"
+	};
+	for ( size_t i = 0; i < sizeof( s_mpCommonShaders ) / sizeof( s_mpCommonShaders[0] ); i++ ) {
+		R_WasmCollectShaderFiles( s_mpCommonShaders[i], extraShaderText, WasmPK3_MarkImageOrSoundOrFile );
+	}
+	WasmPK3_CollectModelsInPrefix( "models/weapons2/", extraShaderText, &bspReady );
+	WasmPK3_CollectModelsInPrefix( "models/items/", extraShaderText, &bspReady );
+	WasmPK3_CollectModelsInPrefix( "models/map_objects/mp/", extraShaderText, &bspReady );
 	WasmPK3_CollectPlayerFiles( "kyle/default", extraShaderText, &bspReady );
 
 	static const char * const s_mpCommonEffects[] = {
@@ -4428,17 +4534,35 @@ extern "C" const char *FS_WasmPlanDemoChunks(
 				R_WasmCollectShaderFiles( gs->stringData + ofs, extraShaderText, WasmPK3_MarkImageOrSoundOrFile );
 			}
 		}
+		int gametype = 0;
+		if ( gs->stringOffsets[0] >= 0 && gs->stringData[gs->stringOffsets[0]] ) {
+			const char *gtStr = Info_ValueForKey( gs->stringData + gs->stringOffsets[0], "g_gametype" );
+			if ( gtStr && gtStr[0] ) {
+				gametype = atoi( gtStr );
+			}
+		}
 		for ( int i = 0; i < MAX_CLIENTS; i++ ) {
 			int ofs = gs->stringOffsets[1131 + i];
 			if ( ofs > 0 && gs->stringData[ofs] ) {
 				const char *pinfo = gs->stringData + ofs;
-				const char *model = Info_ValueForKey( pinfo, "model" );
-				if ( model && model[0] ) {
-					WasmPK3_CollectPlayerFiles( model, extraShaderText, &bspReady );
+				const char *shOverride = Info_ValueForKey( pinfo, "shader" );
+				if ( shOverride && shOverride[0] && !( shOverride[0] == '2' && !shOverride[1] ) ) {
+					R_WasmCollectShaderFiles( shOverride, extraShaderText, WasmPK3_MarkImageOrSoundOrFile );
 				}
-				const char *hmodel = Info_ValueForKey( pinfo, "hmodel" );
-				if ( hmodel && hmodel[0] && ( !model || Q_stricmp( hmodel, model ) ) ) {
-					WasmPK3_CollectPlayerFiles( hmodel, extraShaderText, &bspReady );
+				const char *fxOverride = Info_ValueForKey( pinfo, "effect" );
+				if ( fxOverride && fxOverride[0] ) {
+					WasmPK3_CollectEfxFile( fxOverride, extraShaderText, &bspReady, 0 );
+				}
+				// In Emscripten builds, CG_NewClientInfo forces all non-Siege (g_gametype != 7) players to kyle
+				if ( gametype == 7 ) {
+					const char *model = Info_ValueForKey( pinfo, "model" );
+					if ( model && model[0] ) {
+						WasmPK3_CollectPlayerFiles( model, extraShaderText, &bspReady );
+					}
+					const char *hmodel = Info_ValueForKey( pinfo, "hmodel" );
+					if ( hmodel && hmodel[0] && ( !model || Q_stricmp( hmodel, model ) ) ) {
+						WasmPK3_CollectPlayerFiles( hmodel, extraShaderText, &bspReady );
+					}
 				}
 			}
 		}

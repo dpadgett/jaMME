@@ -53,6 +53,20 @@
       flex-direction: column;
       gap: 10px;
     }
+    main:fullscreen,
+    main:-webkit-full-screen,
+    main.jk-host-pseudo-fs {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      width: 100dvw;
+      height: 100dvh;
+      margin: 0;
+      padding: 8px;
+      background-color: var(--bg-primary);
+      z-index: 99999;
+    }
     #jk-player-pane {
       position: relative;
       flex: 1 1 auto;
@@ -73,6 +87,7 @@
       height: 100% !important;
       background: #000;
       outline: none;
+      cursor: pointer;
     }
     #jk-controls-bar {
       flex: 0 0 auto;
@@ -93,8 +108,21 @@
       border: 1px solid var(--border-color);
       border-radius: 4px;
       padding: 6px 12px;
+      min-block-size: 28px;
+      min-inline-size: 28px;
       font-size: 13px;
       cursor: pointer;
+    }
+    #btn-play-pause {
+      min-inline-size: 78px;
+      font-weight: 600;
+    }
+    @media (pointer: coarse) {
+      button, select {
+        min-block-size: 36px;
+        min-inline-size: 36px;
+        padding: 8px 14px;
+      }
     }
     button:hover {
       border-color: var(--accent-hover);
@@ -136,18 +164,13 @@
     </div>
 
     <div id="jk-controls-bar">
-      <div class="control-group">
+      <div class="control-group" style="margin-inline-end: 8px;">
         <button id="btn-play-pause" type="button">Pause</button>
-        <button id="btn-start-over" type="button" title="Restart from 0:00">⏮ 0:00</button>
       </div>
 
       <div class="control-group" style="flex: 1 1 200px; min-width: 180px;">
-        <input id="slider-seek" type="range" min="0" max="1000" step="50" value="0" style="flex: 1 1 auto;" />
+        <input id="slider-seek" type="range" min="0" max="1000" step="50" value="0" aria-label="Seek timeline" style="flex: 1 1 auto;" />
         <span id="time-display" style="font-family: ui-monospace, monospace; font-size: 12px; min-width: 85px;">00:00 / 00:00</span>
-      </div>
-
-      <div class="control-group">
-        <button id="btn-loop" type="button" aria-pressed="true">Loop: On</button>
       </div>
 
       <div class="control-group">
@@ -159,12 +182,16 @@
           <option value="2">2.0x</option>
           <option value="4">4.0x</option>
         </select>
+        <button id="btn-loop" type="button" aria-pressed="true">Loop: On</button>
+        <button id="btn-camera" type="button" title="Switch camera view (1st / 3rd person)" aria-label="View: 3rd — Switch to first-person camera">View: 3rd</button>
+        <button id="btn-start-over" type="button" title="Restart from 0:00" aria-label="0:00 — Restart from beginning">⏮ 0:00</button>
       </div>
 
       <div class="control-group">
         <button id="btn-mute" type="button">Mute</button>
         <label for="slider-volume">Vol:</label>
         <input id="slider-volume" type="range" min="0" max="1" step="0.05" value="0.8" />
+        <button id="btn-fullscreen" type="button" aria-pressed="false">Fullscreen</button>
       </div>
 
       <div class="control-group">

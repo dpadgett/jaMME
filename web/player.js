@@ -14,11 +14,16 @@
   const MAX_SPEED = 20.0;
 
   const BOOT_START_MS = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  const DEFAULT_ENGINE_VERSION = '20261105c';
+  const DEFAULT_PLAYER_VERSION = '20261105e';
+  const EXPECTED_OPENJK_JS_BYTES = 307440;
+  const EXPECTED_OPENJK_WASM_BYTES = 5190856;
   const WASM_PK3_CHUNK_SIZE = 256 * 1024;
   const IDB_NAME = 'openjk-cache-v1';
   const IDB_VERSION = 1;
   const LS_MANIFEST_KEY = 'openjk_pk3_manifest_v2';
   const LS_HOT_CHUNKS_KEY = 'openjk_hot_chunks_v1';
+  const LS_SYNC_FALLBACK_KEY = 'openjk_sync_fallback_chunks_v1';
   const LS_PREFS_KEY = 'openjk_player_prefs_v1';
 
   const state = {
@@ -26,6 +31,7 @@
     interactiveMode: false,
     paused: false,
     loop: true,
+    thirdPerson: true,
     speed: 1.0,
     muted: false,
     volume: 0.8,
@@ -42,6 +48,11 @@
     audioContexts: [],
     masterGains: [],
     engineStarted: false,
+    engineBootStage: 'idle',
+    engineBootError: '',
+    engineDownloadLoaded: 0,
+    engineDownloadTotal: 0,
+    engineLastProgressAt: 0,
     prewarmed: false,
     preloadOnly: false,
     demoLoadedOnce: false,
@@ -90,6 +101,9 @@
         if (typeof prefs.loop === 'boolean') {
           state.loop = prefs.loop;
         }
+        if (typeof prefs.thirdPerson === 'boolean') {
+          state.thirdPerson = prefs.thirdPerson;
+        }
       }
     } catch (_) {}
   }
@@ -104,8 +118,28 @@
           muted: state.muted,
           volume: state.volume,
           loop: state.loop,
+          thirdPerson: state.thirdPerson,
         })
       );
+    } catch (_) {}
+  }
+
+  function persistPrefField(key, value) {
+    try {
+      let existing = {};
+      const raw = localStorage.getItem(LS_PREFS_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') existing = parsed;
+      } else {
+        existing = {
+          speed: state.speed,
+          volume: state.volume,
+          loop: state.loop,
+        };
+      }
+      existing[key] = value;
+      localStorage.setItem(LS_PREFS_KEY, JSON.stringify(existing));
     } catch (_) {}
   }
 
@@ -168,7 +202,27 @@
       const r = cfg.renderer.toLowerCase();
       forceSoftwareRenderer = r === 'software' || r === 'sw' || r === 'cpu';
     }
-    return { demo, speed, muted, volume, forceSoftwareRenderer, preloadOnly, bypassCache };
+    let thirdPerson = state.thirdPerson;
+    let hasExplicitThirdPerson = false;
+    if (params.has('thirdPerson')) {
+      const tp = String(params.get('thirdPerson') || '').toLowerCase();
+      thirdPerson = !(tp === '0' || tp === 'false' || tp === 'no');
+      hasExplicitThirdPerson = true;
+    } else if (typeof cfg.thirdPerson === 'boolean') {
+      thirdPerson = cfg.thirdPerson;
+      hasExplicitThirdPerson = true;
+    }
+    return {
+      demo,
+      speed,
+      muted,
+      volume,
+      thirdPerson,
+      hasExplicitThirdPerson,
+      forceSoftwareRenderer,
+      preloadOnly,
+      bypassCache,
+    };
   }
 
   function isQueryDemoUrl(input) {
@@ -196,6 +250,7 @@
   state.speed = initialCfg.speed;
   state.muted = initialCfg.muted;
   state.volume = initialCfg.volume;
+  state.thirdPerson = Boolean(initialCfg.thirdPerson);
   state.forceSoftwareRenderer = Boolean(initialCfg.forceSoftwareRenderer);
   state.preloadOnly = Boolean(initialCfg.preloadOnly);
   state.bypassCache = Boolean(initialCfg.bypassCache);
@@ -1503,6 +1558,11 @@
         console.info('[OpenJK] Hardware WebGL unavailable; using Canvas2D Software WebGL1 rasterizer.');
         this.__jkActiveWebGLContext = softCtx;
         this.__jkUsingSoftwareWebGL = true;
+        requestAnimationFrame(() => {
+          try {
+            resize();
+          } catch (_) {}
+        });
         return softCtx;
       }
     }
@@ -1521,8 +1581,10 @@
   }
 
   // 3. Intercept AudioContext creation so SDL2's ScriptProcessorNode connects through a master GainNode to destination
-  const OrigAudioContext = window.AudioContext || window.webkitAudioContext;
+  const OrigAudioContext =
+    window.__jkOrigAudioContext || window.AudioContext || window.webkitAudioContext;
   if (OrigAudioContext) {
+    window.__jkOrigAudioContext = OrigAudioContext;
     if (
       typeof window.AudioNode !== 'undefined' &&
       AudioNode.prototype &&
@@ -1544,9 +1606,127 @@
       };
     }
 
+    const instrumentAudioContext = function (ctx) {
+      if (!ctx) return ctx;
+      if (!ctx.__jkInstrumented) {
+        ctx.__jkInstrumented = true;
+        if (!state.audioContexts.includes(ctx)) {
+          state.audioContexts.push(ctx);
+        }
+        try {
+          if (typeof ctx.createGain === 'function' && !ctx.__jkMasterGain) {
+            const masterGain = ctx.createGain();
+            masterGain.gain.value = state.muted ? 0.0 : state.volume;
+            ctx.__jkMasterGain = masterGain;
+            masterGain.connect(ctx.destination);
+            state.masterGains.push(masterGain);
+          }
+        } catch (_) {}
+        if (typeof ctx.createScriptProcessor === 'function' && !ctx.__jkScriptProcWrapped) {
+          ctx.__jkScriptProcWrapped = true;
+          const origCreateScriptProc = ctx.createScriptProcessor.bind(ctx);
+          const spProtoDesc =
+            typeof window.ScriptProcessorNode !== 'undefined' && ScriptProcessorNode.prototype
+              ? Object.getOwnPropertyDescriptor(ScriptProcessorNode.prototype, 'onaudioprocess')
+              : null;
+          ctx.createScriptProcessor = function () {
+            const node = origCreateScriptProc(...arguments);
+            let rawCb = null;
+            let wrappedCb = null;
+            let fallbackListenerAttached = false;
+            Object.defineProperty(node, 'onaudioprocess', {
+              configurable: true,
+              enumerable: true,
+              get() {
+                return rawCb;
+              },
+              set(fn) {
+                if (typeof fn !== 'function') {
+                  rawCb = null;
+                  wrappedCb = null;
+                  if (spProtoDesc && typeof spProtoDesc.set === 'function') {
+                    spProtoDesc.set.call(node, null);
+                  }
+                  return;
+                }
+                rawCb = fn;
+                wrappedCb = function (audioProcessingEvent) {
+                  try {
+                    const outBuf = audioProcessingEvent && audioProcessingEvent.outputBuffer;
+                    if (outBuf) {
+                      const numCh = outBuf.numberOfChannels || 0;
+                      for (let ch = 0; ch < numCh; ch++) {
+                        outBuf.getChannelData(ch).fill(0);
+                      }
+                    }
+                    if (
+                      state.paused ||
+                      state.seeking ||
+                      isPageHidden() ||
+                      (window.Module &&
+                        window.Module.Asyncify &&
+                        window.Module.Asyncify.state !== 0)
+                    ) {
+                      return;
+                    }
+                    fn.call(this, audioProcessingEvent);
+                  } catch (_) {}
+                };
+                if (spProtoDesc && typeof spProtoDesc.set === 'function') {
+                  spProtoDesc.set.call(node, wrappedCb);
+                } else if (!fallbackListenerAttached && typeof node.addEventListener === 'function') {
+                  fallbackListenerAttached = true;
+                  node.addEventListener('audioprocess', function (ev) {
+                    if (wrappedCb) wrappedCb.call(node, ev);
+                  });
+                }
+              },
+            });
+            return node;
+          };
+        }
+        if (typeof ctx.addEventListener === 'function' && !ctx.__jkStateListenerAttached) {
+          ctx.__jkStateListenerAttached = true;
+          let lastCtxState = ctx.state;
+          ctx.addEventListener('statechange', () => {
+            if (lastCtxState !== 'running' && ctx.state === 'running' && !state.muted) {
+              window.__jkAudioJustUnlockedAt = Date.now();
+            }
+            lastCtxState = ctx.state;
+            try {
+              window.dispatchEvent(
+                new CustomEvent('jkdemo:audiostate', { detail: { state: ctx.state } })
+              );
+            } catch (_) {}
+          });
+        }
+      }
+      if (ctx.__jkMasterGain) {
+        try {
+          ctx.__jkMasterGain.gain.value = state.muted ? 0.0 : state.volume;
+        } catch (_) {}
+      }
+      if (!state.muted && typeof ctx.resume === 'function' && ctx.state !== 'running') {
+        ctx.resume().catch(() => {});
+      }
+      return ctx;
+    };
+
+    if (window.__jkSharedAudioCtx && window.__jkSharedAudioCtx.state !== 'closed') {
+      instrumentAudioContext(window.__jkSharedAudioCtx);
+    }
+
     const WrappedAudioContext = function () {
       let ctx;
-      if (arguments.length === 0) {
+      if (
+        arguments.length === 0 &&
+        window.__jkSharedAudioCtx &&
+        !window.__jkSharedAudioCtx.__jkClaimedBySdl &&
+        window.__jkSharedAudioCtx.state !== 'closed'
+      ) {
+        ctx = window.__jkSharedAudioCtx;
+        ctx.__jkClaimedBySdl = true;
+      } else if (arguments.length === 0) {
         try {
           ctx = new OrigAudioContext({ sampleRate: 44100, latencyHint: 'interactive' });
         } catch (_) {
@@ -1559,64 +1739,7 @@
       } else {
         ctx = new OrigAudioContext(...arguments);
       }
-      state.audioContexts.push(ctx);
-      try {
-        if (typeof ctx.createGain === 'function') {
-          const masterGain = ctx.createGain();
-          masterGain.gain.value = state.muted ? 0.0 : state.volume;
-          ctx.__jkMasterGain = masterGain;
-          masterGain.connect(ctx.destination);
-          state.masterGains.push(masterGain);
-        }
-      } catch (_) {}
-      if (!state.muted && typeof ctx.resume === 'function') {
-        ctx.resume().catch(() => {});
-      }
-      if (typeof ctx.createScriptProcessor === 'function' && !ctx.__jkScriptProcWrapped) {
-        ctx.__jkScriptProcWrapped = true;
-        const origCreateScriptProc = ctx.createScriptProcessor.bind(ctx);
-        ctx.createScriptProcessor = function () {
-          const node = origCreateScriptProc(...arguments);
-          let userCb = null;
-          Object.defineProperty(node, 'onaudioprocess', {
-            configurable: true,
-            enumerable: true,
-            get() {
-              return userCb;
-            },
-            set(fn) {
-              if (typeof fn !== 'function') {
-                userCb = null;
-                return;
-              }
-              userCb = function (audioProcessingEvent) {
-                try {
-                  const outBuf = audioProcessingEvent && audioProcessingEvent.outputBuffer;
-                  if (outBuf) {
-                    const numCh = outBuf.numberOfChannels || 0;
-                    for (let ch = 0; ch < numCh; ch++) {
-                      outBuf.getChannelData(ch).fill(0);
-                    }
-                  }
-                  if (
-                    state.paused ||
-                    state.seeking ||
-                    isPageHidden() ||
-                    (window.Module &&
-                      window.Module.Asyncify &&
-                      window.Module.Asyncify.state !== 0)
-                  ) {
-                    return;
-                  }
-                  fn.call(this, audioProcessingEvent);
-                } catch (_) {}
-              };
-            },
-          });
-          return node;
-        };
-      }
-      return ctx;
+      return instrumentAudioContext(ctx);
     };
     WrappedAudioContext.prototype = OrigAudioContext.prototype;
     Object.setPrototypeOf(WrappedAudioContext, OrigAudioContext);
@@ -1628,7 +1751,10 @@
     const unlockAudioOnGesture = function (ev) {
       if (state.muted && !(ev && ev.isTrusted)) return;
       for (const ctx of state.audioContexts) {
-        if (ctx && ctx.state === 'suspended' && typeof ctx.resume === 'function') {
+        if (ctx && ctx.state !== 'running' && typeof ctx.resume === 'function') {
+          if (!state.muted) {
+            window.__jkAudioJustUnlockedAt = Date.now();
+          }
           ctx.resume().catch(() => {});
         }
       }
@@ -1666,7 +1792,11 @@
       type === 'mouseup' ||
       type === 'mousemove' ||
       type === 'wheel' ||
-      type === 'mousewheel'
+      type === 'mousewheel' ||
+      type === 'touchstart' ||
+      type === 'touchmove' ||
+      type === 'touchend' ||
+      type === 'touchcancel'
     ) {
       if (!state.interactiveMode) return true;
     }
@@ -1676,6 +1806,8 @@
   let interceptingEmscriptenListeners = false;
   const origWinAddEventListener = window.addEventListener;
   const origDocAddEventListener = document.addEventListener;
+  const origElAddEventListener =
+    typeof Element !== 'undefined' && Element.prototype ? Element.prototype.addEventListener : null;
 
   function isPageHidden() {
     return Boolean(
@@ -1740,14 +1872,32 @@
           type === 'mousemove' ||
           type === 'wheel' ||
           type === 'mousewheel' ||
+          type === 'touchstart' ||
+          type === 'touchmove' ||
+          type === 'touchend' ||
+          type === 'touchcancel' ||
           type === 'blur' ||
           type === 'focusout' ||
           type === 'focus' ||
           type === 'focusin' ||
           type === 'visibilitychange' ||
           type === 'pagehide' ||
-          type === 'pageshow')
+          type === 'pageshow' ||
+          type === 'resize' ||
+          type === 'fullscreenchange' ||
+          type === 'webkitfullscreenchange')
       ) {
+        const isResizeOrFullscreen =
+          type === 'resize' || type === 'fullscreenchange' || type === 'webkitfullscreenchange';
+        if (isResizeOrFullscreen) {
+          let fnSrc = '';
+          try {
+            fnSrc = Function.prototype.toString.call(listener);
+          } catch (_) {}
+          if (!/JSEvents\.|dynCall_/.test(fnSrc)) {
+            return origFn.call(this, type, listener, options);
+          }
+        }
         const wrapped = function (ev) {
           if (
             type === 'blur' ||
@@ -1756,10 +1906,11 @@
             type === 'focusin' ||
             type === 'visibilitychange' ||
             type === 'pagehide' ||
-            type === 'pageshow'
+            type === 'pageshow' ||
+            isResizeOrFullscreen
           ) {
-            // Never let Emscripten/SDL2 visibilitychange or blur invoke dynCall into Wasm
-            // during Asyncify or backgrounding; player.js manages visibility lifecycle cleanly.
+            // Never let Emscripten/SDL2 visibility, resize, or fullscreen callbacks invoke dynCall
+            // into Wasm during Asyncify or overwrite HiDPI canvas.width/height back to 1x CSS px.
             return;
           }
           if (shouldBlockSDLInput(ev)) {
@@ -1775,6 +1926,20 @@
 
   window.addEventListener = wrapEventTargetAdd(origWinAddEventListener);
   document.addEventListener = wrapEventTargetAdd(origDocAddEventListener);
+  if (origElAddEventListener && typeof HTMLCanvasElement !== 'undefined' && HTMLCanvasElement.prototype) {
+    HTMLCanvasElement.prototype.addEventListener = function (type, listener, options) {
+      if (this && this.id === 'jk-canvas') {
+        let fnSrc = '';
+        try {
+          fnSrc = Function.prototype.toString.call(listener);
+        } catch (_) {}
+        if (/JSEvents\.|dynCall_/.test(fnSrc)) {
+          return wrapEventTargetAdd(origElAddEventListener).call(this, type, listener, options);
+        }
+      }
+      return origElAddEventListener.call(this, type, listener, options);
+    };
+  }
 
   // Helper to call exported Wasm C functions safely
   function callWasm(fnName, returnType, argTypes, args) {
@@ -1826,9 +1991,13 @@
   const DEFAULT_AUTOEXEC_CFG = [
     '// Fallback autoexec.cfg',
     'set cg_draw2D "1"',
+    'set cg_drawTimer "1"',
+    'set cg_drawRadar "0"',
+    'set cg_drawTeamOverlay "1"',
     'set cg_simpleItems "1"',
     'set cg_fov "80"',
     'set cg_fovAspectAdjust "1"',
+    'set cg_thirdPerson "1"',
     'set cg_shadows "1"',
     'set r_dynamiclight "1"',
     'set r_drawfog "0"',
@@ -1864,25 +2033,36 @@
     return true;
   }
 
-  async function fetchAutoexecConfig(wasmDir) {
+  async function fetchAutoexecConfig(wasmDir, querySuffix) {
     const cfg = window.JKDemoConfig || {};
+    const q =
+      typeof querySuffix === 'string' && querySuffix
+        ? querySuffix
+        : `?v=${DEFAULT_PLAYER_VERSION}`;
+    const withQuery = (u) => (q && !u.includes('?') ? u + q : u);
     const candidates = [];
     if (typeof cfg.autoexecUrl === 'string' && cfg.autoexecUrl) {
-      candidates.push(cfg.autoexecUrl);
+      candidates.push(withQuery(cfg.autoexecUrl));
     }
     if (wasmDir) {
-      const dirCandidate = wasmDir + 'autoexec.cfg';
+      const dirCandidate = withQuery(wasmDir + 'autoexec.cfg');
       if (!candidates.includes(dirCandidate)) candidates.push(dirCandidate);
     }
-    if (!candidates.includes('/jkplayer/autoexec.cfg')) {
-      candidates.push('/jkplayer/autoexec.cfg');
+    const jkCandidate = withQuery('/jkplayer/autoexec.cfg');
+    if (!candidates.includes(jkCandidate)) {
+      candidates.push(jkCandidate);
     }
-    if (!candidates.includes('/autoexec.cfg')) {
-      candidates.push('/autoexec.cfg');
+    const rootCandidate = withQuery('/autoexec.cfg');
+    if (!candidates.includes(rootCandidate)) {
+      candidates.push(rootCandidate);
     }
     for (const url of candidates) {
       try {
-        const resp = await fetch(url, { cache: 'no-cache' });
+        const fetchOpts = url.includes('?') ? {} : { cache: 'no-cache' };
+        if (state.preloadOnly && !state.demoLoadedOnce) {
+          fetchOpts.priority = 'low';
+        }
+        const resp = await fetch(url, fetchOpts);
         if (resp && resp.ok) {
           const text = await resp.text();
           if (text && !/^\s*<!doctype html/i.test(text) && !/^\s*<html/i.test(text)) {
@@ -1896,8 +2076,12 @@
 
   async function reloadAutoexec() {
     const text = await fetchAutoexecConfig();
-    writeConfigToFS('autoexec.cfg', text);
+    writeConfigToFS(
+      'autoexec.cfg',
+      text + `\nset cg_thirdPerson "${state.thirdPerson ? '1' : '0'}"\n`
+    );
     execCommand('exec autoexec.cfg');
+    syncCameraModeToEngine();
     return text;
   }
 
@@ -1964,7 +2148,44 @@
     }
   }
 
+  const syncFallbackChunkSet = new Set();
+  let syncFallbackSaveTimer = 0;
+
+  function loadSyncFallbackList() {
+    try {
+      const raw = localStorage.getItem(LS_SYNC_FALLBACK_KEY);
+      if (!raw) return;
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) {
+        for (const item of arr) {
+          if (typeof item === 'string' && item.includes(':')) {
+            syncFallbackChunkSet.add(item);
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  function recordSyncFallbackChunk(pk3Name, chunkIdx) {
+    const key = pk3Name + ':' + chunkIdx;
+    if (syncFallbackChunkSet.has(key)) return;
+    if (syncFallbackChunkSet.size >= 128) return;
+    syncFallbackChunkSet.add(key);
+    if (!syncFallbackSaveTimer) {
+      syncFallbackSaveTimer = setTimeout(() => {
+        syncFallbackSaveTimer = 0;
+        try {
+          localStorage.setItem(
+            LS_SYNC_FALLBACK_KEY,
+            JSON.stringify(Array.from(syncFallbackChunkSet))
+          );
+        } catch (_) {}
+      }, 400);
+    }
+  }
+
   loadHotChunkList();
+  loadSyncFallbackList();
 
   function openCacheDB() {
     if (state.bypassCache || typeof indexedDB === 'undefined') {
@@ -2270,7 +2491,7 @@
     return copyLen;
   };
 
-  window.__jkPk3OnRangeFetched = function (name, start, end, subarray) {
+  window.__jkPk3OnRangeFetched = function (name, start, end, subarray, isAsyncFetch) {
     if (!subarray || subarray.byteLength === 0) return;
     if (start % WASM_PK3_CHUNK_SIZE === 0) {
       let c = (start / WASM_PK3_CHUNK_SIZE) | 0;
@@ -2282,6 +2503,9 @@
         pk3ChunkCache.set(mapKey, copy);
         queueIdbChunkWrite('chunk:' + mapKey, copy);
         recordHotChunk(name, c);
+        if (!isAsyncFetch) {
+          recordSyncFallbackChunk(name, c);
+        }
       }
     } else {
       const copy = new Uint8Array(subarray.byteLength);
@@ -2293,25 +2517,55 @@
   };
 
   const asyncChunkPrefetchInFlight = new Set();
-  window.__jkPk3PrefetchChunkAsync = function (name, chunkIdx, archSize) {
-    if (!name || typeof chunkIdx !== 'number' || chunkIdx < 0) return;
-    const key = name + ':' + chunkIdx;
-    if (pk3ChunkCache.has(key) || asyncChunkPrefetchInFlight.has(key)) return;
-    asyncChunkPrefetchInFlight.add(key);
-    const task = idbKnownKeys.has('chunk:' + key)
-      ? loadChunksFromIdb([key])
-      : fetchPk3SpanIntoCache(name, chunkIdx, chunkIdx, archSize || 0);
+  window.__jkPk3PrefetchSpanAsync = function (name, cStart, cEnd, archSize) {
+    if (!name || typeof cStart !== 'number' || typeof cEnd !== 'number' || cStart < 0 || cEnd < cStart) return;
+    const missingIdbKeys = [];
+    let needsNetwork = false;
+    for (let c = cStart; c <= cEnd; c++) {
+      const key = name + ':' + c;
+      if (pk3ChunkCache.has(key) || asyncChunkPrefetchInFlight.has(key)) continue;
+      if (idbKnownKeys.has('chunk:' + key)) {
+        missingIdbKeys.push(key);
+      } else {
+        needsNetwork = true;
+      }
+    }
+    if (!needsNetwork && missingIdbKeys.length === 0) return;
+    // Defer low-priority background network prefetches until active demo load completes
+    if (needsNetwork && state.activeDemoLoadCount > 0) return;
+
+    const spanKeys = [];
+    for (let c = cStart; c <= cEnd; c++) {
+      const key = name + ':' + c;
+      if (!pk3ChunkCache.has(key) && !asyncChunkPrefetchInFlight.has(key)) {
+        asyncChunkPrefetchInFlight.add(key);
+        spanKeys.push(key);
+      }
+    }
+    if (spanKeys.length === 0) return;
+
+    const ctrl = needsNetwork && typeof AbortController === 'function' ? new AbortController() : null;
+    if (ctrl) bgPrefetchControllers.add(ctrl);
+    const task = !needsNetwork
+      ? loadChunksFromIdb(missingIdbKeys)
+      : fetchPk3SpanIntoCache(name, cStart, cEnd, archSize || 0, ctrl ? ctrl.signal : undefined);
     task
       .catch(() => {})
       .finally(() => {
-        asyncChunkPrefetchInFlight.delete(key);
+        if (ctrl) bgPrefetchControllers.delete(ctrl);
+        for (const k of spanKeys) asyncChunkPrefetchInFlight.delete(k);
       });
+  };
+
+  window.__jkPk3PrefetchChunkAsync = function (name, chunkIdx, archSize) {
+    window.__jkPk3PrefetchSpanAsync(name, chunkIdx, chunkIdx, archSize);
   };
 
   // =========================================================================
   // Server-Side Converted .mme Progressive Streaming & HTTP Range Seeking
   // =========================================================================
   const MME_CHUNK_SIZE = 524288; // 512 KB chunks
+  const mmeInitCache = new Map();
   const mmeStreamState = {
     active: false,
     streamId: 0,
@@ -2393,7 +2647,10 @@
         const fetchOpts = {
           headers: { Range: 'bytes=' + byteStart + '-' + byteEnd },
         };
-        if (signal) fetchOpts.signal = signal;
+        if (signal) {
+          fetchOpts.signal = signal;
+          fetchOpts.priority = 'low';
+        }
         const resp = await fetch(mmeStreamState.baseUrl + '&format=mme', fetchOpts);
         if (resp.status !== 200 && resp.status !== 206) return 0;
         const ab = await resp.arrayBuffer();
@@ -2434,7 +2691,11 @@
           mmeStreamState.streamId === streamId &&
           nextChunk < totalChunks
         ) {
-          while (isPageHidden() && mmeStreamState.active && mmeStreamState.streamId === streamId) {
+          while (
+            (isPageHidden() || state.activeDemoLoadCount > 0) &&
+            mmeStreamState.active &&
+            mmeStreamState.streamId === streamId
+          ) {
             await new Promise((r) => setTimeout(r, 200));
           }
           const cIdx = nextChunk++;
@@ -2517,13 +2778,17 @@
             mmeStreamState.baseUrl + '&format=mme&start=' + byteStart + '&end=' + byteEnd,
             false
           );
-          xhr.responseType = 'arraybuffer';
+          xhr.overrideMimeType('text/plain; charset=x-user-defined');
           try {
             xhr.setRequestHeader('Range', 'bytes=' + byteStart + '-' + byteEnd);
           } catch (_) {}
           xhr.send(null);
-          if ((xhr.status === 200 || xhr.status === 206) && xhr.response) {
-            const bytes = new Uint8Array(xhr.response);
+          if ((xhr.status === 200 || xhr.status === 206) && xhr.responseText) {
+            const txt = xhr.responseText;
+            const bytes = new Uint8Array(txt.length);
+            for (let i = 0; i < txt.length; i++) {
+              bytes[i] = txt.charCodeAt(i) & 0xff;
+            }
             if (bytes.byteLength > 0) {
               storeMmeRangeBytes(byteStart, bytes);
               mmeStreamState.rangeRequests++;
@@ -2540,8 +2805,11 @@
       window.Module.HEAPU8.set(chunk.subarray(cOff, cOff + take), dst + copied);
       copied += take;
       curPos += take;
-      // Trigger async lookahead for next chunk if not yet cached
-      if (!mmeStreamState.chunks.has(cIdx + 1)) {
+      // Trigger async lookahead for next chunk once playing, or during load only near chunk end
+      if (
+        !mmeStreamState.chunks.has(cIdx + 1) &&
+        (!state.activeDemoLoadCount || cOff + take >= chunk.byteLength - 65536)
+      ) {
         fetchMmeChunkSpanAsync(cIdx + 1, cIdx + 1, mmeStreamState.streamId);
       }
     }
@@ -2568,6 +2836,141 @@
 
   function getLoadProgress() {
     return Object.assign({}, state.loadProgress);
+  }
+
+  async function fetchBytesWithProgressAndRetry(url, opts) {
+    const options = opts || {};
+    const maxAttempts = options.maxAttempts || 4;
+    const minBytes = options.minBytes || 16;
+    const fallbackTotalBytes = options.fallbackTotalBytes || 0;
+    const lowPriority = Boolean(options.lowPriority);
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const validateBytes = typeof options.validateBytes === 'function' ? options.validateBytes : null;
+
+    let lastErr = null;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (attempt > 0 || isPageHidden()) {
+        const backoffMs = attempt === 0 ? 0 : Math.min(2500, 400 * Math.pow(2, attempt - 1));
+        await waitForPageVisible(backoffMs);
+      }
+      try {
+        const fetchOpts = {};
+        if (lowPriority && attempt === 0 && !state.demoLoadedOnce) {
+          fetchOpts.priority = 'low';
+        }
+        const resp = await fetch(url, fetchOpts);
+        if (!resp.ok) {
+          if (
+            resp.status >= 400 &&
+            resp.status < 500 &&
+            resp.status !== 408 &&
+            resp.status !== 429
+          ) {
+            return { ok: false, status: resp.status, bytes: null, extra: null };
+          }
+          throw new Error('HTTP ' + resp.status);
+        }
+
+        const contentEncoding =
+          resp.headers && typeof resp.headers.get === 'function'
+            ? String(resp.headers.get('content-encoding') || '').toLowerCase()
+            : '';
+        const isEncoded = Boolean(contentEncoding && contentEncoding !== 'identity');
+        const rawHeaderLen =
+          resp.headers && typeof resp.headers.get === 'function'
+            ? parseInt(resp.headers.get('x-raw-length') || '0', 10) || 0
+            : 0;
+        const exactExpectedLen = !isEncoded
+          ? resp.headers && typeof resp.headers.get === 'function'
+            ? parseInt(resp.headers.get('content-length') || '0', 10) || 0
+            : 0
+          : rawHeaderLen;
+        const displayTotal = exactExpectedLen > 0 ? exactExpectedLen : fallbackTotalBytes;
+
+        let bytes = null;
+        if (resp.body && typeof resp.body.getReader === 'function') {
+          const reader = resp.body.getReader();
+          const chunks = [];
+          let received = 0;
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!value || value.byteLength === 0) continue;
+            chunks.push(value);
+            received += value.byteLength;
+            if (onProgress) {
+              try {
+                onProgress(received, Math.max(displayTotal, received), attempt);
+              } catch (_) {}
+            }
+          }
+          if (exactExpectedLen > 0 && received < exactExpectedLen) {
+            throw new Error(`Truncated stream (${received} / ${exactExpectedLen})`);
+          }
+          bytes = new Uint8Array(received);
+          let offset = 0;
+          for (const c of chunks) {
+            bytes.set(c, offset);
+            offset += c.byteLength;
+          }
+        } else {
+          const ab = await resp.arrayBuffer();
+          if (!ab) throw new Error('Empty response buffer');
+          bytes = new Uint8Array(ab);
+          if (exactExpectedLen > 0 && bytes.byteLength < exactExpectedLen) {
+            throw new Error(`Truncated response (${bytes.byteLength} / ${exactExpectedLen})`);
+          }
+          if (onProgress) {
+            try {
+              onProgress(
+                bytes.byteLength,
+                Math.max(displayTotal, bytes.byteLength),
+                attempt
+              );
+            } catch (_) {}
+          }
+        }
+
+        if (!bytes || bytes.byteLength < minBytes) {
+          throw new Error(`Payload too short (${bytes ? bytes.byteLength : 0} bytes)`);
+        }
+
+        let extra = null;
+        if (validateBytes) {
+          extra = await validateBytes(bytes, resp);
+        }
+        return { ok: true, status: resp.status, bytes, extra };
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw lastErr || new Error('Network request failed');
+  }
+
+  async function fetchJsonWithRetry(url, maxAttempts) {
+    const attempts = maxAttempts || 3;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      if (attempt > 0 || isPageHidden()) {
+        const backoffMs = attempt === 0 ? 0 : Math.min(2000, 350 * Math.pow(2, attempt - 1));
+        await waitForPageVisible(backoffMs);
+      }
+      try {
+        const resp = await fetch(url);
+        if (!resp.ok) {
+          if (
+            resp.status >= 400 &&
+            resp.status < 500 &&
+            resp.status !== 408 &&
+            resp.status !== 429
+          ) {
+            return null;
+          }
+          continue;
+        }
+        return await resp.json();
+      } catch (_) {}
+    }
+    return null;
   }
 
   async function fetchAndValidateDemoBytes(nameOrUrl, onFirstMessageReady) {
@@ -2677,10 +3080,20 @@
           const m = cd.match(/filename="?([^";]+)"?/i);
           if (m && m[1]) headerLabel = m[1].trim();
         }
-        const contentLen =
+        const contentEncoding =
           resp.headers && typeof resp.headers.get === 'function'
-            ? parseInt(resp.headers.get('content-length') || '0', 10) || 0
+            ? String(resp.headers.get('content-encoding') || '').toLowerCase()
+            : '';
+        const isEncoded = Boolean(contentEncoding && contentEncoding !== 'identity');
+        const rawHeaderLen =
+          resp.headers && typeof resp.headers.get === 'function'
+            ? parseInt(resp.headers.get('x-raw-length') || '0', 10) || 0
             : 0;
+        const contentLen = !isEncoded
+          ? resp.headers && typeof resp.headers.get === 'function'
+            ? parseInt(resp.headers.get('content-length') || '0', 10) || 0
+            : 0
+          : rawHeaderLen;
 
         let bytes = null;
         if (resp.body && typeof resp.body.getReader === 'function') {
@@ -2855,17 +3268,11 @@
     for (let i = state.audioContexts.length - 1; i >= 0; i--) {
       const ctx = state.audioContexts[i];
       if (ctx && typeof ctx.state === 'string') {
-        if (
-          !state.muted &&
-          !isPageHidden() &&
-          (ctx.state === 'suspended' || ctx.state === 'interrupted') &&
-          typeof ctx.resume === 'function'
-        ) {
-          ctx.resume().catch(() => {});
-        }
-        if (!state.muted) return 'running';
         return ctx.state;
       }
+    }
+    if (window.__jkSharedAudioCtx && typeof window.__jkSharedAudioCtx.state === 'string') {
+      return window.__jkSharedAudioCtx.state;
     }
     return state.muted ? 'suspended' : 'running';
   }
@@ -2979,6 +3386,7 @@
       isPlaying: Boolean(isPlaying),
       isPaused: Boolean(isPaused),
       loop: Boolean(loop),
+      thirdPerson: Boolean(state.thirdPerson),
       demoEnded: Boolean(demoEnded),
       demoCompletedCount: Number(demoCompletedCount),
       demoName: String(activeDemoName || ''),
@@ -3005,6 +3413,7 @@
       canvasHeight: Number(canvasHeight),
       viewportWidth: Number(viewportWidth),
       viewportHeight: Number(viewportHeight),
+      devicePixelRatio: Number(window.devicePixelRatio || 1),
       renderer: canvas && canvas.__jkUsingSoftwareWebGL ? 'software' : 'webgl',
       usingSoftwareRenderer: Boolean(canvas && canvas.__jkUsingSoftwareWebGL),
       forceSoftwareRenderer: Boolean(state.forceSoftwareRenderer),
@@ -3096,11 +3505,23 @@
   }
 
   function unlockAudio() {
-    for (const ctx of state.audioContexts) {
-      if (!ctx) continue;
+    const targets = state.audioContexts.slice();
+    if (window.__jkSharedAudioCtx && !targets.includes(window.__jkSharedAudioCtx)) {
+      targets.push(window.__jkSharedAudioCtx);
+    }
+    for (const ctx of targets) {
+      if (!ctx || ctx.state === 'closed') continue;
       try {
-        if (typeof ctx.resume === 'function') {
+        if (typeof ctx.resume === 'function' && ctx.state !== 'running') {
           ctx.resume().catch(() => {});
+        }
+        if (!ctx.__jkUnlockedOnce && typeof ctx.createBuffer === 'function') {
+          ctx.__jkUnlockedOnce = true;
+          const buf = ctx.createBuffer(1, 1, ctx.sampleRate || 44100);
+          const src = ctx.createBufferSource();
+          src.buffer = buf;
+          src.connect(ctx.destination);
+          if (typeof src.start === 'function') src.start(0);
         }
       } catch (_) {}
     }
@@ -3249,7 +3670,10 @@
         const fetchOpts = {
           headers: { Range: 'bytes=' + byteStart + '-' + (byteEnd - 1) },
         };
-        if (signal) fetchOpts.signal = signal;
+        if (signal) {
+          fetchOpts.signal = signal;
+          fetchOpts.priority = 'low';
+        }
         const resp = await fetch('/base/' + pk3Name, fetchOpts);
         if (resp.status !== 200 && resp.status !== 206) {
           if (resp.status >= 400 && resp.status < 500 && resp.status !== 408 && resp.status !== 429) {
@@ -3259,8 +3683,12 @@
         }
         const ab = await resp.arrayBuffer();
         const bytes = new Uint8Array(ab);
+        const expectedLen = byteEnd - byteStart;
+        if (resp.status === 206 && archSize > 0 && bytes.byteLength < expectedLen) {
+          continue;
+        }
         if (bytes.byteLength > 0) {
-          window.__jkPk3OnRangeFetched(pk3Name, byteStart, byteEnd - 1, bytes);
+          window.__jkPk3OnRangeFetched(pk3Name, byteStart, byteEnd - 1, bytes, true);
         }
         return bytes.byteLength;
       } catch (_) {
@@ -3370,7 +3798,9 @@
       }
       await Promise.all(workers);
       flushIdbWriteQueue();
-    })();
+    })().finally(() => {
+      startupCorePrefetchPromise = null;
+    });
     return startupCorePrefetchPromise;
   }
 
@@ -3397,9 +3827,9 @@
       }
     };
 
-    // Pure MP-common sound, HUD, font, effect, and weapon chunks (no SP campaign or map-specific planet folders)
+    // Pure MP-common sound, HUD, font, effect, and weapon chunks (no SP campaign, music, or map-specific planet folders)
     addTargetRanges('assets0.pk3', [
-      2, 429, 451, [537, 549], 925, [1038, 1041], [1064, 1066], 1662,
+      2, 429, 451, 925, [1038, 1041], [1064, 1066], 1662,
       [1664, 1665], [1669, 1670], 1677, [1682, 1683], [1689, 1694], [1707, 1728],
     ]);
     addTargetRanges('assets1.pk3', [
@@ -3488,6 +3918,11 @@
     if (prewarmPromise) return prewarmPromise;
 
     prewarmPromise = (async () => {
+      const booted = await ensureEngineBooted({ background: !state.demoLoadedOnce });
+      if (!booted) {
+        prewarmPromise = null;
+        return false;
+      }
       await waitWithVisibleTimeout(
         () => state.engineStarted && callWasm('JK_DemoIsReady', 'number', [], []) === 1,
         40,
@@ -3509,9 +3944,19 @@
         state.ready = true;
         const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
         state.metrics.prewarmCompleteMs = Math.round(nowMs * 100) / 100;
-        prefetchCommonChunksAsync().then(() => {
-          flushIdbWriteQueue();
-        }).catch(() => {});
+        const conn = typeof navigator !== 'undefined' && navigator.connection;
+        const isConstrainedLink = Boolean(
+          (conn && (conn.saveData || /^(?:slow-2g|2g|3g)$/i.test(String(conn.effectiveType || '')))) ||
+            (typeof window.matchMedia === 'function' &&
+              window.matchMedia('(pointer: coarse)').matches)
+        );
+        if (!isConstrainedLink && state.activeDemoLoadCount === 0 && !state.demoLoadedOnce) {
+          prefetchCommonChunksAsync()
+            .then(() => {
+              flushIdbWriteQueue();
+            })
+            .catch(() => {});
+        }
         flushIdbWriteQueue();
         try {
           window.dispatchEvent(
@@ -3562,16 +4007,22 @@
       }
     }
 
-    // Hydrate any already-persisted chunks for this demo from IndexedDB on demand
-    const toHydrateFromIdb = [];
+    // Hydrate any already-persisted chunks for this demo (plus any prior sync-fallback chunks) from IndexedDB on demand
+    const toHydrateSet = new Set();
     for (const [pk3Name, idxSet] of candidateByArchive.entries()) {
       for (const c of idxSet) {
         const subKey = pk3Name + ':' + c;
         if (!pk3ChunkCache.has(subKey) && idbKnownKeys.has('chunk:' + subKey)) {
-          toHydrateFromIdb.push(subKey);
+          toHydrateSet.add(subKey);
         }
       }
     }
+    for (const subKey of syncFallbackChunkSet) {
+      if (!pk3ChunkCache.has(subKey) && idbKnownKeys.has('chunk:' + subKey)) {
+        toHydrateSet.add(subKey);
+      }
+    }
+    const toHydrateFromIdb = Array.from(toHydrateSet);
     const hydratedFromIdb =
       toHydrateFromIdb.length > 0 ? await loadChunksFromIdb(toHydrateFromIdb) : 0;
 
@@ -3732,6 +4183,7 @@
     pk3ChunkCache.clear();
     pk3CdCache.clear();
     demoByteCache.clear();
+    mmeInitCache.clear();
     idbKnownKeys.clear();
     hotChunkSet.clear();
     try {
@@ -3791,6 +4243,10 @@
         state.metrics.demoLoadDurationMs = 0;
         emitLoadProgress('demo', 'Downloading demo...', 0, 0, 2);
 
+        if (!state.engineStarted) {
+          ensureEngineBooted({ background: false }).catch(() => {});
+        }
+
         const onFirstMessageReady = (headBytes) => {
           if (
             !state.engineStarted ||
@@ -3819,6 +4275,7 @@
         const rawStr = typeof rawInput === 'string' ? rawInput.trim() : '';
         const canUseMmeStream = isQueryDemoUrl(rawStr);
         let usedMmeStream = false;
+        let mmeFetchFailed = false;
         let mmeMetaPromise = null;
         let activeStreamId = 0;
         let demoData = null;
@@ -3833,63 +4290,117 @@
             rawStr.startsWith('/')
               ? rawStr
               : '/' + rawStr.replace(/^\.\//, '');
-          try {
-            stopMmeBackgroundStream();
-            activeStreamId = ++mmeStreamState.streamId;
-            const autoexecPromise = fetchAutoexecConfig();
-            const initPromise = fetch(streamUrl + '&format=mme_init');
-            mmeMetaPromise = fetch(streamUrl + '&format=mme_meta').then((r) =>
-              r && r.ok ? r.json() : null
-            );
+          stopMmeBackgroundStream();
+          activeStreamId = ++mmeStreamState.streamId;
+          const autoexecPromise = fetchAutoexecConfig();
+          const cachedMme = !state.bypassCache ? mmeInitCache.get(rawStr) : null;
 
-            const initResp = await initPromise;
-            if (initResp && initResp.ok) {
-              const initAb = await initResp.arrayBuffer();
-              const initBytes = new Uint8Array(initAb);
-              const hdrStr =
-                initBytes.byteLength >= 15
-                  ? String.fromCharCode.apply(null, initBytes.subarray(0, 15))
-                  : '';
-              if (hdrStr === 'jaMME 1.11 Demo') {
-                usedMmeStream = true;
-                mmeStreamState.active = true;
-                mmeStreamState.baseUrl = streamUrl;
-                mmeStreamState.cacheKey = rawStr;
-                mmeStreamState.fileSize = Math.max(initBytes.byteLength, 0x3fffffff);
-                mmeStreamState.startTime = 0;
-                mmeStreamState.endTime = 0;
-                mmeStreamState.totalFrames = 1;
-                mmeStreamState.index = [[15, 0, 0]];
-                mmeStreamState.chunks.clear();
-                mmeStreamState.inFlight.clear();
-                storeMmeRangeBytes(0, initBytes);
-                mmeStreamState.rangeRequests = 1;
-                mmeStreamState.bytesTransferred = initBytes.byteLength;
-                const kbInit = Math.round(initBytes.byteLength / 1024);
-                emitLoadProgress(
-                  'demo',
-                  `Streaming demo (${kbInit} KB initial buffer ready)...`,
-                  initBytes.byteLength,
-                  initBytes.byteLength,
-                  32
-                );
-                latestAutoexec = await autoexecPromise;
-                demoData = {
-                  fileName: fileName || 'current.dm_26',
-                  shortName: shortName || 'current',
-                  sourceUrl: rawStr,
-                  label: customLabel,
-                  bytes: null,
-                };
+          let initBytes = cachedMme && cachedMme.initBytes ? cachedMme.initBytes : null;
+          if (cachedMme && cachedMme.meta) {
+            mmeMetaPromise = Promise.resolve(cachedMme.meta);
+          } else {
+            mmeMetaPromise = fetchJsonWithRetry(streamUrl + '&format=mme_meta', 3).then(
+              (metaObj) => {
+                if (metaObj && metaObj.fileSize && Array.isArray(metaObj.index)) {
+                  const existing = mmeInitCache.get(rawStr);
+                  if (existing) {
+                    existing.meta = metaObj;
+                  }
+                }
+                return metaObj;
               }
+            );
+          }
+
+          if (!initBytes) {
+            let lastInitProgressAt = 0;
+            try {
+              const initRes = await fetchBytesWithProgressAndRetry(
+                streamUrl + '&format=mme_init',
+                {
+                  maxAttempts: 3,
+                  minBytes: 16,
+                  fallbackTotalBytes: MME_CHUNK_SIZE,
+                  lowPriority: false,
+                  onProgress: (loaded, total, attempt) => {
+                    const now = Date.now();
+                    if (now - lastInitProgressAt < 80 && loaded < total) return;
+                    lastInitProgressAt = now;
+                    const kbLoaded = Math.round(loaded / 1024);
+                    const kbTotal = total > 0 ? Math.round(total / 1024) : 0;
+                    const ratio = total > 0 ? Math.min(1, loaded / total) : 0.5;
+                    const pct = 2 + Math.round(ratio * 16);
+                    const retryPrefix = attempt > 0 ? `Retrying demo (${attempt + 1}/3): ` : 'Downloading demo ';
+                    const sizeLabel =
+                      kbTotal > 0 ? `(${kbLoaded} / ${kbTotal} KB)...` : `(${kbLoaded} KB)...`;
+                    emitLoadProgress('demo', retryPrefix + sizeLabel, loaded, total, pct);
+                  },
+                }
+              );
+              if (initRes && initRes.ok && initRes.bytes) {
+                initBytes = initRes.bytes;
+              }
+            } catch (_) {
+              mmeFetchFailed = true;
             }
-          } catch (_) {
-            usedMmeStream = false;
+          }
+
+          if (initBytes && initBytes.byteLength >= 15) {
+            const hdrStr = String.fromCharCode.apply(null, initBytes.subarray(0, 15));
+            if (hdrStr === 'jaMME 1.11 Demo') {
+              if (!mmeInitCache.has(rawStr)) {
+                if (mmeInitCache.size >= 3) {
+                  const oldestKey = mmeInitCache.keys().next().value;
+                  if (oldestKey !== undefined) mmeInitCache.delete(oldestKey);
+                }
+                mmeInitCache.set(rawStr, { initBytes, meta: null });
+                mmeMetaPromise.then((metaObj) => {
+                  if (metaObj && metaObj.fileSize && Array.isArray(metaObj.index)) {
+                    const entry = mmeInitCache.get(rawStr);
+                    if (entry) entry.meta = metaObj;
+                  }
+                });
+              }
+              usedMmeStream = true;
+              mmeStreamState.active = true;
+              mmeStreamState.baseUrl = streamUrl;
+              mmeStreamState.cacheKey = rawStr;
+              mmeStreamState.fileSize = Math.max(initBytes.byteLength, 0x3fffffff);
+              mmeStreamState.startTime = 0;
+              mmeStreamState.endTime = 0;
+              mmeStreamState.totalFrames = 1;
+              mmeStreamState.index = [[15, 0, 0]];
+              mmeStreamState.chunks.clear();
+              mmeStreamState.inFlight.clear();
+              storeMmeRangeBytes(0, initBytes);
+              mmeStreamState.rangeRequests = cachedMme ? 0 : 1;
+              mmeStreamState.bytesTransferred = cachedMme ? 0 : initBytes.byteLength;
+              const kbInit = Math.round(initBytes.byteLength / 1024);
+              emitLoadProgress(
+                'demo',
+                `Streaming demo (${kbInit} KB initial buffer ready)...`,
+                initBytes.byteLength,
+                initBytes.byteLength,
+                18
+              );
+              latestAutoexec = await autoexecPromise;
+              demoData = {
+                fileName: fileName || 'current.dm_26',
+                shortName: shortName || 'current',
+                sourceUrl: rawStr,
+                label: customLabel,
+                bytes: null,
+              };
+            }
           }
         }
 
         if (!usedMmeStream) {
           resetMmeStreamState();
+          if (mmeFetchFailed) {
+            emitLoadProgress('error', 'Network error downloading demo', 0, 0, 0);
+            return false;
+          }
           [demoData, latestAutoexec] = await Promise.all([
             fetchAndValidateDemoBytes(nameOrUrl, onFirstMessageReady),
             fetchAutoexecConfig(),
@@ -3900,25 +4411,69 @@
           return false;
         }
 
-        // Wait until engine is initialized if called during boot (visibility-aware timeout)
-        await waitWithVisibleTimeout(
-          () => state.engineStarted && callWasm('JK_DemoIsReady', 'number', [], []) === 1,
-          50,
-          45000,
-          (_elapsed, hidden) => {
-            emitLoadProgress(
-              'engine',
-              hidden
-                ? 'Paused in background — switch back to resume...'
-                : 'Initializing 3D engine...',
-              0,
-              0,
-              36
-            );
+        // Wait until engine is downloaded, compiled, and initialized (progress-aware stall timeout)
+        if (!state.engineStarted || callWasm('JK_DemoIsReady', 'number', [], []) !== 1) {
+          if (!state.engineStarted) {
+            ensureEngineBooted({ background: false }).catch(() => {});
           }
-        );
-        if (!state.engineStarted) {
-          emitLoadProgress('error', 'Engine initialization timed out', 0, 0, 0);
+          let stallVisibleMs = 0;
+          let lastSeenProgressAt = state.engineLastProgressAt || Date.now();
+          const MAX_STALL_VISIBLE_MS = 45000;
+          while (
+            !(state.engineStarted && callWasm('JK_DemoIsReady', 'number', [], []) === 1) &&
+            stallVisibleMs < MAX_STALL_VISIBLE_MS
+          ) {
+            if (!state.engineStarted && !engineBootPromise) {
+              break;
+            }
+            const hidden = isPageHidden();
+            if (hidden) {
+              emitLoadProgress(
+                'engine',
+                'Paused in background — switch back to resume...',
+                state.engineDownloadLoaded || 0,
+                state.engineDownloadTotal || 0,
+                Math.max(20, state.loadProgress.percent || 20)
+              );
+            } else if (!state.engineStarted && state.engineBootStage === 'downloading') {
+              const loaded = state.engineDownloadLoaded || 0;
+              const total = Math.max(state.engineDownloadTotal || 0, loaded);
+              if (total > 0 && loaded > 0) {
+                const mbLoaded = (loaded / (1024 * 1024)).toFixed(1);
+                const mbTotal = (total / (1024 * 1024)).toFixed(1);
+                const ratio = Math.min(1, loaded / total);
+                const pct = 18 + Math.round(ratio * 17);
+                emitLoadProgress(
+                  'engine',
+                  `Loading 3D engine (${mbLoaded} / ${mbTotal} MB)...`,
+                  loaded,
+                  total,
+                  pct
+                );
+              } else {
+                emitLoadProgress('engine', 'Loading 3D engine...', 0, 0, 19);
+              }
+            } else {
+              emitLoadProgress('engine', 'Initializing 3D engine...', 0, 0, 36);
+            }
+            await new Promise((r) => setTimeout(r, 80));
+            const curProgressAt = state.engineLastProgressAt || 0;
+            if (curProgressAt > lastSeenProgressAt || state.engineBootStage === 'compiling') {
+              lastSeenProgressAt = Math.max(lastSeenProgressAt, curProgressAt);
+              stallVisibleMs = 0;
+            } else if (!isPageHidden()) {
+              stallVisibleMs += 80;
+            }
+          }
+        }
+        if (!state.engineStarted || callWasm('JK_DemoIsReady', 'number', [], []) !== 1) {
+          emitLoadProgress(
+            'error',
+            state.engineBootError || 'Network error loading 3D engine',
+            0,
+            0,
+            0
+          );
           return false;
         }
 
@@ -3966,7 +4521,6 @@
           mmeStreamState.totalFrames = Number(meta.totalFrames || 1);
           mmeStreamState.index = meta.index;
           applyMmeStreamToWasm(meta);
-          startMmeBackgroundStream(activeStreamId);
         } else {
           writeDemoToFS(demoData.fileName, demoData.bytes);
           if (earlyPeekPromise) {
@@ -4002,6 +4556,7 @@
         state.autoPausedByVisibility = false;
 
         callWasm('JK_DemoSetLoop', 'number', ['number'], [state.loop ? 1 : 0]);
+        syncCameraModeToEngine();
         const prepStarted = callWasm('JK_DemoPrepareBegin', 'number', ['string'], [demoData.shortName]);
         if (prepStarted === 1) {
           let prepStepSafety = 0;
@@ -4027,6 +4582,7 @@
         } else {
           callWasm('JK_DemoLoad', 'number', ['string'], [demoData.shortName]);
         }
+        syncCameraModeToEngine();
 
         try {
           window.dispatchEvent(
@@ -4057,6 +4613,9 @@
           40000
         );
         const finalSt = getStatus();
+        if (mmeStreamState.active && mmeStreamState.streamId === activeStreamId) {
+          startMmeBackgroundStream(activeStreamId);
+        }
         emitLoadProgress('ready', 'Playing', 0, 0, 100);
         updateUIControls();
         return Boolean(finalSt.isPlaying || finalSt.demoCompletedCount > prevCompleted);
@@ -4154,6 +4713,34 @@
     return setLoop(!getLoop());
   }
 
+  function syncCameraModeToEngine() {
+    execCommand(`set cg_thirdPerson "${state.thirdPerson ? '1' : '0'}"`);
+  }
+
+  function setThirdPerson(enabled) {
+    state.thirdPerson = Boolean(enabled);
+    syncCameraModeToEngine();
+    persistPrefField('thirdPerson', state.thirdPerson);
+    savePlayerPrefs();
+    updateUIControls();
+    try {
+      window.dispatchEvent(
+        new CustomEvent('jkdemo:cameramode', {
+          detail: { thirdPerson: Boolean(state.thirdPerson) },
+        })
+      );
+    } catch (_) {}
+    return state.thirdPerson;
+  }
+
+  function getThirdPerson() {
+    return Boolean(state.thirdPerson);
+  }
+
+  function toggleThirdPerson() {
+    return setThirdPerson(!state.thirdPerson);
+  }
+
   function formatTimeMMSS(ms) {
     const safeMs = typeof ms === 'number' && Number.isFinite(ms) && ms > 0 ? ms : 0;
     const totalSec = Math.floor(safeMs / 1000);
@@ -4183,6 +4770,12 @@
     return state.interactiveMode;
   }
 
+  function getEffectiveDevicePixelRatio() {
+    const raw = typeof window !== 'undefined' ? Number(window.devicePixelRatio) : 1;
+    if (!Number.isFinite(raw) || raw <= 0) return 1;
+    return Math.min(Math.max(raw, 1), 3);
+  }
+
   function computeTargetRenderDimensions(customW, customH) {
     if (
       typeof customW === 'number' &&
@@ -4195,34 +4788,111 @@
       return {
         width: Math.min(4096, Math.max(64, Math.round(customW))) & ~1,
         height: Math.min(4096, Math.max(64, Math.round(customH))) & ~1,
+        dpr: 1,
       };
     }
 
     const canvas = document.getElementById('jk-canvas');
     const pane = document.getElementById('jk-player-pane') || (canvas && canvas.parentElement) || canvas;
-    let cssW = 640;
-    let cssH = 360;
+    let rawCssW = 640;
+    let rawCssH = 360;
     if (pane && typeof pane.getBoundingClientRect === 'function') {
       const rect = pane.getBoundingClientRect();
-      if (rect.width >= 64 && rect.height >= 64) {
-        cssW = Math.round(rect.width);
-        cssH = Math.round(rect.height);
+      if (rect.width >= 32 && rect.height >= 32) {
+        const vv = window.visualViewport;
+        const vvScale = vv && Number(vv.scale) > 0.05 ? Number(vv.scale) : 1;
+        const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+        const forceLandscape = Boolean(
+          typeof pane.closest === 'function' && pane.closest('.jk-pip-force-landscape')
+        );
+        const logicalRectW = forceLandscape ? rect.height : rect.width;
+        const logicalRectH = forceLandscape ? rect.width : rect.height;
+
+        if (
+          vv &&
+          canvas &&
+          canvas.width >= 64 &&
+          canvas.height >= 64 &&
+          !fsEl &&
+          !forceLandscape &&
+          (rect.right < vv.offsetLeft ||
+            rect.left > vv.offsetLeft + vv.width ||
+            rect.bottom < vv.offsetTop ||
+            rect.top > vv.offsetTop + vv.height)
+        ) {
+          return {
+            width: canvas.width,
+            height: canvas.height,
+            cssW: Math.max(32, Math.round(logicalRectW * vvScale)),
+            cssH: Math.max(32, Math.round(logicalRectH * vvScale)),
+            dpr: getEffectiveDevicePixelRatio(),
+          };
+        }
+
+        if (fsEl && typeof fsEl.getBoundingClientRect === 'function' && vv && vv.width > 0) {
+          const fsRect = fsEl.getBoundingClientRect();
+          const fsLogicalW = forceLandscape ? fsRect.height : fsRect.width;
+          const screenSpanW = forceLandscape
+            ? Math.max(vv.width * vvScale, (vv.height || 0) * vvScale)
+            : vv.width * vvScale;
+          const fsScale = fsLogicalW >= 32 ? screenSpanW / fsLogicalW : vvScale;
+          rawCssW = logicalRectW * fsScale;
+          rawCssH = logicalRectH * fsScale;
+        } else {
+          rawCssW = logicalRectW * vvScale;
+          rawCssH = logicalRectH * vvScale;
+        }
       }
     }
+    const cssW = Math.max(32, Math.round(rawCssW));
+    const cssH = Math.max(32, Math.round(rawCssH));
 
-    // In hardware/native WebGL mode, render at full 1:1 container resolution.
+    // In hardware/WebGL mode, scale by devicePixelRatio (up to 3x) with an aspect-preserving
+    // pixel budget so HiDPI / Retina mobile and desktop displays render crisply.
     // In CPU Software WebGL fallback mode, use a 640x360 base matching the container aspect ratio.
-    const isHardwareWebGL = Boolean(
-      canvas && canvas.__jkActiveWebGLContext && !canvas.__jkUsingSoftwareWebGL
+    const isSoftwareWebGL = Boolean(
+      (canvas && canvas.__jkUsingSoftwareWebGL) || state.forceSoftwareRenderer
     );
-    const scale = isHardwareWebGL
-      ? 1.0
-      : Math.min(1.0, Math.max(640 / Math.max(cssW, 1), 360 / Math.max(cssH, 1)));
-    let width = Math.max(64, Math.round(cssW * scale)) & ~1;
-    let height = Math.max(64, Math.round(cssH * scale)) & ~1;
-    if (cssW >= 640 && width < 640) width = 640;
-    if (cssH >= 360 && height < 360) height = 360;
-    return { width, height, cssW, cssH };
+    if (isSoftwareWebGL) {
+      const swScale = Math.min(
+        1.0,
+        Math.max(640 / Math.max(rawCssW, 1), 360 / Math.max(rawCssH, 1))
+      );
+      let width = Math.max(64, Math.round(rawCssW * swScale)) & ~1;
+      let height = Math.max(64, Math.round(rawCssH * swScale)) & ~1;
+      if (cssW >= 640 && width < 640) width = 640;
+      if (cssH >= 360 && height < 360) height = 360;
+      return { width, height, cssW, cssH, dpr: 1 };
+    }
+
+    const dpr = getEffectiveDevicePixelRatio();
+    const isCoarsePointer = Boolean(
+      typeof window !== 'undefined' &&
+        typeof window.matchMedia === 'function' &&
+        window.matchMedia('(pointer: coarse)').matches
+    );
+    const maxDim = isCoarsePointer ? 2880 : 3840;
+    const maxPixels = isCoarsePointer ? 2560 * 1440 : 3840 * 2160;
+
+    let scaledW = rawCssW * dpr;
+    let scaledH = rawCssH * dpr;
+
+    const maxEdge = Math.max(scaledW, scaledH);
+    if (maxEdge > maxDim) {
+      const dimScale = maxDim / maxEdge;
+      scaledW *= dimScale;
+      scaledH *= dimScale;
+    }
+    const totalPixels = scaledW * scaledH;
+    if (totalPixels > maxPixels) {
+      const pxScale = Math.sqrt(maxPixels / totalPixels);
+      scaledW *= pxScale;
+      scaledH *= pxScale;
+    }
+
+    const width = Math.max(64, Math.round(scaledW)) & ~1;
+    const height = Math.max(64, Math.round(scaledH)) & ~1;
+    return { width, height, cssW, cssH, dpr };
   }
 
   function resize(customW, customH) {
@@ -4246,7 +4916,13 @@
       try {
         window.dispatchEvent(
           new CustomEvent('jkdemo:resize', {
-            detail: { width: dims.width, height: dims.height, cssWidth: dims.cssW, cssHeight: dims.cssH },
+            detail: {
+              width: dims.width,
+              height: dims.height,
+              cssWidth: dims.cssW,
+              cssHeight: dims.cssH,
+              dpr: dims.dpr,
+            },
           })
         );
       } catch (_) {}
@@ -4272,6 +4948,34 @@
     };
 
     origWinAddEventListener.call(window, 'resize', scheduleSync);
+    if (window.visualViewport && typeof window.visualViewport.addEventListener === 'function') {
+      window.visualViewport.addEventListener('resize', scheduleSync);
+    }
+    const onFullscreenSync = () => {
+      scheduleSync();
+      setTimeout(scheduleSync, 80);
+    };
+    origDocAddEventListener.call(document, 'fullscreenchange', onFullscreenSync);
+    origDocAddEventListener.call(document, 'webkitfullscreenchange', onFullscreenSync);
+
+    let dprMediaQuery = null;
+    const onDprChange = () => {
+      watchDprChange();
+      scheduleSync();
+    };
+    const watchDprChange = () => {
+      if (typeof window.matchMedia !== 'function') return;
+      try {
+        if (dprMediaQuery && typeof dprMediaQuery.removeEventListener === 'function') {
+          dprMediaQuery.removeEventListener('change', onDprChange);
+        }
+        dprMediaQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+        if (typeof dprMediaQuery.addEventListener === 'function') {
+          dprMediaQuery.addEventListener('change', onDprChange);
+        }
+      } catch (_) {}
+    };
+    watchDprChange();
 
     if (typeof ResizeObserver === 'function') {
       const ro = new ResizeObserver(scheduleSync);
@@ -4305,6 +5009,83 @@
         },
         false
       );
+
+      // Tap / click game screen to toggle Play / Pause when not in interactive capture mode
+      const activeCanvasPointers = new Map();
+      let multiTouchCanvasGesture = false;
+      let lastCanvasPointerToggleAt = 0;
+
+      const canToggleFromCanvas = () =>
+        !state.interactiveMode &&
+        state.engineStarted &&
+        state.demoLoadedOnce &&
+        state.activeDemoLoadCount === 0 &&
+        !(state.pendingDemoLoads > 0);
+
+      const triggerCanvasPlayPause = () => {
+        const nowPaused = togglePause();
+        try {
+          window.dispatchEvent(
+            new CustomEvent('jkdemo:screen-toggle', {
+              detail: { isPaused: Boolean(nowPaused) },
+            })
+          );
+        } catch (_) {}
+      };
+
+      canvas.addEventListener('pointerdown', (ev) => {
+        if (state.interactiveMode) return;
+        if (ev.pointerType === 'mouse' && ev.button !== 0) return;
+        activeCanvasPointers.set(ev.pointerId, {
+          x: ev.clientX,
+          y: ev.clientY,
+          t: Date.now(),
+        });
+        if (activeCanvasPointers.size > 1) {
+          multiTouchCanvasGesture = true;
+        }
+      });
+
+      const clearCanvasPointer = (ev) => {
+        activeCanvasPointers.delete(ev.pointerId);
+        if (activeCanvasPointers.size === 0) {
+          multiTouchCanvasGesture = false;
+        }
+      };
+      canvas.addEventListener('pointercancel', clearCanvasPointer);
+      canvas.addEventListener('lostpointercapture', clearCanvasPointer);
+
+      canvas.addEventListener('pointerup', (ev) => {
+        const down = activeCanvasPointers.get(ev.pointerId);
+        activeCanvasPointers.delete(ev.pointerId);
+        const wasMultiTouch = multiTouchCanvasGesture;
+        if (activeCanvasPointers.size === 0) {
+          multiTouchCanvasGesture = false;
+        }
+        if (!down || wasMultiTouch) return;
+        if (ev.pointerType === 'mouse' && ev.button !== 0) return;
+        if (!canToggleFromCanvas()) return;
+        const dist = Math.hypot(ev.clientX - down.x, ev.clientY - down.y);
+        const elapsed = Date.now() - down.t;
+        if (dist <= 12 && elapsed <= 700) {
+          lastCanvasPointerToggleAt = Date.now();
+          if (typeof window.__jkOnCanvasTap === 'function' && window.__jkOnCanvasTap(ev) === true) {
+            return;
+          }
+          triggerCanvasPlayPause();
+        }
+      });
+
+      canvas.addEventListener('click', (ev) => {
+        if (Date.now() - lastCanvasPointerToggleAt <= 350) return;
+        if (ev.button && ev.button !== 0) return;
+        if (!canToggleFromCanvas()) return;
+        lastCanvasPointerToggleAt = Date.now();
+        if (typeof window.__jkOnCanvasTap === 'function' && window.__jkOnCanvasTap(ev) === true) {
+          return;
+        }
+        triggerCanvasPlayPause();
+      });
     }
 
     const handleVisibilityOrFocusChange = () => {
@@ -4360,6 +5141,9 @@
     if (typeof cfg.speed === 'number') setSpeed(cfg.speed);
     if (typeof cfg.volume === 'number') setVolume(cfg.volume);
     if (typeof cfg.muted === 'boolean') setMuted(cfg.muted);
+    if (cfg.hasExplicitThirdPerson && typeof cfg.thirdPerson === 'boolean') {
+      setThirdPerson(cfg.thirdPerson);
+    }
     const normDemo = cfg.demo ? normalizeDemoFileName(cfg.demo) : '';
     if (normDemo && (normDemo !== state.demoName || state.demoEnded)) {
       return loadDemo(cfg.demo).then(() => {
@@ -4445,6 +5229,10 @@
     getLoop,
     isLooping: getLoop,
     toggleLoop,
+    setThirdPerson,
+    getThirdPerson,
+    isThirdPerson: getThirdPerson,
+    toggleThirdPerson,
     formatTimeMMSS,
     init: function () {
       return prewarmEngineInBackground();
@@ -4498,6 +5286,19 @@
       const looping = getLoop();
       btnLoop.textContent = looping ? 'Loop: On' : 'Loop: Off';
       btnLoop.setAttribute('aria-pressed', looping ? 'true' : 'false');
+    }
+    const btnCamera = document.getElementById('btn-camera');
+    if (btnCamera) {
+      const is3p = getThirdPerson();
+      btnCamera.textContent = is3p ? 'View: 3rd' : 'View: 1st';
+      btnCamera.setAttribute(
+        'aria-label',
+        is3p
+          ? 'View: 3rd — Switch to first-person camera'
+          : 'View: 1st — Switch to third-person camera'
+      );
+      btnCamera.style.borderColor = is3p ? '' : '#58a6ff';
+      btnCamera.style.color = is3p ? '' : '#58a6ff';
     }
     const sliderSeek = document.getElementById('slider-seek');
     const timeDisplay = document.getElementById('time-display');
@@ -4573,6 +5374,12 @@
         toggleLoop();
       });
     }
+    const btnCamera = document.getElementById('btn-camera');
+    if (btnCamera) {
+      btnCamera.addEventListener('click', () => {
+        toggleThirdPerson();
+      });
+    }
     const selectSpeed = document.getElementById('select-speed');
     if (selectSpeed) {
       selectSpeed.addEventListener('change', (e) => {
@@ -4607,6 +5414,60 @@
         toggleSoftwareRenderer();
       });
     }
+    const btnFullscreen = document.getElementById('btn-fullscreen');
+    if (btnFullscreen) {
+      const getFsEl = () =>
+        document.fullscreenElement ||
+        document.webkitFullscreenElement ||
+        null;
+      const fsTarget =
+        document.querySelector('main') ||
+        document.getElementById('jk-player-pane');
+      const syncHostFs = () => {
+        const active =
+          Boolean(fsTarget && getFsEl() === fsTarget) ||
+          Boolean(fsTarget && fsTarget.classList.contains('jk-host-pseudo-fs'));
+        btnFullscreen.textContent = active ? 'Exit Fullscreen' : 'Fullscreen';
+        btnFullscreen.setAttribute('aria-pressed', active ? 'true' : 'false');
+        resize();
+      };
+      btnFullscreen.addEventListener('click', () => {
+        if (!fsTarget) return;
+        const active =
+          getFsEl() === fsTarget || fsTarget.classList.contains('jk-host-pseudo-fs');
+        if (active) {
+          if (fsTarget.classList.contains('jk-host-pseudo-fs')) {
+            fsTarget.classList.remove('jk-host-pseudo-fs');
+            syncHostFs();
+          } else if (typeof document.exitFullscreen === 'function') {
+            document.exitFullscreen().catch(() => {});
+          } else if (typeof document.webkitExitFullscreen === 'function') {
+            document.webkitExitFullscreen();
+          }
+        } else {
+          const req = fsTarget.requestFullscreen || fsTarget.webkitRequestFullscreen;
+          if (typeof req === 'function') {
+            try {
+              const p = req.call(fsTarget);
+              if (p && typeof p.catch === 'function') {
+                p.catch(() => {
+                  fsTarget.classList.add('jk-host-pseudo-fs');
+                  syncHostFs();
+                });
+              }
+            } catch (_) {
+              fsTarget.classList.add('jk-host-pseudo-fs');
+              syncHostFs();
+            }
+          } else {
+            fsTarget.classList.add('jk-host-pseudo-fs');
+            syncHostFs();
+          }
+        }
+      });
+      origDocAddEventListener.call(document, 'fullscreenchange', syncHostFs);
+      origDocAddEventListener.call(document, 'webkitfullscreenchange', syncHostFs);
+    }
 
     setInterval(() => {
       updateUIControls();
@@ -4629,191 +5490,461 @@
     }, 250);
   }
 
-  async function bootEngine() {
+  let hostInitialized = false;
+  let engineBootPromise = null;
+  let engineScriptInjected = false;
+
+  function initHostPlayerOnce() {
+    if (hostInitialized) return;
+    hostInitialized = true;
     bindHostControls();
     updateUIControls();
     setupDynamicResizeObservers();
+  }
 
-    const canvas = document.getElementById('jk-canvas');
-    const initialDims = resize();
-    const DEFAULT_ASSET_VERSION = '20261104i';
-    const cfg = window.JKDemoConfig || {};
-    const rawScriptUrl = typeof cfg.scriptUrl === 'string' && cfg.scriptUrl ? cfg.scriptUrl : `/openjk.js?v=${DEFAULT_ASSET_VERSION}`;
-    const scriptUrl = rawScriptUrl.includes('?') ? rawScriptUrl : `${rawScriptUrl}?v=${DEFAULT_ASSET_VERSION}`;
-    const scriptPathOnly = scriptUrl.split('?')[0];
-    const scriptQuery = scriptUrl.includes('?') ? scriptUrl.slice(scriptUrl.indexOf('?')) : `?v=${DEFAULT_ASSET_VERSION}`;
-    const wasmDir = scriptPathOnly.includes('/') ? scriptPathOnly.slice(0, scriptPathOnly.lastIndexOf('/') + 1) : '/';
+  function validateOpenjkScriptBytes(bytes) {
+    if (!bytes || bytes.byteLength < 32768) {
+      throw new Error('openjk.js payload too small');
+    }
+    let firstIdx = 0;
+    while (
+      firstIdx < bytes.byteLength &&
+      (bytes[firstIdx] === 0x20 ||
+        bytes[firstIdx] === 0x09 ||
+        bytes[firstIdx] === 0x0a ||
+        bytes[firstIdx] === 0x0d ||
+        bytes[firstIdx] === 0xef ||
+        bytes[firstIdx] === 0xbb ||
+        bytes[firstIdx] === 0xbf)
+    ) {
+      firstIdx++;
+    }
+    if (firstIdx < bytes.byteLength && bytes[firstIdx] === 0x3c) {
+      throw new Error('Unexpected HTML response for openjk.js');
+    }
+    let lastIdx = bytes.byteLength - 1;
+    while (
+      lastIdx >= 0 &&
+      (bytes[lastIdx] === 0x20 ||
+        bytes[lastIdx] === 0x09 ||
+        bytes[lastIdx] === 0x0a ||
+        bytes[lastIdx] === 0x0d)
+    ) {
+      lastIdx--;
+    }
+    const lastByte = lastIdx >= 0 ? bytes[lastIdx] : 0;
+    // Valid Emscripten JS ends with ';' (0x3b) or '}' (0x7d)
+    if (lastByte !== 0x3b && lastByte !== 0x7d) {
+      throw new Error('Truncated openjk.js script');
+    }
+    return true;
+  }
 
-    const [bootDemoData, , autoexecText] = await Promise.all([
-      state.preloadOnly ? Promise.resolve(null) : fetchAndValidateDemoBytes(state.lastDemoSource || state.demoName),
-      hydrateCacheFromIndexedDB().then(() => prefetchStartupCoreAssetsAsync()),
-      fetchAutoexecConfig(wasmDir),
-    ]);
-    const bootShortName = bootDemoData ? bootDemoData.shortName : stripDemoExt(state.demoName);
+  function ensureEngineBooted(opts) {
+    initHostPlayerOnce();
+    if (state.engineStarted) return Promise.resolve(true);
+    if (engineBootPromise) return engineBootPromise;
 
-    let willUseSoftwareWebGL = Boolean(state.forceSoftwareRenderer);
-    if (!willUseSoftwareWebGL) {
-      try {
-        const probeCanvas = document.createElement('canvas');
-        probeCanvas.width = 4;
-        probeCanvas.height = 4;
-        const probeCtx = probeCanvas.getContext('webgl') || probeCanvas.getContext('experimental-webgl');
-        if (!probeCtx || typeof probeCtx.createShader !== 'function' || probeCtx.__jkUsingSoftwareWebGL || probeCanvas.__jkUsingSoftwareWebGL) {
-          willUseSoftwareWebGL = true;
-        } else {
-          const dbgExt = probeCtx.getExtension('WEBGL_debug_renderer_info');
-          const unmasked = dbgExt ? String(probeCtx.getParameter(dbgExt.UNMASKED_RENDERER_WEBGL) || '') : '';
-          const rStr = String(probeCtx.getParameter(probeCtx.RENDERER) || '');
-          if (/swiftshader|software/i.test(unmasked) || /software/i.test(rStr)) {
-            willUseSoftwareWebGL = true;
-          }
+    const options = opts || {};
+    const lowPriority = Boolean(
+      options.background && state.preloadOnly && !state.demoLoadedOnce
+    );
+
+    engineBootPromise = (async () => {
+      const canvas = document.getElementById('jk-canvas');
+      const initialDims = resize();
+      const cfg = window.JKDemoConfig || {};
+      const rawScriptUrl =
+        typeof cfg.scriptUrl === 'string' && cfg.scriptUrl
+          ? cfg.scriptUrl
+          : `/openjk.js?v=${DEFAULT_ENGINE_VERSION}`;
+      const scriptUrl = rawScriptUrl.includes('?')
+        ? rawScriptUrl
+        : `${rawScriptUrl}?v=${DEFAULT_ENGINE_VERSION}`;
+      const scriptPathOnly = scriptUrl.split('?')[0];
+      const scriptQuery = scriptUrl.includes('?')
+        ? scriptUrl.slice(scriptUrl.indexOf('?'))
+        : `?v=${DEFAULT_ENGINE_VERSION}`;
+      const wasmDir = scriptPathOnly.includes('/')
+        ? scriptPathOnly.slice(0, scriptPathOnly.lastIndexOf('/') + 1)
+        : '/';
+      const rawWasmUrl =
+        typeof cfg.wasmUrl === 'string' && cfg.wasmUrl
+          ? cfg.wasmUrl
+          : `${wasmDir}openjk.wasm`;
+      const wasmUrl = rawWasmUrl.includes('?')
+        ? rawWasmUrl
+        : `${rawWasmUrl}${scriptQuery}`;
+
+      state.engineBootError = '';
+      state.engineBootStage = 'downloading';
+      state.engineLastProgressAt = Date.now();
+
+      let jsLoaded = 0;
+      let jsTotal = EXPECTED_OPENJK_JS_BYTES;
+      let wasmLoaded = 0;
+      let wasmTotal = EXPECTED_OPENJK_WASM_BYTES;
+      const updateEngineProgress = () => {
+        state.engineDownloadLoaded = jsLoaded + wasmLoaded;
+        state.engineDownloadTotal = Math.max(
+          jsTotal + wasmTotal,
+          state.engineDownloadLoaded
+        );
+        state.engineLastProgressAt = Date.now();
+      };
+      updateEngineProgress();
+
+      let jsRes = null;
+      let wasmRes = null;
+      let bootDemoData = null;
+      let autoexecText = DEFAULT_AUTOEXEC_CFG;
+
+      if (!engineScriptInjected) {
+        const shouldPrefetchBootDemo =
+          !state.preloadOnly &&
+          !state.demoLoadedOnce &&
+          !isQueryDemoUrl(state.lastDemoSource || state.demoName);
+        try {
+          [jsRes, wasmRes, bootDemoData, , autoexecText] = await Promise.all([
+            fetchBytesWithProgressAndRetry(scriptUrl, {
+              maxAttempts: 4,
+              minBytes: 32768,
+              fallbackTotalBytes: EXPECTED_OPENJK_JS_BYTES,
+              lowPriority,
+              onProgress: (loaded, total) => {
+                jsLoaded = loaded;
+                if (total > 0) jsTotal = total;
+                updateEngineProgress();
+              },
+              validateBytes: validateOpenjkScriptBytes,
+            }),
+            fetchBytesWithProgressAndRetry(wasmUrl, {
+              maxAttempts: 4,
+              minBytes: 65536,
+              fallbackTotalBytes: EXPECTED_OPENJK_WASM_BYTES,
+              lowPriority,
+              onProgress: (loaded, total) => {
+                wasmLoaded = loaded;
+                if (total > 0) wasmTotal = total;
+                updateEngineProgress();
+              },
+              validateBytes: async (bytes) => {
+                state.engineBootStage = 'compiling';
+                state.engineLastProgressAt = Date.now();
+                const compiled = await WebAssembly.compile(bytes);
+                state.engineLastProgressAt = Date.now();
+                return compiled;
+              },
+            }),
+            shouldPrefetchBootDemo
+              ? fetchAndValidateDemoBytes(state.lastDemoSource || state.demoName)
+              : Promise.resolve(null),
+            hydrateCacheFromIndexedDB().then(() => prefetchStartupCoreAssetsAsync()),
+            fetchAutoexecConfig(wasmDir, `?v=${DEFAULT_PLAYER_VERSION}`),
+          ]);
+        } catch (err) {
+          console.warn('[OpenJK] Engine download/compile failed:', err);
+          state.engineBootStage = 'error';
+          state.engineBootError = 'Network error loading 3D engine';
+          engineBootPromise = null;
+          return false;
         }
-      } catch (_) {
-        willUseSoftwareWebGL = true;
+
+        if (!jsRes || !jsRes.ok || !jsRes.bytes || !wasmRes || !wasmRes.ok || !wasmRes.extra) {
+          state.engineBootStage = 'error';
+          state.engineBootError = 'Failed to load 3D engine files';
+          engineBootPromise = null;
+          return false;
+        }
       }
-    }
 
-    const engineArgs = [
-      '+set', 'fs_basepath', '.',
-      '+set', 'fs_homepath', '.',
-      '+set', 'sv_pure', '0',
-      '+set', 'com_bootlogo', '0',
-      '+set', 'ui_bypassMainMenuLoad', '1',
-      '+set', 'cl_skipMenu', '1',
-      '+set', 'r_primitives', '2',
-      '+set', 'r_fullscreen', '0',
-      '+set', 'r_mode', '-1',
-      '+set', 'r_customwidth', String(initialDims.width || 640),
-      '+set', 'r_customheight', String(initialDims.height || 360),
-      '+set', 'r_ext_multitexture', willUseSoftwareWebGL ? '0' : '1',
-      '+set', 'r_vertexLight', willUseSoftwareWebGL ? '1' : '0',
-      '+set', 'in_InteractiveMode', '0',
-      '+set', 'in_nograb', '1',
-      '+set', 'timescale', String(state.speed),
-      '+set', 's_khz', '22',
-      '+set', 's_volume', String(state.muted ? 0.0 : state.volume),
-    ];
-
-    if (willUseSoftwareWebGL) {
-      engineArgs.push(
-        '+set', 'r_picmip', '2',
-        '+set', 'r_lodbias', '2',
-        '+set', 'r_subdivisions', '20',
-        '+set', 'r_detailtextures', '0',
-        '+set', 'cg_shadows', '0',
-        '+set', 'r_dynamiclight', '0'
-      );
-    }
-
-    if (!state.preloadOnly) {
-      const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
-      state.metrics.demoLoadStartMs = Math.round(nowMs * 100) / 100;
-    }
-
-    window.Module = {
-      canvas: canvas,
-      noInitialRun: false,
-      arguments: engineArgs,
-      locateFile: function (path) {
-        if (path.endsWith('.wasm') && typeof cfg.wasmUrl === 'string' && cfg.wasmUrl) {
-          return cfg.wasmUrl.includes('?') ? cfg.wasmUrl : `${cfg.wasmUrl}${scriptQuery}`;
-        }
-        return wasmDir + path + (path.includes('?') ? '' : scriptQuery);
-      },
-      preRun: [
-        function () {
-          writeConfigToFS('autoexec.cfg', autoexecText);
-          if (bootDemoData) {
-            writeDemoToFS(bootDemoData.fileName, bootDemoData.bytes);
-          }
-        },
-      ],
-      onRuntimeInitialized: function () {
-        if (window.Module) {
-          const safeGetters = [
-            '_JK_DemoIsPlaying',
-            '_JK_DemoIsReady',
-            '_JK_DemoIsPaused',
-            '_JK_DemoIsMuted',
-            '_JK_DemoIsCompleted',
-            '_JK_DemoHasEnded',
-            '_JK_DemoGetCompletedCount',
-            '_JK_DemoGetState',
-            '_JK_DemoGetServerTime',
-            '_JK_DemoGetServerTimeMs',
-            '_JK_DemoGetRealtime',
-            '_JK_DemoGetFrameCount',
-            '_JK_DemoGetStartTimeMs',
-            '_JK_DemoGetEndTimeMs',
-            '_JK_DemoGetDurationMs',
-            '_JK_DemoGetCurrentTimeMs',
-            '_JK_DemoGetLoop',
-            '_JK_DemoGetSpeed',
-            '_JK_DemoGetVolume',
-            '_JK_DemoGetPk3BytesTransferred',
-            '_JK_DemoGetPK3BytesTransferred',
-            '_JK_DemoGetPk3RangeRequests',
-            '_JK_DemoGetPK3RangeRequests',
-            '_JK_DemoGetLoadedPackCount',
-            '_JK_DemoGetViewportWidth',
-            '_JK_DemoGetViewportHeight',
-            '_JK_DemoIsAudioActive',
-            '_JK_DemoGetAudioSamplesMixed',
-          ];
-          const lastGetterVals = {};
-          for (const gName of safeGetters) {
-            const origFn = window.Module[gName];
-            if (typeof origFn === 'function') {
-              lastGetterVals[gName] = 0;
-              window.Module[gName] = function (...args) {
-                if (gName === '_JK_DemoIsPlaying' && state.pendingDemoLoads > 0) {
-                  return 0;
-                }
-                const mod = window.Module;
-                if (mod && mod.Asyncify && mod.Asyncify.state !== 0) {
-                  return lastGetterVals[gName];
-                }
-                const val = origFn.apply(this, args);
-                lastGetterVals[gName] = val;
-                return val;
-              };
+      let willUseSoftwareWebGL = Boolean(state.forceSoftwareRenderer);
+      if (!willUseSoftwareWebGL) {
+        try {
+          const probeCanvas = document.createElement('canvas');
+          probeCanvas.width = 4;
+          probeCanvas.height = 4;
+          const probeCtx =
+            probeCanvas.getContext('webgl') ||
+            probeCanvas.getContext('experimental-webgl');
+          if (
+            !probeCtx ||
+            typeof probeCtx.createShader !== 'function' ||
+            probeCtx.__jkUsingSoftwareWebGL ||
+            probeCanvas.__jkUsingSoftwareWebGL
+          ) {
+            willUseSoftwareWebGL = true;
+          } else {
+            const dbgExt = probeCtx.getExtension('WEBGL_debug_renderer_info');
+            const unmasked = dbgExt
+              ? String(probeCtx.getParameter(dbgExt.UNMASKED_RENDERER_WEBGL) || '')
+              : '';
+            const rStr = String(probeCtx.getParameter(probeCtx.RENDERER) || '');
+            if (/swiftshader|software/i.test(unmasked) || /software/i.test(rStr)) {
+              willUseSoftwareWebGL = true;
             }
           }
+        } catch (_) {
+          willUseSoftwareWebGL = true;
         }
-        state.engineStarted = true;
-        const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
-        state.metrics.runtimeInitMs =
-          Math.round((nowMs - state.metrics.bootStartMs) * 100) / 100;
-        callWasm('JK_DemoSetLoop', 'number', ['number'], [state.loop ? 1 : 0]);
-        if (state.muted) mute();
-        else setVolume(state.volume);
-        flushPendingCommands();
-        resize();
-        if (state.preloadOnly) {
-          prewarmEngineInBackground();
-        } else if (!state.demoLoadedOnce) {
-          loadDemo(state.lastDemoSource || state.demoName);
-        }
-        setTimeout(() => {
-          resize();
-          if (state.speed !== 1.0) setSpeed(state.speed);
-          if (state.muted) mute();
-          else setVolume(state.volume);
-        }, 100);
-      },
-      print: function (text) {
-        if (text) console.log('[OpenJK]', text);
-      },
-      printErr: function (text) {
-        if (text) console.warn('[OpenJK]', text);
-      },
-    };
+      }
 
-    interceptingEmscriptenListeners = true;
-    const script = document.createElement('script');
-    script.src = scriptUrl;
-    script.async = true;
-    document.body.appendChild(script);
+      const engineArgs = [
+        '+set', 'fs_basepath', '.',
+        '+set', 'fs_homepath', '.',
+        '+set', 'sv_pure', '0',
+        '+set', 'com_bootlogo', '0',
+        '+set', 'ui_bypassMainMenuLoad', '1',
+        '+set', 'cl_skipMenu', '1',
+        '+set', 'r_primitives', '2',
+        '+set', 'r_fullscreen', '0',
+        '+set', 'r_mode', '-1',
+        '+set', 'r_customwidth', String(initialDims.width || 640),
+        '+set', 'r_customheight', String(initialDims.height || 360),
+        '+set', 'r_ext_multitexture', willUseSoftwareWebGL ? '0' : '1',
+        '+set', 'r_vertexLight', willUseSoftwareWebGL ? '1' : '0',
+        '+set', 'in_InteractiveMode', '0',
+        '+set', 'in_nograb', '1',
+        '+set', 'timescale', String(state.speed),
+        '+set', 's_khz', '22',
+        '+set', 's_volume', String(state.muted ? 0.0 : state.volume),
+      ];
+
+      if (willUseSoftwareWebGL) {
+        engineArgs.push(
+          '+set', 'r_picmip', '2',
+          '+set', 'r_lodbias', '2',
+          '+set', 'r_subdivisions', '20',
+          '+set', 'r_detailtextures', '0',
+          '+set', 'cg_shadows', '0',
+          '+set', 'r_dynamiclight', '0'
+        );
+      }
+
+      if (!state.preloadOnly && !state.demoLoadedOnce) {
+        const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        state.metrics.demoLoadStartMs = Math.round(nowMs * 100) / 100;
+      }
+
+      let compiledWasmModule = wasmRes ? wasmRes.extra : null;
+      if (wasmRes) {
+        wasmRes.bytes = null;
+        wasmRes.extra = null;
+      }
+      let scriptBytes = jsRes ? jsRes.bytes : null;
+      if (jsRes) {
+        jsRes.bytes = null;
+      }
+
+      const runtimeReadyPromise = new Promise((resolveRuntime) => {
+        let settled = false;
+        const finishRuntime = (ok) => {
+          if (settled) return;
+          settled = true;
+          resolveRuntime(Boolean(ok));
+        };
+
+        window.Module = {
+          canvas: canvas,
+          noInitialRun: false,
+          arguments: engineArgs,
+          locateFile: function (path) {
+            if (path.endsWith('.wasm')) {
+              return wasmUrl;
+            }
+            return wasmDir + path + (path.includes('?') ? '' : scriptQuery);
+          },
+          instantiateWasm: compiledWasmModule
+            ? function (imports, successCallback) {
+                state.engineBootStage = 'initializing';
+                state.engineLastProgressAt = Date.now();
+                const modToInstantiate = compiledWasmModule;
+                compiledWasmModule = null;
+                WebAssembly.instantiate(modToInstantiate, imports)
+                  .then(function (instance) {
+                    state.engineLastProgressAt = Date.now();
+                    successCallback(instance);
+                  })
+                  .catch(function (err) {
+                    console.error('[OpenJK] WebAssembly.instantiate failed:', err);
+                    state.engineBootStage = 'error';
+                    state.engineBootError = 'Failed to initialize 3D engine';
+                    finishRuntime(false);
+                  });
+                return {};
+              }
+            : undefined,
+          preRun: [
+            function () {
+              state.engineLastProgressAt = Date.now();
+              writeConfigToFS(
+                'autoexec.cfg',
+                autoexecText + `\nset cg_thirdPerson "${state.thirdPerson ? '1' : '0'}"\n`
+              );
+              if (bootDemoData) {
+                writeDemoToFS(bootDemoData.fileName, bootDemoData.bytes);
+              }
+            },
+          ],
+          onRuntimeInitialized: function () {
+            if (window.Module) {
+              const safeGetters = [
+                '_JK_DemoIsPlaying',
+                '_JK_DemoIsReady',
+                '_JK_DemoIsPaused',
+                '_JK_DemoIsMuted',
+                '_JK_DemoIsCompleted',
+                '_JK_DemoHasEnded',
+                '_JK_DemoGetCompletedCount',
+                '_JK_DemoGetState',
+                '_JK_DemoGetServerTime',
+                '_JK_DemoGetServerTimeMs',
+                '_JK_DemoGetRealtime',
+                '_JK_DemoGetFrameCount',
+                '_JK_DemoGetStartTimeMs',
+                '_JK_DemoGetEndTimeMs',
+                '_JK_DemoGetDurationMs',
+                '_JK_DemoGetCurrentTimeMs',
+                '_JK_DemoGetLoop',
+                '_JK_DemoGetSpeed',
+                '_JK_DemoGetVolume',
+                '_JK_DemoGetPk3BytesTransferred',
+                '_JK_DemoGetPK3BytesTransferred',
+                '_JK_DemoGetPk3RangeRequests',
+                '_JK_DemoGetPK3RangeRequests',
+                '_JK_DemoGetLoadedPackCount',
+                '_JK_DemoGetViewportWidth',
+                '_JK_DemoGetViewportHeight',
+                '_JK_DemoIsAudioActive',
+                '_JK_DemoGetAudioSamplesMixed',
+              ];
+              const lastGetterVals = {};
+              for (const gName of safeGetters) {
+                const origFn = window.Module[gName];
+                if (typeof origFn === 'function') {
+                  lastGetterVals[gName] = 0;
+                  window.Module[gName] = function (...args) {
+                    if (gName === '_JK_DemoIsPlaying' && state.pendingDemoLoads > 0) {
+                      return 0;
+                    }
+                    const mod = window.Module;
+                    if (mod && mod.Asyncify && mod.Asyncify.state !== 0) {
+                      return lastGetterVals[gName];
+                    }
+                    const val = origFn.apply(this, args);
+                    lastGetterVals[gName] = val;
+                    return val;
+                  };
+                }
+              }
+            }
+            state.engineStarted = true;
+            state.engineBootStage = 'ready';
+            state.engineBootError = '';
+            state.engineLastProgressAt = Date.now();
+            finishRuntime(true);
+
+            const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+            state.metrics.runtimeInitMs =
+              Math.round((nowMs - state.metrics.bootStartMs) * 100) / 100;
+            callWasm('JK_DemoSetLoop', 'number', ['number'], [state.loop ? 1 : 0]);
+            syncCameraModeToEngine();
+            if (state.muted) mute();
+            else setVolume(state.volume);
+            flushPendingCommands();
+            resize();
+            if (state.preloadOnly && !state.demoLoadedOnce && state.activeDemoLoadCount === 0) {
+              prewarmEngineInBackground();
+            } else if (!state.preloadOnly && !state.demoLoadedOnce) {
+              loadDemo(state.lastDemoSource || state.demoName);
+            }
+            setTimeout(() => {
+              resize();
+              if (state.speed !== 1.0) setSpeed(state.speed);
+              if (state.muted) mute();
+              else setVolume(state.volume);
+            }, 100);
+          },
+          print: function (text) {
+            if (text) console.log('[OpenJK]', text);
+          },
+          printErr: function (text) {
+            if (text) console.warn('[OpenJK]', text);
+          },
+        };
+
+        if (!engineScriptInjected) {
+          engineScriptInjected = true;
+          state.engineBootStage = 'initializing';
+          state.engineLastProgressAt = Date.now();
+          interceptingEmscriptenListeners = true;
+
+          let blobUrl = '';
+          try {
+            if (scriptBytes && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+              blobUrl = URL.createObjectURL(
+                new Blob([scriptBytes], { type: 'text/javascript' })
+              );
+            }
+          } catch (_) {
+            blobUrl = '';
+          }
+          scriptBytes = null;
+
+          const injectDirectFallback = () => {
+            const fallbackScript = document.createElement('script');
+            fallbackScript.src = scriptUrl;
+            fallbackScript.async = true;
+            fallbackScript.onerror = () => {
+              if (fallbackScript.parentNode) {
+                fallbackScript.parentNode.removeChild(fallbackScript);
+              }
+              engineScriptInjected = false;
+              state.engineBootStage = 'error';
+              state.engineBootError = 'Network error loading 3D engine';
+              finishRuntime(false);
+            };
+            document.body.appendChild(fallbackScript);
+          };
+
+          if (blobUrl) {
+            const script = document.createElement('script');
+            script.src = blobUrl;
+            script.async = true;
+            script.onload = () => {
+              try {
+                URL.revokeObjectURL(blobUrl);
+              } catch (_) {}
+            };
+            script.onerror = () => {
+              try {
+                URL.revokeObjectURL(blobUrl);
+              } catch (_) {}
+              if (script.parentNode) script.parentNode.removeChild(script);
+              injectDirectFallback();
+            };
+            document.body.appendChild(script);
+          } else {
+            injectDirectFallback();
+          }
+        }
+      });
+
+      const ok = await runtimeReadyPromise;
+      if (!ok) {
+        engineBootPromise = null;
+      }
+      return ok;
+    })();
+
+    return engineBootPromise;
+  }
+
+  function bootEngine() {
+    initHostPlayerOnce();
+    ensureEngineBooted({
+      background: Boolean(state.preloadOnly && !state.demoLoadedOnce),
+    }).catch(() => {});
   }
 
   if (document.readyState === 'loading') {
