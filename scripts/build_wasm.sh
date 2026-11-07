@@ -4,8 +4,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${ROOT_DIR}/build-wasm"
 WEB_DIR="${ROOT_DIR}/web"
+EMSDK_DIR="${EMSDK:-/home/dan/emsdk}"
 
-source /home/dan/emsdk/emsdk_env.sh >/dev/null 2>&1
+if [[ -f "${EMSDK_DIR}/emsdk_env.sh" ]]; then
+  source "${EMSDK_DIR}/emsdk_env.sh" >/dev/null 2>&1
+fi
+
+"${ROOT_DIR}/scripts/apply_emscripten_patches.sh"
 
 emcmake cmake -B "${BUILD_DIR}" -S "${ROOT_DIR}" -GNinja \
   -DCMAKE_BUILD_TYPE=Release \
