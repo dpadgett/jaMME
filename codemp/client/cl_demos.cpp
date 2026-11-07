@@ -69,9 +69,15 @@ static void demoFrameAddString( demoString_t *string, int num, const char *newSt
 
 static void demoFrameUnpack( msg_t *msg, demoFrame_t *oldFrame, demoFrame_t *newFrame, qboolean *firstPack ) {
 	int last;
+	int areaUsed, commandUsed;
+	if ( !msg || !newFrame ) {
+		return;
+	}
 	qboolean isDelta = MSG_ReadBits( msg, 1 ) ? qfalse : qtrue;
-	if (!isDelta)
+	if (!isDelta || !oldFrame) {
+		isDelta = qfalse;
 		oldFrame = 0;
+	}
 
 	newFrame->serverTime = MSG_ReadLong( msg );
 	/* Read config strings */
@@ -80,7 +86,13 @@ static void demoFrameUnpack( msg_t *msg, demoFrame_t *oldFrame, demoFrame_t *new
 	last = 0;
 	/* Extract config strings */
 	while ( 1 ) {
+		if ( msg->bit > ( msg->cursize << 3 ) ) {
+			Com_Error( ERR_DROP, "demoFrameUnpack: truncated configstrings\n" );
+		}
 		int i, num = MSG_ReadShort( msg );
+		if ( num < last || num > MAX_CONFIGSTRINGS ) {
+			Com_Error( ERR_DROP, "demoFrameUnpack: invalid configstring index %d (last=%d)\n", num, last );
+		}
 		if (!isDelta ) {
 			for (i = last;i<num;i++)
 				newFrame->string.offsets[i] = 0;
@@ -98,7 +110,7 @@ static void demoFrameUnpack( msg_t *msg, demoFrame_t *oldFrame, demoFrame_t *new
     /* Extract player states */
 	Com_Memset( newFrame->clientData, 0, sizeof( newFrame->clientData ));
 	last = MSG_ReadByte( msg );
-	while (last < MAX_CLIENTS) {
+	while (last >= 0 && last < MAX_CLIENTS) {
 		playerState_t *oldPlayer, *newPlayer;
 		playerState_t *oldVeh, *newVeh;
 		newFrame->clientData[last] = 1;
@@ -112,11 +124,20 @@ static void demoFrameUnpack( msg_t *msg, demoFrame_t *oldFrame, demoFrame_t *new
 		}
 		last = MSG_ReadByte( msg );
 	}
+	if ( last != MAX_CLIENTS ) {
+		Com_Error( ERR_DROP, "demoFrameUnpack: invalid client index %d\n", last );
+	}
 	/* Extract entity states */
 	last = 0;
 	while ( 1 ) {
+		if ( msg->bit > ( msg->cursize << 3 ) ) {
+			Com_Error( ERR_DROP, "demoFrameUnpack: truncated entities\n" );
+		}
 		int i, num = MSG_ReadBits( msg, GENTITYNUM_BITS );
 		entityState_t *oldEntity, *newEntity;	
+		if ( num < last || num >= MAX_GENTITIES ) {
+			Com_Error( ERR_DROP, "demoFrameUnpack: invalid entity index %d (last=%d)\n", num, last );
+		}
 		if ( isDelta ) {
 			for (i = last;i<num;i++)
 				if (oldFrame->entities[i].number == i)
@@ -135,17 +156,25 @@ static void demoFrameUnpack( msg_t *msg, demoFrame_t *oldFrame, demoFrame_t *new
 			} else {
 				oldEntity = &demoNullEntityState;
 			}
-			newEntity = &newFrame->entities[i];
+			newEntity = &newFrame->entities[num];
 			MSG_ReadDeltaEntity( msg, oldEntity, newEntity, num );
 		} else
 			break;
 		last = num + 1;
 	}
 	/* Read the area mask */
-	newFrame->areaUsed = MSG_ReadByte( msg );
+	areaUsed = MSG_ReadByte( msg );
+	if ( areaUsed < 0 || areaUsed > (int)sizeof( newFrame->areamask ) ) {
+		Com_Error( ERR_DROP, "demoFrameUnpack: invalid areaUsed %d\n", areaUsed );
+	}
+	newFrame->areaUsed = areaUsed;
 	MSG_ReadData( msg, newFrame->areamask, newFrame->areaUsed );
 	/* Read the command string data */
-	newFrame->commandUsed = MSG_ReadLong( msg );
+	commandUsed = MSG_ReadLong( msg );
+	if ( commandUsed < 0 || commandUsed > (int)sizeof( newFrame->commandData ) ) {
+		Com_Error( ERR_DROP, "demoFrameUnpack: invalid commandUsed %d\n", commandUsed );
+	}
+	newFrame->commandUsed = commandUsed;
 	MSG_ReadData( msg, newFrame->commandData, newFrame->commandUsed );
 	/* Extract the entity baselines */
 	if ( *firstPack ) {
@@ -502,6 +531,10 @@ static void demoConvertCleanup( void ) {
 		s_demoConvertState.convert = 0;
 	}
 	s_demoConvertState.active = qfalse;
+}
+
+extern "C" void demoConvertAbort( void ) {
+	demoConvertCleanup();
 }
 
 qboolean demoConvertBegin( const char *oldName, const char *newBaseName, qboolean smoothen ) {
@@ -1036,10 +1069,15 @@ static void demoPlaySynch( demoPlay_t *play, demoFrame_t *frame) {
 //	Com_Printf("Added %d commands, length %d\n", play->commandCount - startCount, totalLen );
 }
 
+extern void Com_RecoverFromThrownError( int code );
+
 static void demoPlayForwardFrame( demoPlay_t *play ) {
 	int			blockSize;
 	msg_t		msg;
 
+	if ( !play ) {
+		return;
+	}
 	if (play->filePos + 4 > play->fileSize) {
 		if (demo.commandSmoothing && play->frameNumber == -1) {
 			play->frame = play->nextFrame;
@@ -1074,18 +1112,28 @@ static void demoPlayForwardFrame( demoPlay_t *play ) {
 #endif
 	{
 		play->filePos += 4;
-		FS_Read( &blockSize, 4, play->fileHandle );
+		if ( FS_Read( &blockSize, 4, play->fileHandle ) != 4 ) {
+			play->lastFrame = qtrue;
+			return;
+		}
 		blockSize = LittleLong( blockSize );
-		FS_Read( demo.buffer, blockSize, play->fileHandle );
+		if ( blockSize <= 0 || blockSize > (int)sizeof( demo.buffer ) || FS_Read( demo.buffer, blockSize, play->fileHandle ) != blockSize ) {
+			play->lastFrame = qtrue;
+			return;
+		}
 		play->filePos += blockSize;
 	}
 	MSG_Init( &msg, demo.buffer, sizeof(demo.buffer) );
 	MSG_BeginReading( &msg );
 	msg.cursize = blockSize;
 	if (demo.commandSmoothing) {
-		play->frame = &play->storageFrame[(play->frameNumber + 1 + FRAME_BUF_SIZE) % FRAME_BUF_SIZE];
-		play->nextFrame = &play->storageFrame[(play->frameNumber + 2 + FRAME_BUF_SIZE) % FRAME_BUF_SIZE];
+		play->frame = &play->storageFrame[(((play->frameNumber + 1) % FRAME_BUF_SIZE) + FRAME_BUF_SIZE) % FRAME_BUF_SIZE];
+		play->nextFrame = &play->storageFrame[(((play->frameNumber + 2) % FRAME_BUF_SIZE) + FRAME_BUF_SIZE) % FRAME_BUF_SIZE];
 	} else {
+		if ( !play->frame || !play->nextFrame ) {
+			play->lastFrame = qtrue;
+			return;
+		}
 		demoFrame_t *copyFrame = play->frame;
 		play->frame = play->nextFrame;
 		play->nextFrame = copyFrame;
@@ -1093,7 +1141,16 @@ static void demoPlayForwardFrame( demoPlay_t *play ) {
 #ifdef __EMSCRIPTEN__
 	g_msgRawBitstream = qtrue;
 #endif
-	demoFrameUnpack( &msg, play->frame, play->nextFrame, &demo.firstPack );
+	try {
+		demoFrameUnpack( &msg, play->frame, play->nextFrame, &demo.firstPack );
+	} catch ( int code ) {
+#ifdef __EMSCRIPTEN__
+		g_msgRawBitstream = qfalse;
+#endif
+		play->lastFrame = qtrue;
+		Com_RecoverFromThrownError( code );
+		return;
+	}
 #ifdef __EMSCRIPTEN__
 	g_msgRawBitstream = qfalse;
 #endif
@@ -1102,6 +1159,12 @@ static void demoPlayForwardFrame( demoPlay_t *play ) {
 
 static void demoPlaySetIndex( demoPlay_t *play, int index ) {
 	int wantPos;
+	if ( !play || play->fileIndexCount <= 0 ) {
+		if ( play ) {
+			play->lastFrame = qtrue;
+		}
+		return;
+	}
 	if (index <0 || index >= play->fileIndexCount) {
 		Com_Printf("demoFile index Out of range search\n");
 		index = 0;
@@ -1146,7 +1209,7 @@ static void demoPlaySetIndex( demoPlay_t *play, int index ) {
 static int demoPlaySeek(demoPlay_t *play, int seekTime) {
 	int i;
 	int curFrameTime;
-	if (!play)
+	if (!play || play->fileIndexCount <= 0 || !play->frame || !play->nextFrame)
 		return 0;
 	play->seekTime = seekTime;
 	seekTime += play->startTime;
@@ -1404,9 +1467,11 @@ qboolean demoGetDefaultState(int index, entityState_t *state) {
 extern void CL_ConfigstringModified( void );
 qboolean demoGetServerCommand( int cmdNumber ) {
 	demoPlay_t *play = demo.play.handle;
-	int index = cmdNumber % DEMO_PLAY_CMDS;
+	int index = ((cmdNumber % DEMO_PLAY_CMDS) + DEMO_PLAY_CMDS) % DEMO_PLAY_CMDS;
 	const char *cmd;
 
+	if ( !play )
+		return qfalse;
 	if (cmdNumber < play->commandCount - DEMO_PLAY_CMDS || cmdNumber > play->commandCount )
 		return qfalse;
 	
@@ -1442,11 +1507,19 @@ int demoSeek( int seekTime ) {
 }
 
 void demoRenderFrame( stereoFrame_t stereo ) {
+	if ( !cgvm ) {
+		return;
+	}
 	VM_Call( cgvm, CG_DRAW_ACTIVE_FRAME, cls.realtime, stereo, 2 );	
 }
 
 void demoGetSnapshotNumber( int *snapNumber, int *serverTime ) {
 	demoPlay_t *play = demo.play.handle;
+	if ( !play || !play->frame || !play->nextFrame ) {
+		if ( snapNumber ) *snapNumber = 0;
+		if ( serverTime ) *serverTime = 0;
+		return;
+	}
 
 	*snapNumber = play->frameNumber + (play->lastFrame ? 0 : 1);
 	*serverTime = play->lastFrame ?  play->frame->serverTime : play->nextFrame->serverTime;
@@ -1457,6 +1530,8 @@ qboolean demoGetSnapshot( int snapNumber, snapshot_t *snap ) {
 	demoFrame_t *frame;
 	int i;
 
+	if ( !play || !snap )
+		return qfalse;
 	if (demo.commandSmoothing && snapNumber < play->frameNumber - FRAME_BUF_SIZE + 2)
 		return qfalse;
 	if (!demo.commandSmoothing && snapNumber < play->frameNumber)
@@ -1467,9 +1542,11 @@ qboolean demoGetSnapshot( int snapNumber, snapshot_t *snap ) {
 		return qfalse;
 
 	if (demo.commandSmoothing)
-		frame = &play->storageFrame[snapNumber % FRAME_BUF_SIZE];
+		frame = &play->storageFrame[((snapNumber % FRAME_BUF_SIZE) + FRAME_BUF_SIZE) % FRAME_BUF_SIZE];
 	else
 		frame = snapNumber == play->frameNumber ? play->frame : play->nextFrame;
+	if ( !frame )
+		return qfalse;
 
 	demoPlaySynch( play, frame );
 	snap->serverCommandSequence = play->commandCount;
@@ -1494,7 +1571,9 @@ qboolean demoGetSnapshot( int snapNumber, snapshot_t *snap ) {
 	snap->snapFlags = 0;
 	snap->ping = 0;
 	snap->numServerCommands = 0;
-	Com_Memcpy( snap->areamask, frame->areamask, frame->areaUsed );
+	if ( frame->areaUsed > 0 && frame->areaUsed <= (int)sizeof( snap->areamask ) ) {
+		Com_Memcpy( snap->areamask, frame->areamask, frame->areaUsed );
+	}
 	return qtrue;
 }
 

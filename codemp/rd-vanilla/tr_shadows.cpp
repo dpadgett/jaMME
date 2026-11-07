@@ -597,14 +597,16 @@ void RB_ProjectionShadowDeform( void ) {
 //update tr.screenImage
 void RB_CaptureScreenImage(void)
 {
-#ifdef __EMSCRIPTEN__
-	return;
-#else
 	int radX = 2048;
 	int radY = 2048;
 	int x = glConfig.vidWidth/2;
 	int y = glConfig.vidHeight/2;
 	int cX, cY;
+
+	if (glConfig.vidWidth < 16 || glConfig.vidHeight < 16)
+	{
+		return;
+	}
 
 	GL_Bind( tr.screenImage );
 	//using this method, we could pixel-filter the texture and all sorts of crazy stuff.
@@ -658,11 +660,12 @@ void RB_CaptureScreenImage(void)
 		cY = 0;
 	}
 
-#ifdef HAVE_GLES
+#ifdef __EMSCRIPTEN__
+	qglCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, cX, cY, radX, radY, 0);
+#elif defined(HAVE_GLES)
 	qglCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cX, cY, radX, radY, 0);
 #else
 	qglCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16, cX, cY, radX, radY, 0);
-#endif
 #endif
 }
 
@@ -686,6 +689,10 @@ void RB_DistortionFill(void)
 	if (!tr_distortionPrePost)
 	{
 		RB_CaptureScreenImage();
+	}
+	else
+	{
+		GL_Bind( tr.screenImage );
 	}
 
 	qglEnable(GL_STENCIL_TEST);

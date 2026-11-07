@@ -463,6 +463,10 @@ int main ( int argc, char* argv[] )
 	int		i;
 	char	commandLine[ MAX_STRING_CHARS ] = { 0 };
 
+#ifdef __EMSCRIPTEN__
+	SDL_SetHint( "SDL_EMSCRIPTEN_ASYNCIFY", "0" );
+#endif
+
 	// done before Com/Sys_Init since we need this for error output
 	//Sys_CreateConsole();
 

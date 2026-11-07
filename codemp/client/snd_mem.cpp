@@ -10,6 +10,9 @@
  *
  *****************************************************************************/
 #include "snd_local.h"
+#include <set>
+
+static std::set<const openSound_t *> s_liveOpenSounds;
 
 #define HAVE_LIBMAD
 #ifdef WIN32
@@ -121,6 +124,7 @@ static openSound_t *S_StreamOpen( const char *fileName, int dataSize ) {
 	memset( open, 0, sizeof( openSound_t ) + dataSize );
 	open->fileSize = fileSize;
 	open->memData = (byte *)memBuf;
+	s_liveOpenSounds.insert( open );
 	return open;
 #else
 	fileSize = FS_FOpenFileRead( fileName, &fileHandle, qtrue );
@@ -130,6 +134,7 @@ static openSound_t *S_StreamOpen( const char *fileName, int dataSize ) {
 	memset( open, 0, sizeof( openSound_t ) + dataSize);
 	open->fileSize = fileSize;
 	open->fileHandle = fileHandle;
+	s_liveOpenSounds.insert( open );
 	return open;
 #endif
 }
@@ -234,6 +239,7 @@ static int S_WavSeek( struct openSound_s *open, int samples ) {
 	if (!open || !open->data )
 		return 0;
 	wav = (wavOpen_t *)(open->data);
+	wantPos = wav->dataStart;
 	if (wav->bits == 8)
 		wantPos = samples + wav->dataStart;
 	else if (wav->bits == 16)
@@ -376,6 +382,16 @@ static openSound_t * S_WavOpen( const char *fileName ) {
 	}
 	if ((wav->channels != 1) && (wav->channels != 2)) {
 		Com_Printf("WavOpen:can't open file with %d channels, %s\n", wav->channels, fileName);
+		S_SoundClose( open );
+		return 0;
+	}
+	if ((wav->bits != 8) && (wav->bits != 16)) {
+		Com_Printf("WavOpen:can't open file with %d bits, %s\n", wav->bits, fileName);
+		S_SoundClose( open );
+		return 0;
+	}
+	if (open->rate <= 0) {
+		Com_Printf("WavOpen:invalid sample rate %d, %s\n", open->rate, fileName);
 		S_SoundClose( open );
 		return 0;
 	}
@@ -607,6 +623,7 @@ static openSound_t *S_MP3Open( const char *fileName ) {
 		return 0;
 	}
 	mp3 = (mp3Open_t *)open->data;
+	memset (&header, 0, sizeof(header));
 	mad_header_init (&header);
 	mad_stream_init (&mp3->stream);
 	mad_frame_init (&mp3->frame);
@@ -657,6 +674,11 @@ static openSound_t *S_MP3Open( const char *fileName ) {
 	mp3->frameSamples = 32 * MAD_NSBSAMPLES( &header );
 	open->totalSamples = mp3->frameSamples * mp3->frameCount;
 	open->rate = header.samplerate;
+	if (mp3->frameCount <= 0 || open->totalSamples <= 0 || open->rate <= 0) {
+		Com_Printf("MP3Open:File %s has no valid frames\n", fileName);
+		S_SoundClose( open );
+		return 0;
+	}
 	return open;
 }
 
@@ -921,7 +943,7 @@ finishSamples:
 
 static int S_OggSeek( struct openSound_s *open, int samples ) {
 	oggOpen_t *ogg;
-	if (!open || !open->data )
+	if (!open || !open->data || open->totalSamples <= 0 )
 		return 0;
 	ogg = (oggOpen_t *)open->data;
 	ogg->samplesLeft = 0;
@@ -1387,7 +1409,7 @@ openSound_t *S_SoundOpen( const char *fileName ) {
 
 int S_SoundRead( openSound_t *open, qboolean stereo, int samples, short *data ){
 	int read ;
-	if (!open)
+	if (!open || s_liveOpenSounds.find( open ) == s_liveOpenSounds.end() || !open->read)
 		return 0;
 	if ( samples + open->doneSamples > open->totalSamples )
 		samples = open->totalSamples - open->doneSamples;
@@ -1399,6 +1421,8 @@ int S_SoundRead( openSound_t *open, qboolean stereo, int samples, short *data ){
 }
 
 int S_SoundSeek( openSound_t *open, int samples ) {
+	if (!open || s_liveOpenSounds.find( open ) == s_liveOpenSounds.end() || !open->seek)
+		return 0;
 	if ( samples > open->totalSamples)
 		samples = open->totalSamples;
 	if ( samples < 0)
@@ -1408,7 +1432,15 @@ int S_SoundSeek( openSound_t *open, int samples ) {
 }
 
 void S_SoundClose( openSound_t *open ) {
-	open->close( open );
+	if ( !open )
+		return;
+	if ( s_liveOpenSounds.find( open ) == s_liveOpenSounds.end() )
+		return;
+	s_liveOpenSounds.erase( open );
+	if ( open->close ) {
+		open->close( open );
+		open->close = 0;
+	}
 	S_StreamClose( open );
 	Z_Free( open );
 }

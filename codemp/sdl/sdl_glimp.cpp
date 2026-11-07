@@ -775,8 +775,10 @@ static rserr_t GLimp_SetMode(int mode, qboolean fullscreen, qboolean noborder)
 		}
 #endif
 
+#ifndef __EMSCRIPTEN__
 		if( SDL_GL_SetSwapInterval(r_swapInterval->integer ) < 0 )
 			Com_Printf( "SDL_GL_SetSwapInterval not supported\n" );
+#endif
 
 #ifdef USE_ICON
 		{
@@ -844,6 +846,10 @@ static qboolean GLimp_StartDriverAndSetMode(int mode, qboolean fullscreen, qbool
 {
 	int i;
 	rserr_t err;
+
+#ifdef __EMSCRIPTEN__
+	SDL_SetHint( "SDL_EMSCRIPTEN_ASYNCIFY", "0" );
+#endif
 
 	if (!SDL_WasInit(SDL_INIT_VIDEO))
 	{

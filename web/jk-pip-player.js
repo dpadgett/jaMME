@@ -70,6 +70,61 @@
       localStorage.setItem(STORAGE_KEY_PLAYER_PREFS, JSON.stringify(existing));
     } catch (_) {}
   }
+
+  function clampGammaPref(val) {
+    const num = Number(val);
+    if (!Number.isFinite(num)) return 1.0;
+    return Math.round(Math.min(3.0, Math.max(0.5, num)) * 100) / 100;
+  }
+
+  function clampOverbrightPref(val) {
+    const num = Math.round(Number(val));
+    if (!Number.isFinite(num)) return 0;
+    return Math.min(3, Math.max(0, num));
+  }
+
+  function readPersistedLightingPrefs() {
+    const defaults = { gamma: 1.0, overbright: 0 };
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY_PLAYER_PREFS);
+      if (!raw) return defaults;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        if (typeof parsed.gamma === 'number' && Number.isFinite(parsed.gamma)) {
+          defaults.gamma = clampGammaPref(parsed.gamma);
+        }
+        if (typeof parsed.overbright === 'number' && Number.isFinite(parsed.overbright)) {
+          defaults.overbright = clampOverbrightPref(parsed.overbright);
+        }
+      }
+    } catch (_) {}
+    return defaults;
+  }
+
+  function writePersistedLightingPrefs(patch) {
+    try {
+      let existing = {};
+      const raw = localStorage.getItem(STORAGE_KEY_PLAYER_PREFS);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') existing = parsed;
+      }
+      if (patch && typeof patch.gamma === 'number') {
+        existing.gamma = clampGammaPref(patch.gamma);
+      }
+      if (patch && typeof patch.overbright === 'number') {
+        existing.overbright = clampOverbrightPref(patch.overbright);
+      }
+      localStorage.setItem(STORAGE_KEY_PLAYER_PREFS, JSON.stringify(existing));
+    } catch (_) {}
+  }
+
+  const LIGHTING_PRESETS = {
+    stock: { gamma: 1.0, overbright: 0, label: 'Stock' },
+    overbright: { gamma: 1.0, overbright: 2, label: 'Overbright' },
+    gamma2: { gamma: 2.0, overbright: 0, label: 'Gamma 2' },
+    bright: { gamma: 1.4, overbright: 1, label: 'Bright+' },
+  };
   const SIZE_PRESETS = {
     compact: { width: 420, height: 290 },
     default: { width: 560, height: 376 },
@@ -84,18 +139,25 @@
     '<svg class="jk-icon-svg" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10"/></svg>';
   const ICON_FULLSCREEN_EXIT =
     '<svg class="jk-icon-svg" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 2.5V6H2.5M13.5 6H10V2.5M10 13.5V10h3.5M2.5 10H6v3.5"/></svg>';
+  const ICON_BRIGHTNESS =
+    '<svg class="jk-icon-svg" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="2.7"/><path d="M8 1.5v1.8M8 12.7v1.8M1.5 8h1.8M12.7 8h1.8M3.4 3.4l1.3 1.3M11.3 11.3l1.3 1.3M12.6 3.4l-1.3 1.3M4.7 11.3l-1.3 1.3"/></svg>';
   const ICON_PLAY_OVERLAY =
     '<svg class="jk-icon-svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor" aria-hidden="true"><path d="M7 5.5v13l11-6.5-11-6.5z"/></svg>';
   const ICON_PAUSE_OVERLAY =
     '<svg class="jk-icon-svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>';
 
   const FS_CONTROLS_HIDE_DELAY_MS = 2800;
+  const initialLightingPrefs = readPersistedLightingPrefs();
 
   const pipState = {
     open: false,
     hasSavedLayout: false,
     preset: 'default',
     thirdPerson: readPersistedThirdPersonPref(),
+    gamma: initialLightingPrefs.gamma,
+    overbright: initialLightingPrefs.overbright,
+    lightingOpen: false,
+    scrubbingGamma: false,
     width: SIZE_PRESETS.default.width,
     height: SIZE_PRESETS.default.height,
     x: null,
@@ -790,6 +852,186 @@
         border-color: #58a6ff;
         color: #ffffff;
       }
+      .jk-pip-ctrl-btn.jk-pip-light-boosted:not(.active) {
+        border-color: #58a6ff;
+        color: #79c0ff;
+      }
+      #jk-pip-lighting-btn {
+        gap: calc(4px * var(--jk-ui-scale, 1));
+      }
+      #jk-pip-lighting-panel {
+        position: absolute;
+        right: calc(10px * var(--jk-ui-scale, 1));
+        bottom: calc(64px * var(--jk-ui-scale, 1));
+        width: min(calc(252px * var(--jk-ui-scale, 1)), calc(100% - 20px * var(--jk-ui-scale, 1)));
+        max-height: calc(100% - 70px * var(--jk-ui-scale, 1));
+        overflow-y: auto;
+        padding: calc(8px * var(--jk-ui-scale, 1)) calc(10px * var(--jk-ui-scale, 1));
+        background: rgba(22, 27, 34, 0.97);
+        border: 1px solid #30363d;
+        border-radius: calc(6px * var(--jk-ui-scale, 1));
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.65);
+        color: #e6edf3;
+        z-index: 30;
+        display: flex;
+        flex-direction: column;
+        gap: calc(7px * var(--jk-ui-scale, 1));
+        box-sizing: border-box;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+      #jk-pip-lighting-panel[hidden] {
+        display: none !important;
+      }
+      #jk-pip-card:fullscreen #jk-pip-lighting-panel,
+      #jk-pip-card:-webkit-full-screen #jk-pip-lighting-panel,
+      #jk-pip-card.jk-pip-pseudo-fullscreen #jk-pip-lighting-panel {
+        right: calc(12px + env(safe-area-inset-right, 0px));
+        bottom: calc(70px + env(safe-area-inset-bottom, 0px));
+        max-height: calc(100% - 82px - env(safe-area-inset-bottom, 0px) - env(safe-area-inset-top, 0px));
+      }
+      .jk-pip-light-presets {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: calc(4px * var(--jk-ui-scale, 1));
+      }
+      .jk-pip-light-preset-btn,
+      .jk-pip-ob-btn {
+        background: #21262d;
+        color: #c9d1d9;
+        border: 1px solid #30363d;
+        border-radius: 4px;
+        padding: calc(3px * var(--jk-ui-scale, 1)) calc(4px * var(--jk-ui-scale, 1));
+        min-block-size: calc(22px * var(--jk-ui-scale, 1));
+        font-size: calc(10.5px * var(--jk-ui-scale, 1));
+        line-height: 1.15;
+        cursor: pointer;
+        text-align: center;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .jk-pip-light-preset-btn:hover,
+      .jk-pip-ob-btn:hover {
+        background: #30363d;
+        color: #ffffff;
+      }
+      .jk-pip-light-preset-btn.active,
+      .jk-pip-ob-btn.active {
+        background: #1f6feb;
+        border-color: #58a6ff;
+        color: #ffffff;
+        font-weight: 600;
+      }
+      .jk-pip-light-row {
+        display: flex;
+        flex-direction: column;
+        gap: calc(3px * var(--jk-ui-scale, 1));
+      }
+      .jk-pip-light-row-hdr {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: calc(6px * var(--jk-ui-scale, 1));
+        font-size: calc(10.5px * var(--jk-ui-scale, 1));
+        color: #8b949e;
+      }
+      .jk-pip-light-row-hdr label,
+      .jk-pip-light-row-hdr span {
+        color: #c9d1d9;
+        font-weight: 500;
+      }
+      .jk-pip-light-val {
+        font-variant-numeric: tabular-nums;
+        color: #58a6ff !important;
+        font-weight: 600 !important;
+      }
+      .jk-pip-ob-group {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: calc(4px * var(--jk-ui-scale, 1));
+      }
+      input[type="range"].jk-pip-styled-range {
+        --slider-track-size: calc(5px * var(--jk-ui-scale, 1));
+        --slider-thumb-size: calc(14px * var(--jk-ui-scale, 1));
+        --slider-track-radius: 999px;
+        --slider-thumb-radius: 50%;
+        --slider-track-color: #30363d;
+        --slider-fill-color: #58a6ff;
+        --slider-thumb-color: #58a6ff;
+        --slider-direction: to right;
+        --attr-min: attr(min type(<number>), 1);
+        --attr-max: attr(max type(<number>), 2.5);
+        --control-value: attr(value type(<number>), 1);
+        --slider-progress: calc(
+          progress(var(--control-value), var(--attr-min), var(--attr-max)) * 100%
+        );
+        appearance: none;
+        -webkit-appearance: none;
+        inline-size: 100%;
+        block-size: calc(20px * var(--jk-ui-scale, 1));
+        margin: 0;
+        padding: 0;
+        border: 0;
+        border-radius: 0;
+        background: transparent;
+        cursor: pointer;
+      }
+      input[type="range"].jk-pip-styled-range:dir(rtl) {
+        --slider-direction: to left;
+      }
+      @supports not (opacity: progress(1, 0, 100)) {
+        input[type="range"].jk-pip-styled-range {
+          --slider-progress: calc(
+            (var(--control-value) - var(--attr-min)) /
+            (var(--attr-max) - var(--attr-min)) * 100%
+          );
+        }
+      }
+      input[type="range"].jk-pip-styled-range::-webkit-slider-runnable-track {
+        block-size: var(--slider-track-size);
+        border: 0;
+        border-radius: var(--slider-track-radius);
+        background: linear-gradient(
+          var(--slider-direction),
+          var(--slider-fill-color) var(--slider-progress),
+          var(--slider-track-color) var(--slider-progress)
+        );
+      }
+      input[type="range"].jk-pip-styled-range::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        appearance: none;
+        inline-size: var(--slider-thumb-size);
+        block-size: var(--slider-thumb-size);
+        margin-block-start: calc(
+          (var(--slider-track-size) - var(--slider-thumb-size)) / 2
+        );
+        border: 0;
+        border-radius: var(--slider-thumb-radius);
+        background: var(--slider-thumb-color);
+      }
+      input[type="range"].jk-pip-styled-range::-moz-range-track {
+        block-size: var(--slider-track-size);
+        border: 0;
+        border-radius: var(--slider-track-radius);
+        background: var(--slider-track-color);
+      }
+      input[type="range"].jk-pip-styled-range::-moz-range-progress {
+        block-size: var(--slider-track-size);
+        border-radius: var(--slider-track-radius);
+        background: var(--slider-fill-color);
+      }
+      input[type="range"].jk-pip-styled-range::-moz-range-thumb {
+        inline-size: var(--slider-thumb-size);
+        block-size: var(--slider-thumb-size);
+        border: 0;
+        border-radius: var(--slider-thumb-radius);
+        background: var(--slider-thumb-color);
+      }
+      input[type="range"].jk-pip-styled-range:focus-visible {
+        outline: 2px solid var(--slider-fill-color);
+        outline-offset: 3px;
+      }
       .jk-pip-select {
         position: relative;
         z-index: 12;
@@ -943,6 +1185,35 @@
       #jk-pip-card.jk-pip-xs #jk-pip-time {
         min-inline-size: calc(60px * var(--jk-ui-scale, 1));
         font-size: calc(10px * var(--jk-ui-scale, 1));
+      }
+      #jk-pip-card.jk-pip-xs .jk-pip-light-label {
+        display: none;
+      }
+      #jk-pip-card.jk-pip-xs #jk-pip-lighting-panel {
+        right: calc(6px * var(--jk-ui-scale, 1));
+        bottom: calc(36px * var(--jk-ui-scale, 1));
+        width: calc(100% - 12px * var(--jk-ui-scale, 1));
+        max-height: calc(100% - 42px * var(--jk-ui-scale, 1));
+        padding: calc(6px * var(--jk-ui-scale, 1)) calc(8px * var(--jk-ui-scale, 1));
+      }
+      #jk-pip-card.jk-pip-xs .jk-pip-light-presets {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      @container jk-card (max-width: 380px) {
+        .jk-pip-light-label {
+          display: none;
+        }
+      }
+      @container jk-card (max-width: 280px) {
+        .jk-pip-light-presets {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        #jk-pip-lighting-panel {
+          right: calc(6px * var(--jk-ui-scale, 1));
+          bottom: calc(36px * var(--jk-ui-scale, 1));
+          width: calc(100% - 12px * var(--jk-ui-scale, 1));
+          max-height: calc(100% - 42px * var(--jk-ui-scale, 1));
+        }
       }
       @container jk-card (max-width: 340px) {
         .jk-pip-header-divider {
@@ -1263,7 +1534,10 @@
     const player = getPlayer();
     if (!player) return false;
     const rawMod = window.Module || (typeof player.getModule === 'function' ? player.getModule() : null);
-    const mod = rawMod && (!rawMod.Asyncify || rawMod.Asyncify.state === 0) ? rawMod : null;
+    const mod =
+      rawMod && (!rawMod.Asyncify || (rawMod.Asyncify.state === 0 && !rawMod.Asyncify.currData))
+        ? rawMod
+        : null;
     if (mod && typeof mod._JK_DemoIsPaused === 'function') {
       return mod._JK_DemoIsPaused() === 1;
     }
@@ -1287,10 +1561,18 @@
     card.classList.remove('jk-pip-fs-controls-hidden');
     clearFullscreenControlsTimer();
     if (!scheduleAutoHide || !isCardFullscreen()) return;
-    if (isDemoCurrentlyPaused() || pipState.scrubbing) return;
+    if (isDemoCurrentlyPaused() || pipState.scrubbing || pipState.lightingOpen || pipState.scrubbingGamma) {
+      return;
+    }
     pipState.fsControlsTimer = setTimeout(() => {
       pipState.fsControlsTimer = null;
-      if (!isCardFullscreen() || isDemoCurrentlyPaused() || pipState.scrubbing) {
+      if (
+        !isCardFullscreen() ||
+        isDemoCurrentlyPaused() ||
+        pipState.scrubbing ||
+        pipState.lightingOpen ||
+        pipState.scrubbingGamma
+      ) {
         return;
       }
       const speedSelect = document.getElementById('jk-pip-speed');
@@ -1581,11 +1863,37 @@
             <button type="button" id="jk-pip-loop" class="jk-pip-ctrl-btn active" title="Loop Demo" aria-pressed="true">Loop: On</button>
             <button type="button" id="jk-pip-camera" class="jk-pip-ctrl-btn${pipState.thirdPerson ? '' : ' active'}" title="Switch camera view (1st / 3rd person)" aria-label="${pipState.thirdPerson ? 'View: 3rd — Switch to first-person camera' : 'View: 1st — Switch to third-person camera'}">${pipState.thirdPerson ? 'View: 3rd' : 'View: 1st'}</button>
             <button type="button" id="jk-pip-start-over" class="jk-pip-ctrl-btn" title="Restart from 0:00" aria-label="0:00 — Restart from beginning">0:00</button>
+            <button type="button" id="jk-pip-lighting-btn" class="jk-pip-ctrl-btn" title="Brightness &amp; Lighting (Gamma / Overbright)" aria-label="Lighting settings" aria-expanded="false" aria-controls="jk-pip-lighting-panel">${ICON_BRIGHTNESS}<span class="jk-pip-light-label">Light</span></button>
           </div>
           <div class="jk-pip-btn-group jk-pip-audio-group">
             <button type="button" id="jk-pip-mute" class="jk-pip-ctrl-btn" title="Mute / Unmute">Mute</button>
             <input type="range" id="jk-pip-volume" min="0" max="1" step="0.01" value="0.8" aria-label="Volume" />
             <button type="button" id="jk-pip-fullscreen" class="jk-pip-ctrl-btn" title="Fullscreen" aria-label="Fullscreen" aria-pressed="false">${ICON_FULLSCREEN_ENTER}</button>
+          </div>
+        </div>
+      </div>
+      <div id="jk-pip-lighting-panel" role="region" aria-label="Brightness and lighting" hidden>
+        <div class="jk-pip-light-presets" role="group" aria-label="Lighting presets">
+          <button type="button" class="jk-pip-light-preset-btn" data-light-preset="stock" title="Stock JKA lighting (r_gamma 1, r_mapOverBrightBits 0)">Stock</button>
+          <button type="button" class="jk-pip-light-preset-btn" data-light-preset="overbright" title="Overbright lightmaps (r_gamma 1, r_mapOverBrightBits 2)">Overbright</button>
+          <button type="button" class="jk-pip-light-preset-btn" data-light-preset="gamma2" title="Gamma 2.0 (r_gamma 2, r_mapOverBrightBits 0)">Gamma 2</button>
+          <button type="button" class="jk-pip-light-preset-btn" data-light-preset="bright" title="Balanced bright combo (r_gamma 1.4, r_mapOverBrightBits 1)">Bright+</button>
+        </div>
+        <div class="jk-pip-light-row">
+          <div class="jk-pip-light-row-hdr">
+            <label for="jk-pip-gamma" title="Display gamma curve (r_gamma)">Gamma</label>
+            <span id="jk-pip-gamma-val" class="jk-pip-light-val">1.00</span>
+          </div>
+          <input type="range" id="jk-pip-gamma" class="jk-pip-styled-range" min="1" max="2.5" step="0.05" value="1" aria-valuetext="1.00 (Stock)" />
+        </div>
+        <div class="jk-pip-light-row">
+          <div class="jk-pip-light-row-hdr">
+            <span id="jk-pip-ob-label" title="Map lightmap overbright bits (r_mapOverBrightBits)">Overbright</span>
+          </div>
+          <div class="jk-pip-ob-group" role="group" aria-labelledby="jk-pip-ob-label">
+            <button type="button" class="jk-pip-ob-btn active" data-overbright="0" aria-pressed="true">0 (Off)</button>
+            <button type="button" class="jk-pip-ob-btn" data-overbright="1" aria-pressed="false">+1</button>
+            <button type="button" class="jk-pip-ob-btn" data-overbright="2" aria-pressed="false">+2</button>
           </div>
         </div>
       </div>
@@ -1601,6 +1909,8 @@
 
     document.body.appendChild(card);
     bindPiPEvents(card);
+    applyCanvasGammaFilterLocal(pipState.gamma);
+    syncLightingUI();
     applyCardGeometry();
     return card;
   }
@@ -1929,6 +2239,90 @@
       });
     }
 
+    // Lighting / Brightness panel & controls
+    const lightingBtn = card.querySelector('#jk-pip-lighting-btn');
+    const lightingPanel = card.querySelector('#jk-pip-lighting-panel');
+    const gammaInput = card.querySelector('#jk-pip-gamma');
+    if (lightingBtn) {
+      lightingBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (e && e.isTrusted) primeSharedAudioOnUserGesture();
+        setLightingPanelOpen(!pipState.lightingOpen);
+      });
+    }
+    if (lightingPanel) {
+      lightingPanel.addEventListener('pointerdown', (e) => {
+        e.stopPropagation();
+        if (isCardFullscreen()) {
+          showFullscreenControls(false);
+        }
+      });
+      lightingPanel.addEventListener('click', (e) => {
+        e.stopPropagation();
+      });
+      const presetBtns = Array.from(lightingPanel.querySelectorAll('[data-light-preset]'));
+      presetBtns.forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const key = btn.getAttribute('data-light-preset');
+          if (key) {
+            applyLightingPreset(key);
+          }
+        });
+      });
+      const obBtns = Array.from(lightingPanel.querySelectorAll('[data-overbright]'));
+      obBtns.forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const ob = parseInt(btn.getAttribute('data-overbright') || '0', 10);
+          if (Number.isFinite(ob)) {
+            setOverbright(ob);
+          }
+        });
+      });
+    }
+    if (gammaInput) {
+      const syncGammaSliderVars = () => {
+        gammaInput.style.setProperty('--attr-min', gammaInput.min || '1');
+        gammaInput.style.setProperty('--attr-max', gammaInput.max || '2.5');
+        gammaInput.style.setProperty('--control-value', gammaInput.value);
+      };
+      syncGammaSliderVars();
+      gammaInput.addEventListener('pointerdown', () => {
+        pipState.scrubbingGamma = true;
+        if (isCardFullscreen()) {
+          showFullscreenControls(false);
+        }
+      });
+      const finishGammaScrub = () => {
+        if (!pipState.scrubbingGamma) return;
+        pipState.scrubbingGamma = false;
+      };
+      gammaInput.addEventListener('pointerup', finishGammaScrub);
+      gammaInput.addEventListener('pointercancel', finishGammaScrub);
+      const onGammaEvent = () => {
+        syncGammaSliderVars();
+        const val = parseFloat(gammaInput.value);
+        if (Number.isFinite(val)) {
+          setGamma(val);
+        }
+      };
+      gammaInput.addEventListener('input', onGammaEvent);
+      gammaInput.addEventListener('change', () => {
+        pipState.scrubbingGamma = false;
+        onGammaEvent();
+      });
+    }
+    document.addEventListener('pointerdown', (e) => {
+      if (!pipState.lightingOpen) return;
+      const t = e.target;
+      if (
+        (lightingPanel && lightingPanel.contains(t)) ||
+        (lightingBtn && lightingBtn.contains(t))
+      ) {
+        return;
+      }
+      setLightingPanelOpen(false);
+    });
+
     // Timeline seek slider (value in milliseconds [0, durationMs])
     seekInput.addEventListener('pointerdown', () => {
       pipState.scrubbing = true;
@@ -2082,6 +2476,14 @@
     document.addEventListener('webkitfullscreenchange', onFullscreenChanged);
 
     window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && pipState.lightingOpen) {
+        e.preventDefault();
+        e.stopPropagation();
+        setLightingPanelOpen(false);
+        const lBtn = document.getElementById('jk-pip-lighting-btn');
+        if (lBtn) lBtn.focus();
+        return;
+      }
       if (e.key === 'Escape' && card.classList.contains('jk-pip-pseudo-fullscreen')) {
         card.classList.remove('jk-pip-pseudo-fullscreen', 'jk-pip-fs-controls-hidden', 'jk-pip-force-landscape');
         clearFullscreenControlsTimer();
@@ -2139,6 +2541,17 @@
       }
       syncCameraButtonUI(pipState.thirdPerson);
       updateControlState();
+    });
+    window.addEventListener('jkdemo:lighting', (e) => {
+      if (e && e.detail) {
+        if (typeof e.detail.gamma === 'number' && Number.isFinite(e.detail.gamma)) {
+          pipState.gamma = clampGammaPref(e.detail.gamma);
+        }
+        if (typeof e.detail.overbright === 'number' && Number.isFinite(e.detail.overbright)) {
+          pipState.overbright = clampOverbrightPref(e.detail.overbright);
+        }
+      }
+      syncLightingUI();
     });
     window.addEventListener('jkdemo:screen-toggle', (e) => {
       updateControlState();
@@ -2212,19 +2625,153 @@
     cameraBtn.classList.toggle('active', !is3p);
   }
 
+  function applyCanvasGammaFilterLocal(gammaVal) {
+    const canvas = document.getElementById('jk-canvas');
+    if (!canvas) return;
+    const g = clampGammaPref(gammaVal);
+    if (Math.abs(g - 1.0) < 0.005) {
+      if (canvas.style.filter) {
+        canvas.style.filter = '';
+      }
+      return;
+    }
+    const host = canvas.parentNode || document.body;
+    let svg = document.getElementById('jk-gamma-svg-defs');
+    if (!svg && host) {
+      const ns = 'http://www.w3.org/2000/svg';
+      svg = document.createElementNS(ns, 'svg');
+      svg.setAttribute('id', 'jk-gamma-svg-defs');
+      svg.setAttribute('width', '0');
+      svg.setAttribute('height', '0');
+      svg.setAttribute('aria-hidden', 'true');
+      svg.setAttribute('focusable', 'false');
+      svg.style.cssText =
+        'position:absolute;width:0;height:0;overflow:hidden;pointer-events:none;';
+      const defs = document.createElementNS(ns, 'defs');
+      const filter = document.createElementNS(ns, 'filter');
+      filter.setAttribute('id', 'jk-gamma-filter');
+      filter.setAttribute('color-interpolation-filters', 'sRGB');
+      filter.setAttribute('x', '0%');
+      filter.setAttribute('y', '0%');
+      filter.setAttribute('width', '100%');
+      filter.setAttribute('height', '100%');
+      const transfer = document.createElementNS(ns, 'feComponentTransfer');
+      ['R', 'G', 'B'].forEach((ch) => {
+        const fn = document.createElementNS(ns, 'feFunc' + ch);
+        fn.setAttribute('id', 'jk-gamma-func-' + ch.toLowerCase());
+        fn.setAttribute('type', 'gamma');
+        fn.setAttribute('amplitude', '1');
+        fn.setAttribute('exponent', '1');
+        fn.setAttribute('offset', '0');
+        transfer.appendChild(fn);
+      });
+      filter.appendChild(transfer);
+      defs.appendChild(filter);
+      svg.appendChild(defs);
+      host.appendChild(svg);
+    } else if (svg && host && svg.parentNode !== host) {
+      host.appendChild(svg);
+    }
+    const expStr = String(Math.round((1.0 / g) * 100000) / 100000);
+    ['r', 'g', 'b'].forEach((ch) => {
+      const fn = document.getElementById('jk-gamma-func-' + ch);
+      if (fn) {
+        fn.setAttribute('exponent', expStr);
+      }
+    });
+    const wantFilter = 'url(#jk-gamma-filter)';
+    if (canvas.style.filter !== wantFilter) {
+      canvas.style.filter = wantFilter;
+    }
+  }
+
+  function syncLightingUI() {
+    const g = clampGammaPref(pipState.gamma);
+    const ob = clampOverbrightPref(pipState.overbright);
+    const boosted = Math.abs(g - 1.0) >= 0.01 || ob !== 0;
+
+    const lightingBtn = document.getElementById('jk-pip-lighting-btn');
+    const lightingPanel = document.getElementById('jk-pip-lighting-panel');
+    if (lightingPanel) {
+      lightingPanel.hidden = !pipState.lightingOpen;
+    }
+    if (lightingBtn) {
+      lightingBtn.classList.toggle('active', Boolean(pipState.lightingOpen));
+      lightingBtn.classList.toggle('jk-pip-light-boosted', boosted);
+      lightingBtn.setAttribute('aria-expanded', pipState.lightingOpen ? 'true' : 'false');
+      const summary = boosted
+        ? `Lighting: Gamma ${g.toFixed(2)}, Overbright +${ob}`
+        : 'Lighting: Stock';
+      lightingBtn.title = summary;
+      lightingBtn.setAttribute('aria-label', summary);
+    }
+
+    const gammaInput = document.getElementById('jk-pip-gamma');
+    if (gammaInput && !pipState.scrubbingGamma && document.activeElement !== gammaInput) {
+      const minNum = parseFloat(gammaInput.min || '1');
+      const maxNum = parseFloat(gammaInput.max || '2.5');
+      const sliderVal = Math.min(maxNum, Math.max(minNum, g));
+      gammaInput.value = String(sliderVal);
+      gammaInput.style.setProperty('--attr-min', String(minNum));
+      gammaInput.style.setProperty('--attr-max', String(maxNum));
+      gammaInput.style.setProperty('--control-value', String(sliderVal));
+    }
+    if (gammaInput) {
+      gammaInput.setAttribute(
+        'aria-valuetext',
+        Math.abs(g - 1.0) < 0.01 ? '1.00 (Stock)' : g.toFixed(2)
+      );
+    }
+    const gammaValEl = document.getElementById('jk-pip-gamma-val');
+    if (gammaValEl) {
+      gammaValEl.textContent = g.toFixed(2);
+    }
+
+    if (lightingPanel) {
+      const obBtns = lightingPanel.querySelectorAll('[data-overbright]');
+      obBtns.forEach((btn) => {
+        const btnOb = parseInt(btn.getAttribute('data-overbright') || '0', 10);
+        const isCur = btnOb === ob;
+        btn.classList.toggle('active', isCur);
+        btn.setAttribute('aria-pressed', isCur ? 'true' : 'false');
+      });
+      const presetBtns = lightingPanel.querySelectorAll('[data-light-preset]');
+      presetBtns.forEach((btn) => {
+        const key = btn.getAttribute('data-light-preset') || '';
+        const preset = LIGHTING_PRESETS[key];
+        const matches =
+          Boolean(preset) &&
+          Math.abs(preset.gamma - g) < 0.02 &&
+          preset.overbright === ob;
+        btn.classList.toggle('active', matches);
+        btn.setAttribute('aria-pressed', matches ? 'true' : 'false');
+      });
+    }
+  }
+
+  function setLightingPanelOpen(open) {
+    pipState.lightingOpen = Boolean(open);
+    syncLightingUI();
+    if (isCardFullscreen()) {
+      showFullscreenControls(!pipState.lightingOpen);
+    }
+    return pipState.lightingOpen;
+  }
+
   function updateControlState() {
     const card = document.getElementById('jk-pip-card');
     if (!card) return;
     const player = getPlayer();
     if (!player) {
       syncCameraButtonUI(pipState.thirdPerson);
+      syncLightingUI();
       return;
     }
 
     const status = typeof player.getStatus === 'function' ? player.getStatus() : {};
     const rawMod = window.Module || (typeof player.getModule === 'function' ? player.getModule() : null);
     const mod =
-      rawMod && (!rawMod.Asyncify || rawMod.Asyncify.state === 0)
+      rawMod && (!rawMod.Asyncify || (rawMod.Asyncify.state === 0 && !rawMod.Asyncify.currData))
         ? rawMod
         : null;
 
@@ -2266,6 +2813,29 @@
         : pipState.thirdPerson;
     pipState.thirdPerson = Boolean(thirdPersonEnabled);
     syncCameraButtonUI(pipState.thirdPerson);
+
+    const curGamma =
+      typeof player.getGamma === 'function'
+        ? player.getGamma()
+        : typeof status.gamma === 'number'
+        ? status.gamma
+        : pipState.gamma;
+    if (!pipState.scrubbingGamma && typeof curGamma === 'number' && Number.isFinite(curGamma)) {
+      pipState.gamma = clampGammaPref(curGamma);
+    }
+    const curOb =
+      status.engineStarted && mod && typeof mod._JK_DemoGetMapOverbright === 'function'
+        ? mod._JK_DemoGetMapOverbright()
+        : typeof player.getOverbright === 'function'
+        ? player.getOverbright()
+        : typeof status.overbright === 'number'
+        ? status.overbright
+        : pipState.overbright;
+    if (typeof curOb === 'number' && Number.isFinite(curOb)) {
+      pipState.overbright = clampOverbrightPref(curOb);
+    }
+    applyCanvasGammaFilterLocal(pipState.gamma);
+    syncLightingUI();
 
     const curSpeed =
       mod && typeof mod._JK_DemoGetSpeed === 'function'
@@ -2348,14 +2918,16 @@
     }
 
     // Separate engine vs wrapper versions so UI/JS updates do not invalidate cached openjk.wasm
-    const ENGINE_ASSET_VERSION = '20261105c';
-    const PLAYER_ASSET_VERSION = '20261105g';
+    const ENGINE_ASSET_VERSION = '20261106f';
+    const PLAYER_ASSET_VERSION = '20261106f';
     window.JKDemoConfig = Object.assign(
       {
         preload: true,
         preloadOnly: true,
         autoPlay: false,
         muted: true,
+        gamma: pipState.gamma,
+        overbright: pipState.overbright,
         preserveDocumentTitle: true,
         scriptUrl: `/jkplayer/openjk.js?v=${ENGINE_ASSET_VERSION}`,
         wasmUrl: `/jkplayer/openjk.wasm?v=${ENGINE_ASSET_VERSION}`,
@@ -2726,6 +3298,8 @@
   function closePiP() {
     const card = document.getElementById('jk-pip-card');
     pipState.open = false;
+    pipState.lightingOpen = false;
+    syncLightingUI();
     clearFullscreenControlsTimer();
     unlockOrientationIfSupported();
     if (card) {
@@ -2910,6 +3484,115 @@
     return setThirdPerson(!getThirdPerson());
   }
 
+  function setGamma(val) {
+    const next = clampGammaPref(val);
+    pipState.gamma = next;
+    writePersistedLightingPrefs({ gamma: next });
+    applyCanvasGammaFilterLocal(next);
+    syncLightingUI();
+    const player = getPlayer();
+    if (player && typeof player.setGamma === 'function') {
+      player.setGamma(next);
+    } else if (pipState.playerScriptPromise) {
+      pipState.playerScriptPromise
+        .then((p) => {
+          if (p && typeof p.setGamma === 'function') {
+            p.setGamma(pipState.gamma);
+          }
+        })
+        .catch(() => {});
+    }
+    return next;
+  }
+
+  function getGamma() {
+    const player = getPlayer();
+    if (player && typeof player.getGamma === 'function') {
+      return clampGammaPref(player.getGamma());
+    }
+    return clampGammaPref(pipState.gamma);
+  }
+
+  function setOverbright(bits) {
+    const next = clampOverbrightPref(bits);
+    pipState.overbright = next;
+    writePersistedLightingPrefs({ overbright: next });
+    syncLightingUI();
+    const player = getPlayer();
+    if (player && typeof player.setOverbright === 'function') {
+      player.setOverbright(next);
+    } else if (pipState.playerScriptPromise) {
+      pipState.playerScriptPromise
+        .then((p) => {
+          if (p && typeof p.setOverbright === 'function') {
+            p.setOverbright(pipState.overbright);
+          }
+        })
+        .catch(() => {});
+    }
+    return next;
+  }
+
+  function getOverbright() {
+    const player = getPlayer();
+    if (player && typeof player.getOverbright === 'function') {
+      return clampOverbrightPref(player.getOverbright());
+    }
+    return clampOverbrightPref(pipState.overbright);
+  }
+
+  function setLighting(opts) {
+    if (!opts || typeof opts !== 'object') {
+      return getLighting();
+    }
+    const patch = {};
+    if (typeof opts.gamma === 'number' && Number.isFinite(opts.gamma)) {
+      pipState.gamma = clampGammaPref(opts.gamma);
+      patch.gamma = pipState.gamma;
+      applyCanvasGammaFilterLocal(pipState.gamma);
+    }
+    const rawOb =
+      typeof opts.overbright === 'number'
+        ? opts.overbright
+        : typeof opts.mapOverBrightBits === 'number'
+        ? opts.mapOverBrightBits
+        : undefined;
+    if (typeof rawOb === 'number' && Number.isFinite(rawOb)) {
+      pipState.overbright = clampOverbrightPref(rawOb);
+      patch.overbright = pipState.overbright;
+    }
+    if (Object.keys(patch).length > 0) {
+      writePersistedLightingPrefs(patch);
+    }
+    syncLightingUI();
+    const player = getPlayer();
+    if (player && typeof player.setLighting === 'function') {
+      player.setLighting(patch);
+    } else if (pipState.playerScriptPromise) {
+      pipState.playerScriptPromise
+        .then((p) => {
+          if (p && typeof p.setLighting === 'function') {
+            p.setLighting({ gamma: pipState.gamma, overbright: pipState.overbright });
+          }
+        })
+        .catch(() => {});
+    }
+    return getLighting();
+  }
+
+  function getLighting() {
+    return {
+      gamma: getGamma(),
+      overbright: getOverbright(),
+    };
+  }
+
+  function applyLightingPreset(presetKey) {
+    const preset = LIGHTING_PRESETS[String(presetKey || '').toLowerCase()];
+    if (!preset) return getLighting();
+    return setLighting({ gamma: preset.gamma, overbright: preset.overbright });
+  }
+
   function setSpeed(rate) {
     const player = getPlayer();
     if (!player || typeof player.setSpeed !== 'function') return rate;
@@ -3083,6 +3766,13 @@
     getThirdPerson,
     isThirdPerson: getThirdPerson,
     toggleThirdPerson,
+    setGamma,
+    getGamma,
+    setOverbright,
+    getOverbright,
+    setLighting,
+    getLighting,
+    applyLightingPreset,
     setSpeed,
     getSpeed,
     setVolume,

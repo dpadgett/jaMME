@@ -151,10 +151,11 @@ EM_JS(int, wasm_js_fetch_range, (const char *namePtr, int start, int end, unsign
 		var name = UTF8ToString(namePtr);
 		var xhr = null;
 		var lastErr = null;
-		for (var attempt = 0; attempt < 3; attempt++) {
+		for (var attempt = 0; attempt < 4; attempt++) {
 			try {
 				xhr = new XMLHttpRequest();
-				xhr.open('GET', '/base/' + name, false);
+				var url = '/base/' + name + (attempt >= 2 ? ('?_r=' + attempt + '_' + start) : '');
+				xhr.open('GET', url, false);
 				xhr.setRequestHeader('Range', 'bytes=' + start + '-' + end);
 				xhr.overrideMimeType('text/plain; charset=x-user-defined');
 				xhr.send(null);

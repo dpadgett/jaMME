@@ -1075,7 +1075,7 @@ void CG_KillCEntityG2(int entNum)
 		{
 			ci->ghoul2Model = NULL;
 		}
-		else if (ci->ghoul2Model && trap_G2_HaveWeGhoul2Models(ci->ghoul2Model))
+		else if (ci->ghoul2Model)
 		{
 			trap_G2API_CleanGhoul2Models(&ci->ghoul2Model);
 			ci->ghoul2Model = NULL;
@@ -1085,7 +1085,7 @@ void CG_KillCEntityG2(int entNum)
 		j = 0;
 		while (j < MAX_SABERS)
 		{
-			if (ci->ghoul2Weapons[j] && trap_G2_HaveWeGhoul2Models(ci->ghoul2Weapons[j]))
+			if (ci->ghoul2Weapons[j])
 			{
 				trap_G2API_CleanGhoul2Models(&ci->ghoul2Weapons[j]);
 				ci->ghoul2Weapons[j] = NULL;
@@ -1095,19 +1095,19 @@ void CG_KillCEntityG2(int entNum)
 		}
 	}
 
-	if (cent->ghoul2 && trap_G2_HaveWeGhoul2Models(cent->ghoul2))
+	if (cent->ghoul2)
 	{
 		trap_G2API_CleanGhoul2Models(&cent->ghoul2);
 		cent->ghoul2 = NULL;
 	}
 
-	if (cent->grip_arm && trap_G2_HaveWeGhoul2Models(cent->grip_arm))
+	if (cent->grip_arm)
 	{
 		trap_G2API_CleanGhoul2Models(&cent->grip_arm);
 		cent->grip_arm = NULL;
 	}
 
-	if (cent->frame_hold && trap_G2_HaveWeGhoul2Models(cent->frame_hold))
+	if (cent->frame_hold)
 	{
 		trap_G2API_CleanGhoul2Models(&cent->frame_hold);
 		cent->frame_hold = NULL;

@@ -12,10 +12,14 @@
 
   const MIN_SPEED = 0.05;
   const MAX_SPEED = 20.0;
+  const MIN_GAMMA = 0.5;
+  const MAX_GAMMA = 3.0;
+  const MIN_OVERBRIGHT = 0;
+  const MAX_OVERBRIGHT = 3;
 
   const BOOT_START_MS = typeof performance !== 'undefined' ? performance.now() : Date.now();
-  const DEFAULT_ENGINE_VERSION = '20261105c';
-  const DEFAULT_PLAYER_VERSION = '20261105g';
+  const DEFAULT_ENGINE_VERSION = '20261106f';
+  const DEFAULT_PLAYER_VERSION = '20261106f';
 
   function installDocumentTitleGuard() {
     if (typeof document === 'undefined' || document.__jkTitleGuardInstalled) return;
@@ -54,8 +58,8 @@
   }
 
   installDocumentTitleGuard();
-  const EXPECTED_OPENJK_JS_BYTES = 307440;
-  const EXPECTED_OPENJK_WASM_BYTES = 5190856;
+  const EXPECTED_OPENJK_JS_BYTES = 306337;
+  const EXPECTED_OPENJK_WASM_BYTES = 5204979;
   const WASM_PK3_CHUNK_SIZE = 256 * 1024;
   const IDB_NAME = 'openjk-cache-v1';
   const IDB_VERSION = 1;
@@ -70,6 +74,8 @@
     paused: false,
     loop: true,
     thirdPerson: true,
+    gamma: 1.0,
+    overbright: 0,
     speed: 1.0,
     muted: false,
     volume: 0.8,
@@ -121,6 +127,18 @@
     },
   };
 
+  function clampGammaValue(val) {
+    const num = Number(val);
+    if (!Number.isFinite(num)) return 1.0;
+    return Math.round(Math.min(MAX_GAMMA, Math.max(MIN_GAMMA, num)) * 100) / 100;
+  }
+
+  function clampOverbrightValue(val) {
+    const num = Math.round(Number(val));
+    if (!Number.isFinite(num)) return 0;
+    return Math.min(MAX_OVERBRIGHT, Math.max(MIN_OVERBRIGHT, num));
+  }
+
   function loadSavedPrefs() {
     try {
       const raw = localStorage.getItem(LS_PREFS_KEY);
@@ -142,6 +160,12 @@
         if (typeof prefs.thirdPerson === 'boolean') {
           state.thirdPerson = prefs.thirdPerson;
         }
+        if (typeof prefs.gamma === 'number' && Number.isFinite(prefs.gamma)) {
+          state.gamma = clampGammaValue(prefs.gamma);
+        }
+        if (typeof prefs.overbright === 'number' && Number.isFinite(prefs.overbright)) {
+          state.overbright = clampOverbrightValue(prefs.overbright);
+        }
       }
     } catch (_) {}
   }
@@ -157,6 +181,8 @@
           volume: state.volume,
           loop: state.loop,
           thirdPerson: state.thirdPerson,
+          gamma: state.gamma,
+          overbright: state.overbright,
         })
       );
     } catch (_) {}
@@ -174,6 +200,9 @@
           speed: state.speed,
           volume: state.volume,
           loop: state.loop,
+          thirdPerson: state.thirdPerson,
+          gamma: state.gamma,
+          overbright: state.overbright,
         };
       }
       existing[key] = value;
@@ -250,6 +279,38 @@
       thirdPerson = cfg.thirdPerson;
       hasExplicitThirdPerson = true;
     }
+    let gamma = state.gamma;
+    let hasExplicitGamma = false;
+    if (params.has('gamma')) {
+      const g = parseFloat(params.get('gamma'));
+      if (Number.isFinite(g)) {
+        gamma = clampGammaValue(g);
+        hasExplicitGamma = true;
+      }
+    } else if (typeof cfg.gamma === 'number' && Number.isFinite(cfg.gamma)) {
+      gamma = clampGammaValue(cfg.gamma);
+      hasExplicitGamma = true;
+    }
+    let overbright = state.overbright;
+    let hasExplicitOverbright = false;
+    const obParam = params.has('overbright')
+      ? params.get('overbright')
+      : params.has('mapOverbright')
+      ? params.get('mapOverbright')
+      : null;
+    if (obParam !== null) {
+      const ob = parseInt(obParam, 10);
+      if (Number.isFinite(ob)) {
+        overbright = clampOverbrightValue(ob);
+        hasExplicitOverbright = true;
+      }
+    } else if (typeof cfg.overbright === 'number' && Number.isFinite(cfg.overbright)) {
+      overbright = clampOverbrightValue(cfg.overbright);
+      hasExplicitOverbright = true;
+    } else if (typeof cfg.mapOverBrightBits === 'number' && Number.isFinite(cfg.mapOverBrightBits)) {
+      overbright = clampOverbrightValue(cfg.mapOverBrightBits);
+      hasExplicitOverbright = true;
+    }
     return {
       demo,
       speed,
@@ -257,6 +318,10 @@
       volume,
       thirdPerson,
       hasExplicitThirdPerson,
+      gamma,
+      hasExplicitGamma,
+      overbright,
+      hasExplicitOverbright,
       forceSoftwareRenderer,
       preloadOnly,
       bypassCache,
@@ -289,6 +354,8 @@
   state.muted = initialCfg.muted;
   state.volume = initialCfg.volume;
   state.thirdPerson = Boolean(initialCfg.thirdPerson);
+  state.gamma = clampGammaValue(initialCfg.gamma);
+  state.overbright = clampOverbrightValue(initialCfg.overbright);
   state.forceSoftwareRenderer = Boolean(initialCfg.forceSoftwareRenderer);
   state.preloadOnly = Boolean(initialCfg.preloadOnly);
   state.bypassCache = Boolean(initialCfg.bypassCache);
@@ -1701,9 +1768,11 @@
                       state.paused ||
                       state.seeking ||
                       isPageHidden() ||
+                      window.__jkWasmBusy > 0 ||
+                      window.__jkSyncXhrDepth > 0 ||
                       (window.Module &&
                         window.Module.Asyncify &&
-                        window.Module.Asyncify.state !== 0)
+                        (window.Module.Asyncify.state !== 0 || window.Module.Asyncify.currData))
                     ) {
                       return;
                     }
@@ -1979,11 +2048,37 @@
     };
   }
 
+  if (
+    typeof XMLHttpRequest !== 'undefined' &&
+    XMLHttpRequest.prototype &&
+    !XMLHttpRequest.prototype.__jkSyncWrapped
+  ) {
+    XMLHttpRequest.prototype.__jkSyncWrapped = true;
+    const origXhrOpen = XMLHttpRequest.prototype.open;
+    const origXhrSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (method, url, async) {
+      this.__jkIsSync = async === false;
+      return origXhrOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function () {
+      if (this.__jkIsSync) {
+        window.__jkSyncXhrDepth = (window.__jkSyncXhrDepth || 0) + 1;
+        try {
+          return origXhrSend.apply(this, arguments);
+        } finally {
+          window.__jkSyncXhrDepth = Math.max(0, (window.__jkSyncXhrDepth || 1) - 1);
+        }
+      }
+      return origXhrSend.apply(this, arguments);
+    };
+  }
+
   // Helper to call exported Wasm C functions safely
   function callWasm(fnName, returnType, argTypes, args) {
     const mod = window.Module;
     if (!mod || !state.engineStarted) return null;
-    if (mod.Asyncify && mod.Asyncify.state !== 0) return null;
+    if (mod.Asyncify && (mod.Asyncify.state !== 0 || mod.Asyncify.currData)) return null;
+    window.__jkWasmBusy = (window.__jkWasmBusy || 0) + 1;
     try {
       const cName = '_' + fnName;
       if (typeof mod[cName] === 'function') {
@@ -2000,6 +2095,8 @@
       }
     } catch (e) {
       console.warn('callWasm error for', fnName, e);
+    } finally {
+      window.__jkWasmBusy = Math.max(0, (window.__jkWasmBusy || 1) - 1);
     }
     return null;
   }
@@ -2116,10 +2213,13 @@
     const text = await fetchAutoexecConfig();
     writeConfigToFS(
       'autoexec.cfg',
-      text + `\nset cg_thirdPerson "${state.thirdPerson ? '1' : '0'}"\n`
+      text +
+        `\nset cg_thirdPerson "${state.thirdPerson ? '1' : '0'}"\n` +
+        `set r_mapOverBrightBits "${state.overbright}"\n`
     );
     execCommand('exec autoexec.cfg');
     syncCameraModeToEngine();
+    syncLightingToEngine();
     return text;
   }
 
@@ -2555,6 +2655,41 @@
   };
 
   const asyncChunkPrefetchInFlight = new Set();
+  const MAX_BG_PREFETCH_CONCURRENCY = 2;
+  let bgPrefetchActiveCount = 0;
+  const bgPrefetchPendingQueue = [];
+
+  function pumpBgPrefetchQueue() {
+    while (
+      bgPrefetchActiveCount < MAX_BG_PREFETCH_CONCURRENCY &&
+      bgPrefetchPendingQueue.length > 0 &&
+      state.activeDemoLoadCount === 0
+    ) {
+      const job = bgPrefetchPendingQueue.shift();
+      if (!job) continue;
+      if (job.ctrl && job.ctrl.signal.aborted) {
+        if (job.ctrl) bgPrefetchControllers.delete(job.ctrl);
+        for (const k of job.spanKeys) asyncChunkPrefetchInFlight.delete(k);
+        continue;
+      }
+      bgPrefetchActiveCount++;
+      fetchPk3SpanIntoCache(
+        job.name,
+        job.cStart,
+        job.cEnd,
+        job.archSize,
+        job.ctrl ? job.ctrl.signal : undefined
+      )
+        .catch(() => {})
+        .finally(() => {
+          bgPrefetchActiveCount = Math.max(0, bgPrefetchActiveCount - 1);
+          if (job.ctrl) bgPrefetchControllers.delete(job.ctrl);
+          for (const k of job.spanKeys) asyncChunkPrefetchInFlight.delete(k);
+          pumpBgPrefetchQueue();
+        });
+    }
+  }
+
   window.__jkPk3PrefetchSpanAsync = function (name, cStart, cEnd, archSize) {
     if (!name || typeof cStart !== 'number' || typeof cEnd !== 'number' || cStart < 0 || cEnd < cStart) return;
     const missingIdbKeys = [];
@@ -2582,17 +2717,26 @@
     }
     if (spanKeys.length === 0) return;
 
-    const ctrl = needsNetwork && typeof AbortController === 'function' ? new AbortController() : null;
+    if (!needsNetwork) {
+      loadChunksFromIdb(missingIdbKeys)
+        .catch(() => {})
+        .finally(() => {
+          for (const k of spanKeys) asyncChunkPrefetchInFlight.delete(k);
+        });
+      return;
+    }
+
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
     if (ctrl) bgPrefetchControllers.add(ctrl);
-    const task = !needsNetwork
-      ? loadChunksFromIdb(missingIdbKeys)
-      : fetchPk3SpanIntoCache(name, cStart, cEnd, archSize || 0, ctrl ? ctrl.signal : undefined);
-    task
-      .catch(() => {})
-      .finally(() => {
-        if (ctrl) bgPrefetchControllers.delete(ctrl);
-        for (const k of spanKeys) asyncChunkPrefetchInFlight.delete(k);
-      });
+    bgPrefetchPendingQueue.push({
+      name,
+      cStart,
+      cEnd,
+      archSize: archSize || 0,
+      ctrl,
+      spanKeys,
+    });
+    pumpBgPrefetchQueue();
   };
 
   window.__jkPk3PrefetchChunkAsync = function (name, chunkIdx, archSize) {
@@ -2884,15 +3028,23 @@
     const lowPriority = Boolean(options.lowPriority);
     const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
     const validateBytes = typeof options.validateBytes === 'function' ? options.validateBytes : null;
+    const signal = options.signal || null;
 
     let lastErr = null;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (signal && signal.aborted) {
+        return { ok: false, status: 0, bytes: null, extra: null, aborted: true };
+      }
       if (attempt > 0 || isPageHidden()) {
         const backoffMs = attempt === 0 ? 0 : Math.min(2500, 400 * Math.pow(2, attempt - 1));
         await waitForPageVisible(backoffMs);
+        if (signal && signal.aborted) {
+          return { ok: false, status: 0, bytes: null, extra: null, aborted: true };
+        }
       }
       try {
         const fetchOpts = {};
+        if (signal) fetchOpts.signal = signal;
         if (lowPriority && attempt === 0 && !state.demoLoadedOnce) {
           fetchOpts.priority = 'low';
         }
@@ -2979,21 +3131,26 @@
         }
         return { ok: true, status: resp.status, bytes, extra };
       } catch (err) {
+        if (signal && signal.aborted) {
+          return { ok: false, status: 0, bytes: null, extra: null, aborted: true };
+        }
         lastErr = err;
       }
     }
     throw lastErr || new Error('Network request failed');
   }
 
-  async function fetchJsonWithRetry(url, maxAttempts) {
+  async function fetchJsonWithRetry(url, maxAttempts, signal) {
     const attempts = maxAttempts || 3;
     for (let attempt = 0; attempt < attempts; attempt++) {
+      if (signal && signal.aborted) return null;
       if (attempt > 0 || isPageHidden()) {
         const backoffMs = attempt === 0 ? 0 : Math.min(2000, 350 * Math.pow(2, attempt - 1));
         await waitForPageVisible(backoffMs);
+        if (signal && signal.aborted) return null;
       }
       try {
-        const resp = await fetch(url);
+        const resp = await fetch(url, signal ? { signal } : undefined);
         if (!resp.ok) {
           if (
             resp.status >= 400 &&
@@ -3006,12 +3163,14 @@
           continue;
         }
         return await resp.json();
-      } catch (_) {}
+      } catch (_) {
+        if (signal && signal.aborted) return null;
+      }
     }
     return null;
   }
 
-  async function fetchAndValidateDemoBytes(nameOrUrl, onFirstMessageReady) {
+  async function fetchAndValidateDemoBytes(nameOrUrl, onFirstMessageReady, signal) {
     let customLabel = '';
     if (nameOrUrl && typeof nameOrUrl === 'object') {
       customLabel = String(nameOrUrl.label || nameOrUrl.title || '').trim();
@@ -3081,6 +3240,7 @@
 
     let firedFirstMsg = false;
     for (let attempt = 0; attempt < 4; attempt++) {
+      if (signal && signal.aborted) return null;
       if (attempt > 0 || isPageHidden()) {
         if (isPageHidden()) {
           emitLoadProgress(
@@ -3100,12 +3260,13 @@
           );
         }
         await waitForPageVisible(attempt * 300);
+        if (signal && signal.aborted) return null;
       }
       try {
         if (attempt === 0) {
           emitLoadProgress('demo', 'Downloading demo...', 0, 0, 4);
         }
-        const resp = await fetch(url);
+        const resp = await fetch(url, signal ? { signal } : undefined);
         if (!resp.ok) {
           if (resp.status >= 400 && resp.status < 500 && resp.status !== 408 && resp.status !== 429) {
             return null;
@@ -3259,6 +3420,9 @@
           bytes,
         };
       } catch (e) {
+        if (signal && signal.aborted) {
+          return null;
+        }
         if (attempt === 3) {
           return null;
         }
@@ -3425,6 +3589,12 @@
       isPaused: Boolean(isPaused),
       loop: Boolean(loop),
       thirdPerson: Boolean(state.thirdPerson),
+      gamma: Number(state.gamma),
+      overbright: Number(
+        typeof callWasm('JK_DemoGetMapOverbright', 'number', [], []) === 'number' && state.engineStarted
+          ? callWasm('JK_DemoGetMapOverbright', 'number', [], [])
+          : state.overbright
+      ),
       demoEnded: Boolean(demoEnded),
       demoCompletedCount: Number(demoCompletedCount),
       demoName: String(activeDemoName || ''),
@@ -3683,6 +3853,12 @@
 
   const bgPrefetchControllers = new Set();
   function abortBackgroundPrefetch() {
+    while (bgPrefetchPendingQueue.length > 0) {
+      const job = bgPrefetchPendingQueue.shift();
+      if (job) {
+        for (const k of job.spanKeys) asyncChunkPrefetchInFlight.delete(k);
+      }
+    }
     for (const ctrl of bgPrefetchControllers) {
       try {
         ctrl.abort();
@@ -3697,12 +3873,13 @@
     let byteEnd = (cEnd + 1) * WASM_PK3_CHUNK_SIZE;
     if (archSize && byteEnd > archSize) byteEnd = archSize;
     if (byteEnd <= byteStart) return 0;
-    const maxAttempts = signal ? 1 : 4;
+    const maxAttempts = 4;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (signal && signal.aborted) return 0;
       if (attempt > 0 || isPageHidden()) {
-        if (signal) return 0;
-        await waitForPageVisible(attempt * 250);
+        const backoffMs = attempt > 0 ? 150 * Math.pow(2, attempt - 1) : 0;
+        await waitForPageVisible(backoffMs);
+        if (signal && signal.aborted) return 0;
       }
       try {
         const fetchOpts = {
@@ -3712,7 +3889,9 @@
           fetchOpts.signal = signal;
           fetchOpts.priority = 'low';
         }
-        const resp = await fetch('/base/' + pk3Name, fetchOpts);
+        const url =
+          '/base/' + pk3Name + (attempt >= 2 ? '?_r=' + attempt + '_' + byteStart : '');
+        const resp = await fetch(url, fetchOpts);
         if (resp.status !== 200 && resp.status !== 206) {
           if (resp.status >= 400 && resp.status < 500 && resp.status !== 408 && resp.status !== 429) {
             return 0;
@@ -3821,7 +4000,7 @@
       const allTasks = cdTasks.concat(spanTasks);
       if (allTasks.length === 0) return;
 
-      const CONCURRENCY = 6;
+      const CONCURRENCY = 4;
       let cursor = 0;
       const workers = [];
       for (let w = 0; w < Math.min(CONCURRENCY, allTasks.length); w++) {
@@ -4087,7 +4266,7 @@
         while (
           i + 1 < sorted.length &&
           sorted[i + 1] === subEnd + 1 &&
-          subEnd - subStart < 31
+          subEnd - subStart < 15
         ) {
           i++;
           subEnd = sorted[i];
@@ -4127,7 +4306,7 @@
       );
     }
 
-    const CONCURRENCY = 6;
+    const CONCURRENCY = 4;
     let cursor = 0;
     const workers = [];
     for (let w = 0; w < Math.min(CONCURRENCY, spans.length); w++) {
@@ -4261,7 +4440,15 @@
 
   function loadDemo(nameOrUrl) {
     state.demoLoadedOnce = true;
+    const myLoadSeq = (state.currentLoadSeq = (state.currentLoadSeq || 0) + 1);
+    if (state.activeLoadAbortCtrl) {
+      try {
+        state.activeLoadAbortCtrl.abort();
+      } catch (_) {}
+      state.activeLoadAbortCtrl = null;
+    }
     state.pendingDemoLoads = (state.pendingDemoLoads || 0) + 1;
+    emitLoadProgress('demo', 'Loading demo...', 0, 0, 1);
     let decrementedPending = false;
     const decPending = () => {
       if (!decrementedPending) {
@@ -4271,6 +4458,16 @@
     };
 
     const runLoad = async () => {
+      if (myLoadSeq !== state.currentLoadSeq) {
+        decPending();
+        return false;
+      }
+      const loadAbortCtrl = typeof AbortController === 'function' ? new AbortController() : null;
+      state.activeLoadAbortCtrl = loadAbortCtrl;
+      const loadSignal = loadAbortCtrl ? loadAbortCtrl.signal : null;
+      const isSuperseded = () =>
+        myLoadSeq !== state.currentLoadSeq || Boolean(loadSignal && loadSignal.aborted);
+
       state.activeDemoLoadCount = (state.activeDemoLoadCount || 0) + 1;
       abortBackgroundPrefetch();
       let earlyPeekPromise = null;
@@ -4313,6 +4510,9 @@
         const rawStr = typeof rawInput === 'string' ? rawInput.trim() : '';
         const canUseMmeStream = isQueryDemoUrl(rawStr);
         let usedMmeStream = false;
+        let mmeStreamInitBytes = null;
+        let mmeStreamUrl = '';
+        let mmeStreamCached = false;
         let mmeFetchFailed = false;
         let mmeMetaPromise = null;
         let activeStreamId = 0;
@@ -4328,8 +4528,6 @@
             rawStr.startsWith('/')
               ? rawStr
               : '/' + rawStr.replace(/^\.\//, '');
-          stopMmeBackgroundStream();
-          activeStreamId = ++mmeStreamState.streamId;
           const autoexecPromise = fetchAutoexecConfig();
           const cachedMme = !state.bypassCache ? mmeInitCache.get(rawStr) : null;
 
@@ -4337,7 +4535,11 @@
           if (cachedMme && cachedMme.meta) {
             mmeMetaPromise = Promise.resolve(cachedMme.meta);
           } else {
-            mmeMetaPromise = fetchJsonWithRetry(streamUrl + '&format=mme_meta', 3).then(
+            mmeMetaPromise = fetchJsonWithRetry(
+              streamUrl + '&format=mme_meta',
+              3,
+              loadSignal
+            ).then(
               (metaObj) => {
                 if (metaObj && metaObj.fileSize && Array.isArray(metaObj.index)) {
                   const existing = mmeInitCache.get(rawStr);
@@ -4360,7 +4562,9 @@
                   minBytes: 16,
                   fallbackTotalBytes: MME_CHUNK_SIZE,
                   lowPriority: false,
+                  signal: loadSignal,
                   onProgress: (loaded, total, attempt) => {
+                    if (isSuperseded()) return;
                     const now = Date.now();
                     if (now - lastInitProgressAt < 80 && loaded < total) return;
                     lastInitProgressAt = now;
@@ -4375,13 +4579,18 @@
                   },
                 }
               );
+              if (isSuperseded() || (initRes && initRes.aborted)) {
+                return false;
+              }
               if (initRes && initRes.ok && initRes.bytes) {
                 initBytes = initRes.bytes;
               }
             } catch (_) {
+              if (isSuperseded()) return false;
               mmeFetchFailed = true;
             }
           }
+          if (isSuperseded()) return false;
 
           if (initBytes && initBytes.byteLength >= 15) {
             const hdrStr = String.fromCharCode.apply(null, initBytes.subarray(0, 15));
@@ -4400,19 +4609,9 @@
                 });
               }
               usedMmeStream = true;
-              mmeStreamState.active = true;
-              mmeStreamState.baseUrl = streamUrl;
-              mmeStreamState.cacheKey = rawStr;
-              mmeStreamState.fileSize = Math.max(initBytes.byteLength, 0x3fffffff);
-              mmeStreamState.startTime = 0;
-              mmeStreamState.endTime = 0;
-              mmeStreamState.totalFrames = 1;
-              mmeStreamState.index = [[15, 0, 0]];
-              mmeStreamState.chunks.clear();
-              mmeStreamState.inFlight.clear();
-              storeMmeRangeBytes(0, initBytes);
-              mmeStreamState.rangeRequests = cachedMme ? 0 : 1;
-              mmeStreamState.bytesTransferred = cachedMme ? 0 : initBytes.byteLength;
+              mmeStreamInitBytes = initBytes;
+              mmeStreamUrl = streamUrl;
+              mmeStreamCached = Boolean(cachedMme);
               const kbInit = Math.round(initBytes.byteLength / 1024);
               emitLoadProgress(
                 'demo',
@@ -4434,16 +4633,17 @@
         }
 
         if (!usedMmeStream) {
-          resetMmeStreamState();
+          if (isSuperseded()) return false;
           if (mmeFetchFailed) {
             emitLoadProgress('error', 'Network error downloading demo', 0, 0, 0);
             return false;
           }
           [demoData, latestAutoexec] = await Promise.all([
-            fetchAndValidateDemoBytes(nameOrUrl, onFirstMessageReady),
+            fetchAndValidateDemoBytes(nameOrUrl, onFirstMessageReady, loadSignal),
             fetchAutoexecConfig(),
           ]);
         }
+        if (isSuperseded()) return false;
         if (!demoData) {
           emitLoadProgress('error', 'Failed to download demo', 0, 0, 0);
           return false;
@@ -4533,11 +4733,31 @@
           15000
         );
 
+        if (isSuperseded()) return false;
+        stopMmeBackgroundStream();
+        if (state.engineStarted) {
+          callWasm('JK_DemoAbortPrepare', null, [], []);
+        }
+
         if (latestAutoexec) {
           writeConfigToFS('autoexec.cfg', latestAutoexec);
           execCommand('execq autoexec.cfg');
         }
         if (usedMmeStream) {
+          activeStreamId = ++mmeStreamState.streamId;
+          mmeStreamState.active = true;
+          mmeStreamState.baseUrl = mmeStreamUrl;
+          mmeStreamState.cacheKey = rawStr;
+          mmeStreamState.fileSize = Math.max(mmeStreamInitBytes.byteLength, 0x3fffffff);
+          mmeStreamState.startTime = 0;
+          mmeStreamState.endTime = 0;
+          mmeStreamState.totalFrames = 1;
+          mmeStreamState.index = [[15, 0, 0]];
+          mmeStreamState.chunks.clear();
+          mmeStreamState.inFlight.clear();
+          storeMmeRangeBytes(0, mmeStreamInitBytes);
+          mmeStreamState.rangeRequests = mmeStreamCached ? 0 : 1;
+          mmeStreamState.bytesTransferred = mmeStreamCached ? 0 : mmeStreamInitBytes.byteLength;
           applyMmeStreamToWasm({
             fileSize: mmeStreamState.fileSize,
             startTime: 0,
@@ -4547,8 +4767,10 @@
           });
           // Plan & download map/model PK3 chunks immediately while mme_meta finishes on the server!
           await planAndPrefetchDemoChunks(demoData.shortName);
+          if (isSuperseded()) return false;
           emitLoadProgress('demo', 'Finalizing demo keyframe index...', 0, 0, 76);
           const meta = mmeMetaPromise ? await mmeMetaPromise.catch(() => null) : null;
+          if (isSuperseded()) return false;
           if (!meta || !meta.fileSize || !Array.isArray(meta.index)) {
             emitLoadProgress('error', 'Failed to load demo keyframe index', 0, 0, 0);
             return false;
@@ -4560,6 +4782,7 @@
           mmeStreamState.index = meta.index;
           applyMmeStreamToWasm(meta);
         } else {
+          resetMmeStreamState();
           writeDemoToFS(demoData.fileName, demoData.bytes);
           if (earlyPeekPromise) {
             try {
@@ -4567,6 +4790,7 @@
             } catch (_) {}
           }
           await planAndPrefetchDemoChunks(demoData.shortName);
+          if (isSuperseded()) return false;
         }
 
         if (isPageHidden()) {
@@ -4579,9 +4803,11 @@
           );
           await waitForPageVisible(50);
         }
+        if (isSuperseded()) return false;
 
         emitLoadProgress('init', 'Preparing demo playback (0%)...', 0, 0, 78);
         await new Promise((r) => setTimeout(r, 0));
+        if (isSuperseded()) return false;
 
         decPending();
         const prevStatus = getStatus();
@@ -4595,17 +4821,27 @@
 
         callWasm('JK_DemoSetLoop', 'number', ['number'], [state.loop ? 1 : 0]);
         syncCameraModeToEngine();
+        syncLightingToEngine();
+        applyCanvasGammaFilter();
         const prepStarted = callWasm('JK_DemoPrepareBegin', 'number', ['string'], [demoData.shortName]);
         if (prepStarted === 1) {
           let prepStepSafety = 0;
           while (prepStepSafety < 4000) {
+            if (isSuperseded()) {
+              callWasm('JK_DemoAbortPrepare', null, [], []);
+              return false;
+            }
             prepStepSafety++;
             if (isPageHidden()) {
               await waitForPageVisible(20);
+              if (isSuperseded()) {
+                callWasm('JK_DemoAbortPrepare', null, [], []);
+                return false;
+              }
             }
             const more = callWasm('JK_DemoPrepareStep', 'number', [], []);
             const rawStatus = callWasm('JK_DemoGetPrepareStatus', 'string', [], []);
-            if (rawStatus) {
+            if (rawStatus && !isSuperseded()) {
               try {
                 const stObj = JSON.parse(rawStatus);
                 const subPct = Math.max(0, Math.min(1, Number(stObj.pct || 0)));
@@ -4620,7 +4856,13 @@
         } else {
           callWasm('JK_DemoLoad', 'number', ['string'], [demoData.shortName]);
         }
+        if (isSuperseded()) {
+          callWasm('JK_DemoAbortPrepare', null, [], []);
+          return false;
+        }
         syncCameraModeToEngine();
+        syncLightingToEngine();
+        applyCanvasGammaFilter();
 
         try {
           window.dispatchEvent(
@@ -4634,6 +4876,7 @@
         const targetShort = demoData.shortName.toLowerCase();
         await waitWithVisibleTimeout(
           () => {
+            if (isSuperseded()) return true;
             const st = getStatus();
             if (st.demoCompletedCount > prevCompleted || st.demoEnded) return true;
             if (
@@ -4650,6 +4893,10 @@
           25,
           40000
         );
+        if (isSuperseded()) {
+          callWasm('JK_DemoAbortPrepare', null, [], []);
+          return false;
+        }
         const finalSt = getStatus();
         if (mmeStreamState.active && mmeStreamState.streamId === activeStreamId) {
           startMmeBackgroundStream(activeStreamId);
@@ -4658,8 +4905,14 @@
         updateUIControls();
         return Boolean(finalSt.isPlaying || finalSt.demoCompletedCount > prevCompleted);
       } finally {
+        if (state.activeLoadAbortCtrl === loadAbortCtrl) {
+          state.activeLoadAbortCtrl = null;
+        }
         state.activeDemoLoadCount = Math.max(0, (state.activeDemoLoadCount || 1) - 1);
         decPending();
+        if (state.activeDemoLoadCount === 0) {
+          pumpBgPrefetchQueue();
+        }
       }
     };
 
@@ -4777,6 +5030,165 @@
 
   function toggleThirdPerson() {
     return setThirdPerson(!state.thirdPerson);
+  }
+
+  function ensureGammaSvgFilter(containerEl) {
+    if (typeof document === 'undefined') return null;
+    const host = containerEl || document.body;
+    if (!host) return null;
+    let svg = document.getElementById('jk-gamma-svg-defs');
+    if (!svg) {
+      const ns = 'http://www.w3.org/2000/svg';
+      svg = document.createElementNS(ns, 'svg');
+      svg.setAttribute('id', 'jk-gamma-svg-defs');
+      svg.setAttribute('width', '0');
+      svg.setAttribute('height', '0');
+      svg.setAttribute('aria-hidden', 'true');
+      svg.setAttribute('focusable', 'false');
+      svg.style.cssText =
+        'position:absolute;width:0;height:0;overflow:hidden;pointer-events:none;';
+      const defs = document.createElementNS(ns, 'defs');
+      const filter = document.createElementNS(ns, 'filter');
+      filter.setAttribute('id', 'jk-gamma-filter');
+      filter.setAttribute('color-interpolation-filters', 'sRGB');
+      filter.setAttribute('x', '0%');
+      filter.setAttribute('y', '0%');
+      filter.setAttribute('width', '100%');
+      filter.setAttribute('height', '100%');
+      const transfer = document.createElementNS(ns, 'feComponentTransfer');
+      ['R', 'G', 'B'].forEach((ch) => {
+        const fn = document.createElementNS(ns, 'feFunc' + ch);
+        fn.setAttribute('id', 'jk-gamma-func-' + ch.toLowerCase());
+        fn.setAttribute('type', 'gamma');
+        fn.setAttribute('amplitude', '1');
+        fn.setAttribute('exponent', '1');
+        fn.setAttribute('offset', '0');
+        transfer.appendChild(fn);
+      });
+      filter.appendChild(transfer);
+      defs.appendChild(filter);
+      svg.appendChild(defs);
+    }
+    if (svg.parentNode !== host) {
+      host.appendChild(svg);
+    }
+    return svg;
+  }
+
+  function applyCanvasGammaFilter() {
+    if (typeof document === 'undefined') return;
+    const canvas = document.getElementById('jk-canvas');
+    if (!canvas) return;
+    const g = clampGammaValue(state.gamma);
+    if (Math.abs(g - 1.0) < 0.005) {
+      if (canvas.style.filter) {
+        canvas.style.filter = '';
+      }
+      return;
+    }
+    ensureGammaSvgFilter(canvas.parentNode || document.body);
+    const expStr = String(Math.round((1.0 / g) * 100000) / 100000);
+    ['r', 'g', 'b'].forEach((ch) => {
+      const fn = document.getElementById('jk-gamma-func-' + ch);
+      if (fn) {
+        fn.setAttribute('exponent', expStr);
+      }
+    });
+    const wantFilter = 'url(#jk-gamma-filter)';
+    if (canvas.style.filter !== wantFilter) {
+      canvas.style.filter = wantFilter;
+    }
+  }
+
+  function syncLightingToEngine() {
+    const ob = clampOverbrightValue(state.overbright);
+    if (state.engineStarted) {
+      const res = callWasm('JK_DemoSetMapOverbright', 'number', ['number'], [ob]);
+      if (typeof res === 'number') {
+        return;
+      }
+    }
+    execCommand(`set r_mapOverBrightBits "${ob}"`);
+  }
+
+  function emitLightingEvent() {
+    try {
+      window.dispatchEvent(
+        new CustomEvent('jkdemo:lighting', {
+          detail: {
+            gamma: Number(state.gamma),
+            overbright: Number(state.overbright),
+          },
+        })
+      );
+    } catch (_) {}
+  }
+
+  function setGamma(gammaVal) {
+    state.gamma = clampGammaValue(gammaVal);
+    applyCanvasGammaFilter();
+    persistPrefField('gamma', state.gamma);
+    savePlayerPrefs();
+    updateUIControls();
+    emitLightingEvent();
+    return state.gamma;
+  }
+
+  function getGamma() {
+    return Number(state.gamma);
+  }
+
+  function setOverbright(bitsVal) {
+    state.overbright = clampOverbrightValue(bitsVal);
+    syncLightingToEngine();
+    persistPrefField('overbright', state.overbright);
+    savePlayerPrefs();
+    updateUIControls();
+    emitLightingEvent();
+    return state.overbright;
+  }
+
+  function getOverbright() {
+    if (state.engineStarted) {
+      const cOb = callWasm('JK_DemoGetMapOverbright', 'number', [], []);
+      if (typeof cOb === 'number' && Number.isFinite(cOb)) {
+        state.overbright = clampOverbrightValue(cOb);
+      }
+    }
+    return Number(state.overbright);
+  }
+
+  function setLighting(opts) {
+    if (!opts || typeof opts !== 'object') {
+      return getLighting();
+    }
+    if (typeof opts.gamma === 'number' && Number.isFinite(opts.gamma)) {
+      state.gamma = clampGammaValue(opts.gamma);
+      applyCanvasGammaFilter();
+      persistPrefField('gamma', state.gamma);
+    }
+    const rawOb =
+      typeof opts.overbright === 'number'
+        ? opts.overbright
+        : typeof opts.mapOverBrightBits === 'number'
+        ? opts.mapOverBrightBits
+        : undefined;
+    if (typeof rawOb === 'number' && Number.isFinite(rawOb)) {
+      state.overbright = clampOverbrightValue(rawOb);
+      syncLightingToEngine();
+      persistPrefField('overbright', state.overbright);
+    }
+    savePlayerPrefs();
+    updateUIControls();
+    emitLightingEvent();
+    return getLighting();
+  }
+
+  function getLighting() {
+    return {
+      gamma: getGamma(),
+      overbright: getOverbright(),
+    };
   }
 
   function formatTimeMMSS(ms) {
@@ -5182,6 +5594,12 @@
     if (cfg.hasExplicitThirdPerson && typeof cfg.thirdPerson === 'boolean') {
       setThirdPerson(cfg.thirdPerson);
     }
+    if (cfg.hasExplicitGamma && typeof cfg.gamma === 'number') {
+      setGamma(cfg.gamma);
+    }
+    if (cfg.hasExplicitOverbright && typeof cfg.overbright === 'number') {
+      setOverbright(cfg.overbright);
+    }
     const normDemo = cfg.demo ? normalizeDemoFileName(cfg.demo) : '';
     if (normDemo && (normDemo !== state.demoName || state.demoEnded)) {
       return loadDemo(cfg.demo).then(() => {
@@ -5271,6 +5689,14 @@
     getThirdPerson,
     isThirdPerson: getThirdPerson,
     toggleThirdPerson,
+    setGamma,
+    getGamma,
+    setOverbright,
+    getOverbright,
+    setMapOverbright: setOverbright,
+    getMapOverbright: getOverbright,
+    setLighting,
+    getLighting,
     formatTimeMMSS,
     init: function () {
       return prewarmEngineInBackground();
@@ -5337,6 +5763,19 @@
       );
       btnCamera.style.borderColor = is3p ? '' : '#58a6ff';
       btnCamera.style.color = is3p ? '' : '#58a6ff';
+    }
+    const sliderGamma = document.getElementById('slider-gamma');
+    if (sliderGamma && document.activeElement !== sliderGamma) {
+      sliderGamma.value = String(state.gamma);
+      sliderGamma.setAttribute('aria-valuetext', state.gamma.toFixed(2));
+    }
+    const gammaDisplay = document.getElementById('gamma-display');
+    if (gammaDisplay) {
+      gammaDisplay.textContent = state.gamma.toFixed(2);
+    }
+    const selectOverbright = document.getElementById('select-overbright');
+    if (selectOverbright && document.activeElement !== selectOverbright) {
+      selectOverbright.value = String(state.overbright);
     }
     const sliderSeek = document.getElementById('slider-seek');
     const timeDisplay = document.getElementById('time-display');
@@ -5416,6 +5855,20 @@
     if (btnCamera) {
       btnCamera.addEventListener('click', () => {
         toggleThirdPerson();
+      });
+    }
+    const sliderGamma = document.getElementById('slider-gamma');
+    if (sliderGamma) {
+      const onGammaInput = (e) => {
+        setGamma(parseFloat(e.target.value));
+      };
+      sliderGamma.addEventListener('input', onGammaInput);
+      sliderGamma.addEventListener('change', onGammaInput);
+    }
+    const selectOverbright = document.getElementById('select-overbright');
+    if (selectOverbright) {
+      selectOverbright.addEventListener('change', (e) => {
+        setOverbright(parseInt(e.target.value, 10));
       });
     }
     const selectSpeed = document.getElementById('select-speed');
@@ -5817,7 +6270,9 @@
               state.engineLastProgressAt = Date.now();
               writeConfigToFS(
                 'autoexec.cfg',
-                autoexecText + `\nset cg_thirdPerson "${state.thirdPerson ? '1' : '0'}"\n`
+                autoexecText +
+                  `\nset cg_thirdPerson "${state.thirdPerson ? '1' : '0'}"\n` +
+                  `set r_mapOverBrightBits "${state.overbright}"\n`
               );
               if (bootDemoData) {
                 writeDemoToFS(bootDemoData.fileName, bootDemoData.bytes);
@@ -5853,6 +6308,7 @@
                 '_JK_DemoGetLoadedPackCount',
                 '_JK_DemoGetViewportWidth',
                 '_JK_DemoGetViewportHeight',
+                '_JK_DemoGetMapOverbright',
                 '_JK_DemoIsAudioActive',
                 '_JK_DemoGetAudioSamplesMixed',
               ];
@@ -5866,7 +6322,10 @@
                       return 0;
                     }
                     const mod = window.Module;
-                    if (mod && mod.Asyncify && mod.Asyncify.state !== 0) {
+                    if (
+                      window.__jkSyncXhrDepth > 0 ||
+                      (mod && mod.Asyncify && (mod.Asyncify.state !== 0 || mod.Asyncify.currData))
+                    ) {
                       return lastGetterVals[gName];
                     }
                     const val = origFn.apply(this, args);
@@ -5887,6 +6346,8 @@
               Math.round((nowMs - state.metrics.bootStartMs) * 100) / 100;
             callWasm('JK_DemoSetLoop', 'number', ['number'], [state.loop ? 1 : 0]);
             syncCameraModeToEngine();
+            syncLightingToEngine();
+            applyCanvasGammaFilter();
             if (state.muted) mute();
             else setVolume(state.volume);
             flushPendingCommands();
@@ -5980,6 +6441,7 @@
 
   function bootEngine() {
     initHostPlayerOnce();
+    applyCanvasGammaFilter();
     ensureEngineBooted({
       background: Boolean(state.preloadOnly && !state.demoLoadedOnce),
     }).catch(() => {});

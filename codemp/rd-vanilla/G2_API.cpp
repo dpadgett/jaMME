@@ -398,12 +398,10 @@ public:
 	}
 	bool IsValid(int handle) const
 	{
-		if (!handle)
+		if (handle<=0||(handle&G2_INDEX_MASK)<0||(handle&G2_INDEX_MASK)>=MAX_G2_MODELS)
 		{
 			return false;
 		}
-		assert(handle>0); //negative handle???
-		assert((handle&G2_INDEX_MASK)>=0&&(handle&G2_INDEX_MASK)<MAX_G2_MODELS); //junk handle
 		if (mIds[handle&G2_INDEX_MASK]!=handle) // not a valid handle, could be old
 		{
 			return false;
@@ -412,13 +410,10 @@ public:
 	}
 	void Delete(int handle)
 	{
-		if (!handle)
+		if (handle<=0||(handle&G2_INDEX_MASK)<0||(handle&G2_INDEX_MASK)>=MAX_G2_MODELS)
 		{
 			return;
 		}
-		assert(handle>0); //null handle
-		assert((handle&G2_INDEX_MASK)>=0&&(handle&G2_INDEX_MASK)<MAX_G2_MODELS); //junk handle
-		assert(mIds[handle&G2_INDEX_MASK]==handle); // not a valid handle, could be old or garbage
 		if (mIds[handle&G2_INDEX_MASK]==handle)
 		{
 			DeleteLow(handle&G2_INDEX_MASK);
@@ -427,9 +422,6 @@ public:
 	vector<CGhoul2Info> &Get(int handle)
 	{
 		static vector<CGhoul2Info> null;
-		assert(handle>0); //null handle
-		assert((handle&G2_INDEX_MASK)>=0&&(handle&G2_INDEX_MASK)<MAX_G2_MODELS); //junk handle
-		assert(mIds[handle&G2_INDEX_MASK]==handle); // not a valid handle, could be old or garbage
 		if (handle<=0||(handle&G2_INDEX_MASK)<0||(handle&G2_INDEX_MASK)>=MAX_G2_MODELS||mIds[handle&G2_INDEX_MASK]!=handle)
 		{
 			null.clear();
@@ -439,8 +431,11 @@ public:
 	}
 	const vector<CGhoul2Info> &Get(int handle) const
 	{
-		assert(handle>0);
-		assert(mIds[handle&G2_INDEX_MASK]==handle); // not a valid handle, could be old or garbage
+		static const vector<CGhoul2Info> null;
+		if (handle<=0||(handle&G2_INDEX_MASK)<0||(handle&G2_INDEX_MASK)>=MAX_G2_MODELS||mIds[handle&G2_INDEX_MASK]!=handle)
+		{
+			return null;
+		}
 		return mInfos[handle&G2_INDEX_MASK];
 	}
 
@@ -492,11 +487,39 @@ void Ghoul2InfoArray_Free(void)
 	}
 }
 
+static std::set<const CGhoul2Info_v *> s_liveG2Instances;
+
+static inline void G2_RegisterInstance(const CGhoul2Info_v *ptr)
+{
+	if (ptr)
+	{
+		s_liveG2Instances.insert(ptr);
+	}
+}
+
+static inline void G2_UnregisterInstance(const CGhoul2Info_v *ptr)
+{
+	if (ptr)
+	{
+		s_liveG2Instances.erase(ptr);
+	}
+}
+
+static inline bool G2_IsLiveInstance(const CGhoul2Info_v *ptr)
+{
+	return ptr != NULL && s_liveG2Instances.find(ptr) != s_liveG2Instances.end();
+}
+
 // this is the ONLY function to read entity states directly
 void G2API_CleanGhoul2Models(CGhoul2Info_v **ghoul2Ptr)
 {
-	if (*ghoul2Ptr)
+	if (ghoul2Ptr && *ghoul2Ptr)
 	{
+		if (!G2_IsLiveInstance(*ghoul2Ptr))
+		{
+			*ghoul2Ptr = NULL;
+			return;
+		}
 		CGhoul2Info_v &ghoul2 = *(*ghoul2Ptr);
 
 #if 0 //rwwFIXMEFIXME: Disable this before release!!!!!! I am just trying to find a crash bug.
@@ -545,8 +568,6 @@ void G2API_CleanGhoul2Models(CGhoul2Info_v **ghoul2Ptr)
 		G2API_ClearSkinGore ( ghoul2 );
 #endif
 
-		ghoul2.~CGhoul2Info_v();
-
 #ifdef _FULL_G2_LEAK_CHECKING
 		if (g_G2AllocServer)
 		{
@@ -560,6 +581,7 @@ void G2API_CleanGhoul2Models(CGhoul2Info_v **ghoul2Ptr)
 		G2_DEBUG_RemovePtrFromTracker(*ghoul2Ptr);
 #endif
 
+		G2_UnregisterInstance(*ghoul2Ptr);
 		delete *ghoul2Ptr;
 		*ghoul2Ptr = NULL;
 	}	
@@ -614,9 +636,20 @@ int G2API_InitGhoul2Model(CGhoul2Info_v **ghoul2Ptr, const char *fileName, int m
 		return -1;
 	}
 
+	if (!ghoul2Ptr)
+	{
+		return -1;
+	}
+
+	if (*ghoul2Ptr && !G2_IsLiveInstance(*ghoul2Ptr))
+	{
+		*ghoul2Ptr = NULL;
+	}
+
 	if (!(*ghoul2Ptr))
 	{
 		*ghoul2Ptr = new CGhoul2Info_v;
+		G2_RegisterInstance(*ghoul2Ptr);
 #ifdef _FULL_G2_LEAK_CHECKING
 		if (g_G2AllocServer)
 		{
@@ -788,6 +821,10 @@ int G2API_GetSurfaceRenderStatus(CGhoul2Info *ghlInfo, const char *surfaceName)
 
 qboolean G2API_HasGhoul2ModelOnIndex(CGhoul2Info_v **ghlRemove, const int modelIndex)
 {
+	if (!ghlRemove || !G2_IsLiveInstance(*ghlRemove) || modelIndex < 0)
+	{
+		return qfalse;
+	}
 	CGhoul2Info_v &ghlInfo = **ghlRemove;
 
 	if (!ghlInfo.size() || (ghlInfo.size() <= modelIndex) || (ghlInfo[modelIndex].mModelindex == -1))
@@ -800,6 +837,19 @@ qboolean G2API_HasGhoul2ModelOnIndex(CGhoul2Info_v **ghlRemove, const int modelI
 
 qboolean G2API_RemoveGhoul2Model(CGhoul2Info_v **ghlRemove, const int modelIndex)
 {
+	if (!ghlRemove || !(*ghlRemove))
+	{
+		return qfalse;
+	}
+	if (!G2_IsLiveInstance(*ghlRemove))
+	{
+		*ghlRemove = NULL;
+		return qfalse;
+	}
+	if (modelIndex < 0)
+	{
+		return qfalse;
+	}
 	CGhoul2Info_v &ghlInfo = **ghlRemove;
 
 	// sanity check
@@ -871,6 +921,7 @@ qboolean G2API_RemoveGhoul2Model(CGhoul2Info_v **ghlRemove, const int modelIndex
 			}
 			g_Ghoul2Allocations -= sizeof(*ghlRemove);
 #endif
+			G2_UnregisterInstance(*ghlRemove);
 			delete *ghlRemove;
 			*ghlRemove = NULL;
 		}
@@ -882,6 +933,15 @@ qboolean G2API_RemoveGhoul2Model(CGhoul2Info_v **ghlRemove, const int modelIndex
 
 qboolean G2API_RemoveGhoul2Models(CGhoul2Info_v **ghlRemove)
 {//remove 'em ALL!
+	if (!ghlRemove || !(*ghlRemove))
+	{
+		return qfalse;
+	}
+	if (!G2_IsLiveInstance(*ghlRemove))
+	{
+		*ghlRemove = NULL;
+		return qfalse;
+	}
 	CGhoul2Info_v &ghlInfo = **ghlRemove;
 	int	modelIndex = 0;
 	int newSize = 0;
@@ -959,6 +1019,7 @@ qboolean G2API_RemoveGhoul2Models(CGhoul2Info_v **ghlRemove)
 		}
 		g_Ghoul2Allocations -= sizeof(*ghlRemove);
 #endif
+		G2_UnregisterInstance(*ghlRemove);
 		delete *ghlRemove;
 		*ghlRemove = NULL;
 	}
@@ -1928,7 +1989,7 @@ void G2API_ListBones(CGhoul2Info *ghlInfo, int frame)
 qboolean G2API_HaveWeGhoul2Models(CGhoul2Info_v *ghoul2)
 {
 	int i;
-	if (ghoul2)
+	if (G2_IsLiveInstance(ghoul2))
 	{
 		for (i=0; i<ghoul2->size();i++)
 		{
@@ -2342,12 +2403,13 @@ void G2API_CopySpecificG2Model(CGhoul2Info_v *ghoul2From, int modelFrom, CGhoul2
 
 // This version will automatically copy everything about this model, and make a new one if necessary.
 void G2API_DuplicateGhoul2Instance(CGhoul2Info_v *g2From, CGhoul2Info_v **g2To)
-{	if (!g2From || *g2To)
+{	if (!G2_IsLiveInstance(g2From) || !g2To || (*g2To && G2_IsLiveInstance(*g2To)))
 	{
 		return;
 	}
 
 	*g2To = new CGhoul2Info_v;
+	G2_RegisterInstance(*g2To);
 #ifdef _FULL_G2_LEAK_CHECKING
 	if (g_G2AllocServer)
 	{

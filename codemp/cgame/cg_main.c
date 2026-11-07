@@ -3436,7 +3436,7 @@ void CG_DestroyAllGhoul2(void)
 		j = 0;
 		while (j < MAX_ITEM_MODELS)
 		{
-			if (cg_items[i].g2Models[j] && trap_G2_HaveWeGhoul2Models(cg_items[i].g2Models[j]))
+			if (cg_items[i].g2Models[j])
 			{
 				trap_G2API_CleanGhoul2Models(&cg_items[i].g2Models[j]);
 				cg_items[i].g2Models[j] = NULL;
@@ -3482,6 +3482,13 @@ void CG_Shutdown( void )
 	// like closing files or archiving session data
 
 	CG_MultiSpecShutDown();
+
+#ifdef __EMSCRIPTEN__
+	memset( cg_entities, 0, sizeof( cg_entities ) );
+	memset( cgs.clientinfo, 0, sizeof( cgs.clientinfo ) );
+	memset( cg_items, 0, sizeof( cg_items ) );
+	memset( cg_weapons, 0, sizeof( cg_weapons ) );
+#endif
 }
 
 /*

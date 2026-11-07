@@ -1025,7 +1025,7 @@ void R_Register( void )
 
 	r_overBrightBits					= ri.Cvar_Get( "r_overBrightBits",					"0",						CVAR_ARCHIVE|CVAR_LATCH );
 #ifdef __EMSCRIPTEN__
-	r_mapOverBrightBits					= ri.Cvar_Get( "r_mapOverBrightBits",				"2",						CVAR_ARCHIVE|CVAR_LATCH );
+	r_mapOverBrightBits					= ri.Cvar_Get( "r_mapOverBrightBits",				"0",						CVAR_ARCHIVE );
 #else
 	r_mapOverBrightBits					= ri.Cvar_Get( "r_mapOverBrightBits",				"0",						CVAR_ARCHIVE|CVAR_LATCH );
 #endif

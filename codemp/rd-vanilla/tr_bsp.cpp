@@ -74,6 +74,37 @@ static void HSVtoRGB( float h, float s, float v, float rgb[3] )
 	}
 }
 
+#ifdef __EMSCRIPTEN__
+static byte		*s_jkRawLightmaps = NULL;
+static int		s_jkRawNumLightmaps = 0;
+static mgrid_t	*s_jkRawLightGrid = NULL;
+static int		s_jkRawLightGridCount = 0;
+static byte		*s_jkRawSurfaceColors = NULL;
+static int		s_jkRawSurfaceVertCount = 0;
+static qboolean	s_jkLoadingUnshiftedSurfaces = qfalse;
+static int		s_jkAppliedOverbrightBits = -1;
+
+static void R_FreeWorldRawLighting( void ) {
+	if ( s_jkRawLightmaps ) {
+		free( s_jkRawLightmaps );
+		s_jkRawLightmaps = NULL;
+	}
+	s_jkRawNumLightmaps = 0;
+	if ( s_jkRawLightGrid ) {
+		free( s_jkRawLightGrid );
+		s_jkRawLightGrid = NULL;
+	}
+	s_jkRawLightGridCount = 0;
+	if ( s_jkRawSurfaceColors ) {
+		free( s_jkRawSurfaceColors );
+		s_jkRawSurfaceColors = NULL;
+	}
+	s_jkRawSurfaceVertCount = 0;
+	s_jkLoadingUnshiftedSurfaces = qfalse;
+	s_jkAppliedOverbrightBits = -1;
+}
+#endif
+
 /*
 ===============
 R_ColorShiftLightingBytes
@@ -83,8 +114,23 @@ R_ColorShiftLightingBytes
 void R_ColorShiftLightingBytes( byte in[4], byte out[4] ) {
 	int shift, r, g, b;
 
+#ifdef __EMSCRIPTEN__
+	if ( s_jkLoadingUnshiftedSurfaces ) {
+		out[0] = in[0];
+		out[1] = in[1];
+		out[2] = in[2];
+		out[3] = in[3];
+		return;
+	}
+#endif
+
 	// shift the color data based on overbright range
 	shift = r_mapOverBrightBits->integer - tr.overbrightBits;
+	if ( shift < 0 ) {
+		shift = 0;
+	} else if ( shift > 4 ) {
+		shift = 4;
+	}
 
 	// shift the data based on overbright range
 	r = in[0] << shift;
@@ -119,6 +165,11 @@ void R_ColorShiftLightingBytes( byte in[3] ) {
 
 	// shift the color data based on overbright range
 	shift = r_mapOverBrightBits->integer - tr.overbrightBits;
+	if ( shift < 0 ) {
+		shift = 0;
+	} else if ( shift > 4 ) {
+		shift = 4;
+	}
 
 	// shift the data based on overbright range
 	r = in[0] << shift;
@@ -171,7 +222,8 @@ static	void R_LoadLightmaps( lump_t *l, const char *psMapName, world_t &worldDat
 	R_SyncRenderThread();
 
 	// create all the lightmaps
-	tr.numLightmaps = len / (LIGHTMAP_SIZE * LIGHTMAP_SIZE * 3);
+	int diskLightmaps = len / (LIGHTMAP_SIZE * LIGHTMAP_SIZE * 3);
+	tr.numLightmaps = diskLightmaps;
 	if ( tr.numLightmaps == 1 ) {
 		//FIXME: HACK: maps with only one lightmap turn up fullbright for some reason.
 		//this avoids this, but isn't the correct solution.
@@ -183,12 +235,29 @@ static	void R_LoadLightmaps( lump_t *l, const char *psMapName, world_t &worldDat
 		return;
 	}
 
+#ifdef __EMSCRIPTEN__
+	if ( &worldData == &s_worldData && tr.numLightmaps > 0 ) {
+		s_jkRawLightmaps = (byte *)calloc( tr.numLightmaps, LIGHTMAP_SIZE * LIGHTMAP_SIZE * 3 );
+		if ( s_jkRawLightmaps && diskLightmaps > 0 ) {
+			memcpy( s_jkRawLightmaps, buf, diskLightmaps * LIGHTMAP_SIZE * LIGHTMAP_SIZE * 3 );
+			s_jkRawNumLightmaps = tr.numLightmaps;
+		}
+	}
+#endif
+
 	char sMapName[MAX_QPATH];
 	COM_StripExtension(psMapName, sMapName, sizeof(sMapName));
 
 	for ( i = 0 ; i < tr.numLightmaps ; i++ ) {
 		// expand the 24 bit on-disk to 32 bit
-		buf_p = buf + i * LIGHTMAP_SIZE*LIGHTMAP_SIZE * 3;
+#ifdef __EMSCRIPTEN__
+		if ( &worldData == &s_worldData && s_jkRawLightmaps ) {
+			buf_p = s_jkRawLightmaps + i * LIGHTMAP_SIZE * LIGHTMAP_SIZE * 3;
+		} else
+#endif
+		{
+			buf_p = buf + i * LIGHTMAP_SIZE*LIGHTMAP_SIZE * 3;
+		}
 
 		if ( r_lightmap->integer == 2 )
 		{	// color code by intensity as development tool	(FIXME: check range)
@@ -1363,6 +1432,12 @@ static	void R_LoadSurfaces( lump_t *surfs, lump_t *verts, lump_t *indexLump, wor
 	worldData.surfaces = out;
 	worldData.numsurfaces = count;
 
+#ifdef __EMSCRIPTEN__
+	if ( !index && &worldData == &s_worldData ) {
+		s_jkLoadingUnshiftedSurfaces = qtrue;
+	}
+#endif
+
 	for ( i = 0 ; i < count ; i++, in++, out++ ) {
 		switch ( LittleLong( in->surfaceType ) ) {
 		case MST_PATCH:
@@ -1394,6 +1469,66 @@ static	void R_LoadSurfaces( lump_t *surfs, lump_t *verts, lump_t *indexLump, wor
 
 #ifdef PATCH_STITCHING
 	R_MovePatchSurfacesToHunk(worldData);
+#endif
+
+#ifdef __EMSCRIPTEN__
+	if ( !index && &worldData == &s_worldData ) {
+		s_jkLoadingUnshiftedSurfaces = qfalse;
+		int totalVerts = 0;
+		for ( i = 0; i < worldData.numsurfaces; i++ ) {
+			surfaceType_t *data = worldData.surfaces[i].data;
+			if ( !data ) continue;
+			if ( *data == SF_FACE ) {
+				totalVerts += ((srfSurfaceFace_t *)data)->numPoints;
+			} else if ( *data == SF_GRID ) {
+				srfGridMesh_t *grid = (srfGridMesh_t *)data;
+				totalVerts += grid->width * grid->height;
+			} else if ( *data == SF_TRIANGLES ) {
+				totalVerts += ((srfTriangles_t *)data)->numVerts;
+			}
+		}
+		if ( totalVerts > 0 ) {
+			s_jkRawSurfaceColors = (byte *)malloc( (size_t)totalVerts * MAXLIGHTMAPS * 4 );
+			if ( s_jkRawSurfaceColors ) {
+				s_jkRawSurfaceVertCount = totalVerts;
+				byte *dst = s_jkRawSurfaceColors;
+				for ( i = 0; i < worldData.numsurfaces; i++ ) {
+					surfaceType_t *data = worldData.surfaces[i].data;
+					if ( !data ) continue;
+					if ( *data == SF_FACE ) {
+						srfSurfaceFace_t *cv = (srfSurfaceFace_t *)data;
+						for ( int v = 0; v < cv->numPoints; v++ ) {
+							for ( int k = 0; k < MAXLIGHTMAPS; k++ ) {
+								byte *col = (byte *)&cv->points[v][VERTEX_COLOR + k];
+								memcpy( dst, col, 4 );
+								R_ColorShiftLightingBytes( dst, col );
+								dst += 4;
+							}
+						}
+					} else if ( *data == SF_GRID ) {
+						srfGridMesh_t *grid = (srfGridMesh_t *)data;
+						int n = grid->width * grid->height;
+						for ( int v = 0; v < n; v++ ) {
+							for ( int k = 0; k < MAXLIGHTMAPS; k++ ) {
+								memcpy( dst, grid->verts[v].color[k], 4 );
+								R_ColorShiftLightingBytes( dst, grid->verts[v].color[k] );
+								dst += 4;
+							}
+						}
+					} else if ( *data == SF_TRIANGLES ) {
+						srfTriangles_t *tri = (srfTriangles_t *)data;
+						for ( int v = 0; v < tri->numVerts; v++ ) {
+							for ( int k = 0; k < MAXLIGHTMAPS; k++ ) {
+								memcpy( dst, tri->verts[v].color[k], 4 );
+								R_ColorShiftLightingBytes( dst, tri->verts[v].color[k] );
+								dst += 4;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 #endif
 
 	Com_Printf ("...loaded %d faces, %i meshes, %i trisurfs, %i flares\n", numFaces, numMeshes, numTriSurfs, numFlares );
@@ -1826,6 +1961,16 @@ void R_LoadLightGrid( lump_t *l, world_t &worldData ) {
 	w->lightGridData = (mgrid_t *)Hunk_Alloc( l->filelen, h_low );
 	memcpy( w->lightGridData, (void *)(fileBase + l->fileofs), l->filelen );
 
+#ifdef __EMSCRIPTEN__
+	if ( &worldData == &s_worldData && numGridDataElements > 0 ) {
+		s_jkRawLightGrid = (mgrid_t *)malloc( (size_t)numGridDataElements * sizeof( mgrid_t ) );
+		if ( s_jkRawLightGrid ) {
+			memcpy( s_jkRawLightGrid, (const void *)(fileBase + l->fileofs), (size_t)numGridDataElements * sizeof( mgrid_t ) );
+			s_jkRawLightGridCount = numGridDataElements;
+		}
+	}
+#endif
+
 	// deal with overbright bits
 	for ( i = 0 ; i < numGridDataElements ; i++ ) 
 	{
@@ -2003,6 +2148,9 @@ void RE_LoadWorldMap_Actual( const char *name, world_t &worldData, int index )
 
 	if (!index)
 	{
+#ifdef __EMSCRIPTEN__
+		R_FreeWorldRawLighting();
+#endif
 		skyboxportal = 0;
 
 		// set default sun direction to be used if it isn't
@@ -2079,6 +2227,12 @@ void RE_LoadWorldMap_Actual( const char *name, world_t &worldData, int index )
 
 		// only set tr.world now that we know the entire level has loaded properly
 		tr.world = &worldData;
+#ifdef __EMSCRIPTEN__
+		s_jkAppliedOverbrightBits = r_mapOverBrightBits ? r_mapOverBrightBits->integer : 0;
+		if ( r_mapOverBrightBits ) {
+			r_mapOverBrightBits->modified = qfalse;
+		}
+#endif
 
 		if ( ri.Cvar_VariableIntegerValue( "com_RMG" ) )
 		{
@@ -2106,3 +2260,115 @@ void RE_LoadWorldMap( const char *name )
 	RE_LoadWorldMap_Actual( name, s_worldData, 0 );
 	ri.CM_SetUsingCache( qfalse );
 }
+
+#ifdef __EMSCRIPTEN__
+static void R_ReapplyWorldMapOverbright( void )
+{
+	if ( !tr.worldMapLoaded || tr.world != &s_worldData || !r_mapOverBrightBits ) {
+		return;
+	}
+
+	R_SyncRenderThread();
+
+	if ( s_jkRawLightmaps && tr.numLightmaps > 0 && !r_vertexLight->integer && r_lightmap->integer != 2 ) {
+		static byte image[LIGHTMAP_SIZE * LIGHTMAP_SIZE * 4];
+		int prevTMU = glState.currenttmu;
+		if ( qglActiveTextureARB && prevTMU != 0 ) {
+			GL_SelectTexture( 0 );
+		}
+		int count = ( tr.numLightmaps < s_jkRawNumLightmaps ) ? tr.numLightmaps : s_jkRawNumLightmaps;
+		for ( int i = 0; i < count; i++ ) {
+			if ( !tr.lightmaps[i] ) continue;
+			byte *buf_p = s_jkRawLightmaps + i * LIGHTMAP_SIZE * LIGHTMAP_SIZE * 3;
+			for ( int j = 0; j < LIGHTMAP_SIZE * LIGHTMAP_SIZE; j++ ) {
+				R_ColorShiftLightingBytes( &buf_p[j * 3], &image[j * 4] );
+				image[j * 4 + 3] = 255;
+			}
+			GL_Bind( tr.lightmaps[i] );
+			qglTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, LIGHTMAP_SIZE, LIGHTMAP_SIZE, GL_RGBA, GL_UNSIGNED_BYTE, image );
+		}
+		qglBindTexture( GL_TEXTURE_2D, 0 );
+		glState.currenttextures[0] = 0;
+		if ( qglActiveTextureARB && prevTMU != 0 ) {
+			GL_SelectTexture( prevTMU );
+		}
+	}
+
+	if ( s_jkRawLightGrid && s_worldData.lightGridData && s_jkRawLightGridCount > 0 ) {
+		memcpy( s_worldData.lightGridData, s_jkRawLightGrid, (size_t)s_jkRawLightGridCount * sizeof( mgrid_t ) );
+		for ( int i = 0; i < s_jkRawLightGridCount; i++ ) {
+			for ( int j = 0; j < MAXLIGHTMAPS; j++ ) {
+				R_ColorShiftLightingBytes( s_worldData.lightGridData[i].ambientLight[j] );
+				R_ColorShiftLightingBytes( s_worldData.lightGridData[i].directLight[j] );
+			}
+		}
+	}
+
+	if ( s_jkRawSurfaceColors && s_worldData.surfaces && s_jkRawSurfaceVertCount > 0 ) {
+		byte *src = s_jkRawSurfaceColors;
+		for ( int i = 0; i < s_worldData.numsurfaces; i++ ) {
+			surfaceType_t *data = s_worldData.surfaces[i].data;
+			if ( !data ) continue;
+			if ( *data == SF_FACE ) {
+				srfSurfaceFace_t *cv = (srfSurfaceFace_t *)data;
+				for ( int v = 0; v < cv->numPoints; v++ ) {
+					for ( int k = 0; k < MAXLIGHTMAPS; k++ ) {
+						R_ColorShiftLightingBytes( src, (byte *)&cv->points[v][VERTEX_COLOR + k] );
+						src += 4;
+					}
+				}
+			} else if ( *data == SF_GRID ) {
+				srfGridMesh_t *grid = (srfGridMesh_t *)data;
+				int n = grid->width * grid->height;
+				for ( int v = 0; v < n; v++ ) {
+					for ( int k = 0; k < MAXLIGHTMAPS; k++ ) {
+						R_ColorShiftLightingBytes( src, grid->verts[v].color[k] );
+						src += 4;
+					}
+				}
+			} else if ( *data == SF_TRIANGLES ) {
+				srfTriangles_t *tri = (srfTriangles_t *)data;
+				for ( int v = 0; v < tri->numVerts; v++ ) {
+					for ( int k = 0; k < MAXLIGHTMAPS; k++ ) {
+						R_ColorShiftLightingBytes( src, tri->verts[v].color[k] );
+						src += 4;
+					}
+				}
+			}
+		}
+	}
+
+	s_jkAppliedOverbrightBits = r_mapOverBrightBits->integer;
+	r_mapOverBrightBits->modified = qfalse;
+}
+
+void R_SyncWorldMapOverbright( void )
+{
+	if ( !tr.worldMapLoaded || tr.world != &s_worldData || !r_mapOverBrightBits ) {
+		return;
+	}
+	if ( r_mapOverBrightBits->modified || r_mapOverBrightBits->integer != s_jkAppliedOverbrightBits ) {
+		R_ReapplyWorldMapOverbright();
+	}
+}
+
+extern "C" int R_SetMapOverBrightBits( int bits )
+{
+	if ( bits < 0 ) bits = 0;
+	if ( bits > 3 ) bits = 3;
+	ri.Cvar_Set( "r_mapOverBrightBits", va( "%d", bits ) );
+	if ( tr.worldMapLoaded && tr.world == &s_worldData && r_mapOverBrightBits ) {
+		if ( r_mapOverBrightBits->integer != s_jkAppliedOverbrightBits ) {
+			R_ReapplyWorldMapOverbright();
+		} else {
+			r_mapOverBrightBits->modified = qfalse;
+		}
+	}
+	return bits;
+}
+
+extern "C" int R_GetMapOverBrightBits( void )
+{
+	return r_mapOverBrightBits ? r_mapOverBrightBits->integer : (int)ri.Cvar_VariableIntegerValue( "r_mapOverBrightBits" );
+}
+#endif

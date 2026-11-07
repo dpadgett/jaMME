@@ -1227,9 +1227,20 @@ void RB_RenderDrawSurfList( drawSurf_t *drawSurfs, int numDrawSurfs ) {
 				rad = backEnd.currentEntity->e.radius;
 #endif
 
-				if (r)
+				if (r && glConfig.vidWidth >= 16 && glConfig.vidHeight >= 16)
 				{
 					int cX, cY;
+					int potRad = 16;
+					while ((potRad << 1) <= rad && (potRad << 1) <= glConfig.maxTextureSize)
+					{
+						potRad <<= 1;
+					}
+					while (potRad > 16 && (potRad > glConfig.vidWidth || potRad > glConfig.vidHeight))
+					{
+						potRad >>= 1;
+					}
+					rad = potRad;
+
 					cX = glConfig.vidWidth-x-(rad/2);
 					cY = glConfig.vidHeight-y-(rad/2);
 
@@ -1252,9 +1263,11 @@ void RB_RenderDrawSurfList( drawSurf_t *drawSurfs, int numDrawSurfs ) {
 					}
 
 					//now copy a portion of the screen to this texture
-#ifdef HAVE_GLES
+#ifdef __EMSCRIPTEN__
+					qglCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, cX, cY, rad, rad, 0);
+#elif defined(HAVE_GLES)
 					qglCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, cX, cY, rad, rad, 0);
-#elif !defined(__EMSCRIPTEN__)
+#else
 					qglCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16, cX, cY, rad, rad, 0);
 #endif
 

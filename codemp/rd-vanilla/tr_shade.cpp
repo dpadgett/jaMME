@@ -2021,13 +2021,9 @@ static void RB_IterateStagesGeneric( shaderCommands_t *input )
 			if ( (tess.shader == tr.distortionShader) || 
 				 (backEnd.currentEntity && (backEnd.currentEntity->e.renderfx & RF_DISTORTION)) )
 			{ //special distortion effect -rww
-#ifdef __EMSCRIPTEN__
-				continue;
-#else
 				//tr.screenImage should have been set for this specific entity before we got in here.
 				GL_Bind( tr.screenImage );
 				GL_Cull(CT_TWO_SIDED);
-#endif
 			}
 			else if ( pStage->bundle[0].vertexLightmap && ( r_vertexLight->integer && !r_uiFullScreen->integer ) && r_lightmap->integer )
 			{

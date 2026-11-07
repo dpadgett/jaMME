@@ -1529,7 +1529,7 @@ void CG_NewClientInfo( int clientNum, qboolean entitiesInitialized ) {
 	void *oldG2Weapons[MAX_SABERS];
 	int i = 0;
 	int k = 0;
-	qboolean saberUpdate[MAX_SABERS];
+	qboolean saberUpdate[MAX_SABERS] = { qfalse, qfalse };
 
 	const char	*strings[6];
 	qboolean	friendly, skipColor, skipColor2;
@@ -1941,6 +1941,10 @@ void CG_NewClientInfo( int clientNum, qboolean entitiesInitialized ) {
 				{
 					if (oldG2Weapons[j])
 					{ //free the old instance(s)
+						if (ci->ghoul2Weapons[j] == oldG2Weapons[j])
+						{
+							ci->ghoul2Weapons[j] = NULL;
+						}
 						trap_G2API_CleanGhoul2Models(&oldG2Weapons[j]);
 						oldG2Weapons[j] = 0;
 					}
@@ -1951,6 +1955,10 @@ void CG_NewClientInfo( int clientNum, qboolean entitiesInitialized ) {
 				{
 					if (oldG2Weapons[j])
 					{ //free the old instance(s)
+						if (ci->ghoul2Weapons[j] == oldG2Weapons[j])
+						{
+							ci->ghoul2Weapons[j] = NULL;
+						}
 						trap_G2API_CleanGhoul2Models(&oldG2Weapons[j]);
 						oldG2Weapons[j] = 0;
 					}

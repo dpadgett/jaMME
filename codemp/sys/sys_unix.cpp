@@ -452,6 +452,10 @@ Block execution for msec or until input is recieved.
 */
 void Sys_Sleep( int msec )
 {
+#ifdef __EMSCRIPTEN__
+	(void)msec;
+	return;
+#else
 	if( msec == 0 )
 		return;
 
@@ -482,6 +486,7 @@ void Sys_Sleep( int msec )
 
 		usleep( msec * 1000 );
 	}
+#endif
 }
 
 /*
@@ -629,6 +634,9 @@ char *Sys_DefaultHomePath(void)
 
 char *Sys_ConsoleInput(void)
 {
+#ifdef __EMSCRIPTEN__
+	return NULL;
+#else
     static char text[256];
     int     len;
 	fd_set	fdset;
@@ -658,6 +666,7 @@ char *Sys_ConsoleInput(void)
 	text[len-1] = 0;    // rip off the /n and terminate
 
 	return text;
+#endif
 }
 
 /*

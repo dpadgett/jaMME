@@ -3275,11 +3275,18 @@ void R_SetColorMappings( void ) {
 	shift = tr.overbrightBits;
 
 	for ( i = 0; i < 256; i++ ) {
+#ifdef __EMSCRIPTEN__
+		// In WebGL, final display gamma is applied directly to the canvas via an sRGB
+		// SVG feComponentTransfer gamma filter (matching desktop hardware gamma ramps),
+		// so keep s_gammatable identity to avoid baking partial gamma into newly loaded textures.
+		inf = i;
+#else
 		if ( g == 1 ) {
 			inf = i;
 		} else {
 			inf = 255 * pow ( i/255.0f, 1.0f / g ) + 0.5f;
 		}
+#endif
 		inf <<= shift;
 		if (inf < 0) {
 			inf = 0;

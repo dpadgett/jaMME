@@ -1254,6 +1254,12 @@ static void Com_CatchError ( int code )
 	}
 }
 
+void Com_RecoverFromThrownError( int code )
+{
+	Com_CatchError( code );
+	Com_Printf( "%s\n", Com_ErrorString( code ) );
+}
+
 #ifdef _WIN32
 static const char *GetErrorString( DWORD error ) {
 	static char buf[MAX_STRING_CHARS];

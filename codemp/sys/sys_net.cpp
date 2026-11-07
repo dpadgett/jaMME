@@ -585,6 +585,10 @@ char *NET_ErrorString (void)
 // sleeps msec or until net socket is ready
 void NET_Sleep(int msec)
 {
+#ifdef __EMSCRIPTEN__
+	(void)msec;
+	return;
+#else
     struct timeval timeout;
 	fd_set	fdset;
 	extern qboolean stdin_active;
@@ -599,5 +603,6 @@ void NET_Sleep(int msec)
 	timeout.tv_sec = msec/1000;
 	timeout.tv_usec = (msec%1000)*1000;
 	select(ip_socket+1, &fdset, NULL, NULL, &timeout);
+#endif
 }
 

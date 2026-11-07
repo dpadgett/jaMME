@@ -575,8 +575,10 @@ void S_MixBackground( mixBackground_t *background, int speed, int count, int *ou
 #endif
 			/* Already playing, check if we already have the right one open */
 			if ( background->sound && Q_stricmp( background->soundName, s_background.startName )) {
-				S_SoundClose( background->sound );
+				openSound_t *oldSound = background->sound;
 				background->sound = 0;
+				background->soundName[0] = 0;
+				S_SoundClose( oldSound );
 			}
 			/* Do we have to load a sound */
 			if ( !background->sound ) {
@@ -624,7 +626,16 @@ void S_MixBackground( mixBackground_t *background, int speed, int count, int *ou
 				Com_Memset( output, 0, count * sizeof(int) * 2 );
 				return;
 			}
+			if ( sound->rate <= 0 ) {
+				background->sound = 0;
+				background->soundName[0] = 0;
+				S_SoundClose( sound );
+				Com_Memset( output, 0, count * sizeof(int) * 2 );
+				return;
+			}
 			indexAdd = (sound->rate * speed ) / MIX_SPEED;
+			if ( indexAdd <= 0 )
+				indexAdd = 1;
 			if ( background->length ) {
 				background->length -= indexAdd;
 				if ( background->length < 0 ) {
@@ -644,9 +655,11 @@ void S_MixBackground( mixBackground_t *background, int speed, int count, int *ou
 					if (!strcmp( s_background.loopName, background->soundName))
 						S_SoundSeek( sound, 0 );
 					else {
-						S_SoundClose( background->sound );
-						background->sound = S_SoundOpen( s_background.loopName );
+						openSound_t *oldSound = background->sound;
+						background->sound = 0;
 						Q_strncpyz( background->soundName, s_background.loopName, sizeof( background->soundName));
+						S_SoundClose( oldSound );
+						background->sound = S_SoundOpen( s_background.loopName );
 					}
 					background->index = 1 << MIX_SHIFT;
 					if (background->sound)
@@ -679,8 +692,10 @@ void S_MixBackground( mixBackground_t *background, int speed, int count, int *ou
 	} else {
 		//Close up the sound file if no longer playing
 		if ( background->sound ) {
-			S_SoundClose( background->sound );
+			openSound_t *oldSound = background->sound;
 			background->sound = 0;
+			background->soundName[0] = 0;
+			S_SoundClose( oldSound );
 		}
 		Com_Memset( output, 0, count * sizeof(int) * 2 );
 	}

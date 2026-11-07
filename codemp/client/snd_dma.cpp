@@ -47,6 +47,15 @@ void S_DMAClearBuffer( void ) {
 		return;
 
 	/* Clear the active channels and loops */
+	if ( dmaBackground.sound ) {
+		openSound_t *oldBg = dmaBackground.sound;
+		dmaBackground.sound = 0;
+		S_SoundClose( oldBg );
+		if ( s_background.playing ) {
+			s_background.reload = qtrue;
+		}
+	}
+	Com_Memset( &dmaBackground, 0, sizeof( dmaBackground ));
 	Com_Memset( dmaLoops, 0, sizeof( dmaLoops ));
 	Com_Memset( dmaChannels, 0, sizeof( dmaChannels ));
 	Com_Memset( &dmaEffect, 0, sizeof( dmaEffect ));

@@ -4490,7 +4490,10 @@ EMSCRIPTEN_KEEPALIVE float JK_DemoGetVolume( void ) {
 	return g_jkSavedVolume;
 }
 
+extern void Com_RecoverFromThrownError( int code );
+
 EMSCRIPTEN_KEEPALIVE int JK_DemoLoad( const char *demoName ) {
+	try {
 	if ( !demoName || !demoName[0] ) {
 		return 0;
 	}
@@ -4527,6 +4530,10 @@ EMSCRIPTEN_KEEPALIVE int JK_DemoLoad( const char *demoName ) {
 	Cvar_Set( "mme_demoPaused", "0" );
 	Cbuf_ExecuteText( EXEC_APPEND, va( "demo \"%s\"\n", demoName ) );
 	return 1;
+	} catch ( int code ) {
+		Com_RecoverFromThrownError( code );
+		return 0;
+	}
 }
 
 static int s_jkPrepareStage = 0;
@@ -4542,13 +4549,42 @@ static int s_jkPrepareClientsTotal = 0;
 extern qboolean demoIsMmeStreamActive( void );
 extern void demoSetMmeStream( qboolean active, const char *fileName, int fileSize, int startTime, int endTime, int totalFrames, int indexCount, const int *indexTriples );
 extern qboolean demoReadStreamInitialGamestate( gameState_t *outGs );
+extern void demoConvertAbort( void );
+
+EMSCRIPTEN_KEEPALIVE void JK_DemoAbortPrepare( void ) {
+	try {
+		g_jkPreparingDemo = qfalse;
+		s_jkPrepareStage = 0;
+		demoConvertAbort();
+		if ( cls.cgameStarted || cgvm ) {
+			CL_ShutdownCGame();
+		}
+		if ( clc.demofile ) {
+			FS_FCloseFile( clc.demofile );
+			clc.demofile = 0;
+		}
+		demoStop();
+		if ( clc.demoplaying || cls.state >= CA_LOADING ) {
+			CL_Disconnect( qfalse );
+		}
+		S_ClearSoundBuffer();
+	} catch ( int code ) {
+		g_jkPreparingDemo = qfalse;
+		s_jkPrepareStage = 0;
+		Com_RecoverFromThrownError( code );
+	}
+}
 
 EMSCRIPTEN_KEEPALIVE void JK_DemoSetMmeStream( int active, int fileSize, int startTime, int endTime, int totalFrames, int indexCount, const int *indexTriples ) {
+	if ( clc.demoplaying || g_jkPreparingDemo || cls.cgameStarted || cls.state >= CA_LOADING ) {
+		JK_DemoAbortPrepare();
+	}
 	demoSetMmeStream( active ? qtrue : qfalse, "mmedemos/current.mme", fileSize, startTime, endTime, totalFrames, indexCount, indexTriples );
 }
 
 EMSCRIPTEN_KEEPALIVE int JK_DemoPrepareBegin( const char *demoName ) {
 #ifdef __EMSCRIPTEN__
+	try {
 	if ( !demoName || !demoName[0] ) {
 		return 0;
 	}
@@ -4634,6 +4670,12 @@ EMSCRIPTEN_KEEPALIVE int JK_DemoPrepareBegin( const char *demoName ) {
 	s_jkPreparePct = 0.01f;
 	Q_strncpyz( s_jkPrepareLabel, "Indexing demo timeline (0%)...", sizeof( s_jkPrepareLabel ) );
 	return 1;
+	} catch ( int code ) {
+		g_jkPreparingDemo = qfalse;
+		s_jkPrepareStage = 0;
+		Com_RecoverFromThrownError( code );
+		return 0;
+	}
 #else
 	return JK_DemoLoad( demoName );
 #endif
@@ -4641,6 +4683,7 @@ EMSCRIPTEN_KEEPALIVE int JK_DemoPrepareBegin( const char *demoName ) {
 
 EMSCRIPTEN_KEEPALIVE int JK_DemoPrepareStep( void ) {
 #ifdef __EMSCRIPTEN__
+	try {
 	if ( !g_jkPreparingDemo || s_jkPrepareStage <= 0 ) {
 		g_jkPreparingDemo = qfalse;
 		s_jkPrepareStage = 0;
@@ -4756,6 +4799,14 @@ EMSCRIPTEN_KEEPALIVE int JK_DemoPrepareStep( void ) {
 	g_jkPreparingDemo = qfalse;
 	s_jkPrepareStage = 0;
 	return 0;
+	} catch ( int code ) {
+		g_jkPreparingDemo = qfalse;
+		s_jkPrepareStage = 0;
+		s_jkPreparePct = 1.0f;
+		Q_strncpyz( s_jkPrepareLabel, "Load interrupted", sizeof( s_jkPrepareLabel ) );
+		Com_RecoverFromThrownError( code );
+		return 0;
+	}
 #else
 	return 0;
 #endif
@@ -4787,6 +4838,7 @@ extern "C" const char *FS_WasmPlanDemoChunks(
 
 EMSCRIPTEN_KEEPALIVE const char *JK_DemoPlanLoadChunks( const char *demoName ) {
 #ifdef __EMSCRIPTEN__
+	try {
 	if ( !demoName || !demoName[0] ) {
 		return "{\"bspReady\":0,\"mapName\":\"\",\"spans\":[]}";
 	}
@@ -4893,6 +4945,10 @@ EMSCRIPTEN_KEEPALIVE const char *JK_DemoPlanLoadChunks( const char *demoName ) {
 	Q_strncpyz( pakNames, Info_ValueForKey( systemInfo, "sv_pakNames" ), sizeof( pakNames ) );
 	Q_strncpyz( mapName, Info_ValueForKey( serverInfo, "mapname" ), sizeof( mapName ) );
 	return FS_WasmPlanDemoChunks( refSums, refNames, pakSums, pakNames, mapName, &s_planGs );
+	} catch ( int code ) {
+		Com_RecoverFromThrownError( code );
+		return "{\"bspReady\":0,\"mapName\":\"\",\"spans\":[]}";
+	}
 #else
 	(void)demoName;
 	return "{\"bspReady\":1,\"mapName\":\"\",\"spans\":[]}";
@@ -5115,6 +5171,8 @@ EMSCRIPTEN_KEEPALIVE int JK_DemoPrewarmAssets( void ) {
 extern "C" void CG_ResetForDemoSeek( int serverCommandSeq, int processedSnapNum );
 extern "C" void CG_GetDemoDebugState( float *outFloats, int maxCount );
 extern "C" void CG_ExecuteNewServerCommands( int latestSequence );
+extern "C" int R_SetMapOverBrightBits( int bits );
+extern "C" int R_GetMapOverBrightBits( void );
 extern int FS_GetLoadedPackCount( void );
 #endif
 
@@ -5132,6 +5190,7 @@ extern "C" void CL_ResetSeekEntityCache( void );
 extern "C" void CL_MaterializeSeekSnapshot( clSnapshot_t *snap );
 
 EMSCRIPTEN_KEEPALIVE int JK_DemoSeekToMs( int targetOffsetMs ) {
+	try {
 	if ( !clc.demoplaying && g_jkLastDemoName[0] ) {
 		Cbuf_AddText( va( "demo \"%s\"\n", g_jkLastDemoName ) );
 		Cbuf_Execute();
@@ -5316,6 +5375,14 @@ EMSCRIPTEN_KEEPALIVE int JK_DemoSeekToMs( int targetOffsetMs ) {
 	Cvar_Set( "cl_freezeDemo", wasPaused ? "1" : "0" );
 	com_frameTime = Com_Milliseconds();
 	return JK_DemoGetCurrentTimeMs();
+	} catch ( int code ) {
+		g_jkDemoSkipSnapshot = qfalse;
+		g_jkDemoSeeking = qfalse;
+		g_jkDemoSeekingRewind = qfalse;
+		s_jkDemoSeekHitEof = qfalse;
+		Com_RecoverFromThrownError( code );
+		return -1;
+	}
 }
 
 EMSCRIPTEN_KEEPALIVE const char *JK_DemoGetDebugJSON( void ) {
@@ -5377,6 +5444,27 @@ EMSCRIPTEN_KEEPALIVE int JK_DemoGetLoadedPackCount( void ) {
 
 EMSCRIPTEN_KEEPALIVE int JK_DemoGetServerTimeMs( void ) {
 	return JK_DemoGetServerTime();
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoSetMapOverbright( int bits ) {
+	if ( bits < 0 ) bits = 0;
+	if ( bits > 3 ) bits = 3;
+#ifdef __EMSCRIPTEN__
+	if ( cls.rendererStarted ) {
+		return R_SetMapOverBrightBits( bits );
+	}
+#endif
+	Cvar_Set( "r_mapOverBrightBits", va( "%d", bits ) );
+	return bits;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoGetMapOverbright( void ) {
+#ifdef __EMSCRIPTEN__
+	if ( cls.rendererStarted ) {
+		return R_GetMapOverBrightBits();
+	}
+#endif
+	return (int)Cvar_VariableIntegerValue( "r_mapOverBrightBits" );
 }
 
 } // extern "C"

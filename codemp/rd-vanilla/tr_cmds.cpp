@@ -426,6 +426,11 @@ void RE_BeginFrame( stereoFrame_t stereoFrame ) {
 		R_SetColorMappings();
 	}
 
+#ifdef __EMSCRIPTEN__
+	extern void R_SyncWorldMapOverbright( void );
+	R_SyncWorldMapOverbright();
+#endif
+
     // check for errors
 #ifndef __EMSCRIPTEN__
     if ( !r_ignoreGLErrors->integer ) {
