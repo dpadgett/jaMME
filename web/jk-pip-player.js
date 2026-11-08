@@ -2955,7 +2955,7 @@
       return Promise.resolve(window.JKVideoExport);
     }
     if (videoExportScriptPromise) return videoExportScriptPromise;
-    const PLAYER_ASSET_VERSION = '20261107m';
+    const PLAYER_ASSET_VERSION = '20261107n';
     videoExportScriptPromise = new Promise((resolve, reject) => {
       const existing = document.querySelector('script[src*="/jkplayer/jk-video-export.js"]');
       if (existing) {
@@ -3001,7 +3001,7 @@
 
     // Separate engine vs wrapper versions so UI/JS updates do not invalidate cached openjk.wasm
     const ENGINE_ASSET_VERSION = '20261107m';
-    const PLAYER_ASSET_VERSION = '20261107m';
+    const PLAYER_ASSET_VERSION = '20261107n';
     ensureVideoExportScriptLoaded().catch(() => {});
     window.JKDemoConfig = Object.assign(
       {
@@ -3115,35 +3115,205 @@
     );
   }
 
+  function cleanElementText(el) {
+    if (!el) return '';
+    const clone = el.cloneNode(true);
+    if (clone.querySelectorAll) {
+      clone.querySelectorAll('.jk-play-btn').forEach((btn) => btn.remove());
+    }
+    return (clone.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function extractDemoBasename(urlStr) {
+    try {
+      const u = new URL(String(urlStr || ''), window.location.origin);
+      let demoParam = u.searchParams.get('demo');
+      if (demoParam) {
+        if (/%[0-9A-Fa-f]{2}/.test(demoParam)) {
+          try {
+            demoParam = decodeURIComponent(demoParam);
+          } catch (_) {}
+        }
+        const parts = demoParam.split(/[/\\]/).filter(Boolean);
+        const base = parts[parts.length - 1] || demoParam;
+        return base.replace(/\.(?:dm_26|dm_25|mme)$/i, '').trim() || base;
+      }
+    } catch (_) {}
+    return '';
+  }
+
   function deriveDemoTitle(anchorOrUrl) {
     if (anchorOrUrl && typeof anchorOrUrl === 'object' && anchorOrUrl.nodeType === 1) {
       const href = anchorOrUrl.getAttribute('href') || '';
-      const text = (anchorOrUrl.textContent || '').trim();
+      const text = cleanElementText(anchorOrUrl);
+      const isGenericLinkText =
+        !text || text === 'Link' || text === 'Demo' || text === 'Match Demo';
+      const cell = anchorOrUrl.closest('td');
       const row = anchorOrUrl.closest('tr');
-      if (row) {
-        const cells = Array.from(row.querySelectorAll(':scope > td')).map((td) =>
-          (td.textContent || '').replace(/(?:\u25B6\s*)?Play/g, '').trim()
+
+      if (row && cell) {
+        const table = row.closest('table');
+        const tableRows = table ? table.rows : null;
+        const hdr0 = tableRows && tableRows.length > 0 ? tableRows[0] : null;
+        const hdr1 = tableRows && tableRows.length > 1 ? tableRows[1] : null;
+        const hdr0First = hdr0 && hdr0.children[0] ? cleanElementText(hdr0.children[0]) : '';
+        const rowCells = Array.from(row.children);
+        const cellIdx = rowCells.indexOf(cell);
+        const isMatchSummaryRow = Boolean(
+          rowCells[0] && rowCells[0].hasAttribute('rowspan')
         );
-        const nonEmpty = cells.filter(
-          (c) => c && c !== 'Link' && c !== 'Demo' && c !== 'LinkDemo' && c !== 'Match Demo'
-        );
+
+        // 1. match.html (#recentdemos built by matchrpc.js): Link | Server | Date | Map | Duration | Red | Blue | Free | Spec
+        if (hdr0First === 'Link') {
+          if (isMatchSummaryRow) {
+            const server = cleanElementText(rowCells[1]);
+            const dateStr = cleanElementText(rowCells[2]);
+            const mapName = cleanElementText(rowCells[3]);
+            const redScore = cleanElementText(rowCells[5]);
+            const blueScore = cleanElementText(rowCells[6]);
+            const scoreBadge =
+              redScore !== '' && blueScore !== '' ? `(${redScore}-${blueScore})` : '';
+            const mapWithScore = [mapName, scoreBadge].filter(Boolean).join(' ');
+            const meta = [mapWithScore, server, dateStr].filter(Boolean).join(' \u00B7 ');
+            const prefix =
+              href.includes('rpc=matchdemo') || text === 'Demo'
+                ? 'Match Demo'
+                : !isGenericLinkText
+                  ? text
+                  : 'Match Demo';
+            return meta ? `${prefix} \u2014 ${meta}` : prefix;
+          }
+
+          // Player POV / Nice Shot / Bookmark / Merged POV cell inside multi-team row
+          let nameIdx = cellIdx + 2;
+          if (hdr1 && hdr1.children.length === rowCells.length) {
+            for (
+              let k = cellIdx + 1;
+              k < Math.min(rowCells.length, cellIdx + 6);
+              k++
+            ) {
+              const colHdr = cleanElementText(hdr1.children[k]);
+              if (colHdr === 'Demo') break;
+              if (colHdr === 'Name') {
+                nameIdx = k;
+                break;
+              }
+            }
+          }
+          let playerName = '';
+          const nameCell = rowCells[nameIdx];
+          if (nameCell) {
+            const nameAnchor = nameCell.querySelector('a[href*="player"]');
+            playerName = nameAnchor
+              ? cleanElementText(nameAnchor)
+              : cleanElementText(nameCell).replace(/\s*\(\d+\s*-\s*\d+\)\s*$/, '').trim();
+            if (playerName === 'Disconnected Players:') {
+              playerName = '';
+            }
+          }
+
+          let lead = '';
+          if (!isGenericLinkText) {
+            lead = playerName ? `${playerName} \u00B7 ${text}` : text;
+          } else if (href.includes('mergedemo.php')) {
+            lead = `${playerName || 'Player'} (Merged POV)`;
+          } else {
+            lead = playerName || extractDemoBasename(href) || deriveDemoTitle(href);
+          }
+
+          let matchRow = row.previousElementSibling;
+          while (
+            matchRow &&
+            !(matchRow.children[0] && matchRow.children[0].hasAttribute('rowspan'))
+          ) {
+            matchRow = matchRow.previousElementSibling;
+          }
+          if (matchRow) {
+            const server = cleanElementText(matchRow.children[1]);
+            const dateStr = cleanElementText(matchRow.children[2]);
+            const mapName = cleanElementText(matchRow.children[3]);
+            const meta = [mapName, server].filter(Boolean).join(' \u00B7 ') || dateStr;
+            if (meta) {
+              return `${lead} \u2014 ${meta}`;
+            }
+          }
+          return lead;
+        }
+
+        // 2. index.html (#recentdemos built by rpc.js): Server | Player | Date | Duration | Download | Map
+        if (hdr0First === 'Server' && isMatchSummaryRow) {
+          const server = cleanElementText(rowCells[0]);
+          const playerName = cleanElementText(rowCells[1]);
+          const dateStr = cleanElementText(rowCells[2]);
+          const mapName = rowCells[5] ? cleanElementText(rowCells[5]) : '';
+          const lead =
+            (!isGenericLinkText && text) ||
+            playerName ||
+            extractDemoBasename(href) ||
+            'Demo';
+          const meta = [mapName, server].filter(Boolean).join(' \u00B7 ') || dateStr;
+          return meta && meta !== lead ? `${lead} \u2014 ${meta}` : lead;
+        }
+
+        // 3. Generic fallback for any other table layout
+        const nonEmpty = rowCells
+          .filter((td) => td !== cell)
+          .map((td) => cleanElementText(td))
+          .filter(
+            (c) => c && c !== 'Link' && c !== 'Demo' && c !== 'LinkDemo' && c !== 'Match Demo'
+          );
         if (nonEmpty.length >= 2) {
-          return (text ? text + ' \u2014 ' : '') + nonEmpty.slice(0, 2).join(' \u00B7 ');
+          return (!isGenericLinkText ? text + ' \u2014 ' : '') + nonEmpty.slice(0, 2).join(' \u00B7 ');
         }
       }
-      if (text && text !== 'Link') return text;
+
+      // 4. AngularJS player pages (aplayer2.html, debugplayer2.html, aplayer.html, debugplayer.html)
+      const li = anchorOrUrl.closest('li');
+      if (li) {
+        const gameLi =
+          !isGenericLinkText && li.parentElement && li.parentElement.closest('li')
+            ? li.parentElement.closest('li')
+            : li;
+        let playerName = '';
+        const nameSpans = gameLi.querySelectorAll(
+          ':scope > span[ng-repeat*="game.names"] span[ng-bind-html], :scope > span[ng-bind-html*="name"]'
+        );
+        if (nameSpans.length > 0) {
+          playerName = cleanElementText(nameSpans[0]);
+        }
+        if (!playerName) {
+          const pagePlayerHdr = document.querySelector('h2 span[ng-bind-html*="player"]');
+          playerName = cleanElementText(pagePlayerHdr);
+        }
+        const base = extractDemoBasename(href);
+        if (!isGenericLinkText) {
+          return playerName ? `${playerName} \u00B7 ${text}` : text;
+        }
+        if (playerName && base) {
+          return `${playerName} \u2014 ${base}`;
+        }
+        if (playerName) return playerName;
+      }
+
+      if (!isGenericLinkText) return text;
       return deriveDemoTitle(href);
     }
+
     const urlStr = String(anchorOrUrl || '');
     try {
       const u = new URL(urlStr, window.location.origin);
-      const demoParam = u.searchParams.get('demo');
-      if (demoParam) {
-        const parts = decodeURIComponent(demoParam).split('/');
-        return parts[parts.length - 1] || demoParam;
+      const base = extractDemoBasename(urlStr);
+      if (u.pathname.includes('trimdemo.php')) {
+        const timeMs = parseInt(u.searchParams.get('time') || '', 10);
+        if (Number.isFinite(timeMs) && timeMs >= 0) {
+          const mins = Math.floor(timeMs / 60000);
+          const secs = String(Math.floor((timeMs % 60000) / 1000)).padStart(2, '0');
+          return base ? `${base} @ ${mins}:${secs}` : `Clip @ ${mins}:${secs}`;
+        }
       }
+      if (base) return base;
       if (u.searchParams.get('rpc') === 'matchdemo') {
-        return 'Match Highlight #' + (u.searchParams.get('id') || '');
+        return 'Match Demo #' + (u.searchParams.get('id') || '');
       }
       if (u.pathname.includes('mergedemo.php')) {
         return (
