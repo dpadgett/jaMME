@@ -18,8 +18,8 @@
   const MAX_OVERBRIGHT = 3;
 
   const BOOT_START_MS = typeof performance !== 'undefined' ? performance.now() : Date.now();
-  const DEFAULT_ENGINE_VERSION = '20261106f';
-  const DEFAULT_PLAYER_VERSION = '20261106f';
+  const DEFAULT_ENGINE_VERSION = '20261107m';
+  const DEFAULT_PLAYER_VERSION = '20261107m';
 
   function installDocumentTitleGuard() {
     if (typeof document === 'undefined' || document.__jkTitleGuardInstalled) return;
@@ -58,8 +58,8 @@
   }
 
   installDocumentTitleGuard();
-  const EXPECTED_OPENJK_JS_BYTES = 306337;
-  const EXPECTED_OPENJK_WASM_BYTES = 5204979;
+  const EXPECTED_OPENJK_JS_BYTES = 327283;
+  const EXPECTED_OPENJK_WASM_BYTES = 5305470;
   const WASM_PK3_CHUNK_SIZE = 256 * 1024;
   const IDB_NAME = 'openjk-cache-v1';
   const IDB_VERSION = 1;
@@ -1155,7 +1155,13 @@
         const bytes = new Uint8Array(0);
         return { id: nextObjId++, bytes, dv: new DataView(bytes.buffer) };
       },
-      deleteBuffer() {},
+      deleteBuffer(buf) {
+        if (!buf) return;
+        if (this._boundArrayBuffer === buf) this._boundArrayBuffer = null;
+        if (this._boundElementArrayBuffer === buf) this._boundElementArrayBuffer = null;
+        buf.bytes = new Uint8Array(0);
+        buf.dv = new DataView(buf.bytes.buffer);
+      },
       isBuffer(b) { return !!b; },
       bindBuffer(target, buf) {
         if (target === 0x8892) this._boundArrayBuffer = buf || null;
@@ -1197,7 +1203,15 @@
       createTexture() {
         return { id: nextObjId++, width: 0, height: 0, data: null, wrapS: 0x2901, wrapT: 0x2901 };
       },
-      deleteTexture() {},
+      deleteTexture(tex) {
+        if (!tex) return;
+        for (let i = 0; i < boundTextures.length; i++) {
+          if (boundTextures[i] === tex) boundTextures[i] = null;
+        }
+        tex.data = null;
+        tex.width = 0;
+        tex.height = 0;
+      },
       isTexture(t) { return !!t; },
       activeTexture(texEnum) {
         activeTexUnit = Math.max(0, Math.min(15, (texEnum - 0x84C0) | 0));
@@ -1604,7 +1618,7 @@
           const unmaskedRenderer = dbgExt
             ? String(probeCtx.getParameter(dbgExt.UNMASKED_RENDERER_WEBGL) || '')
             : '';
-          if (/swiftshader/i.test(unmaskedRenderer)) {
+          if (/swiftshader|basic render driver/i.test(unmaskedRenderer)) {
             try {
               const loseExt = probeCtx.getExtension('WEBGL_lose_context');
               if (loseExt) loseExt.loseContext();
@@ -5645,6 +5659,206 @@
     return setForceSoftwareRenderer(!state.forceSoftwareRenderer);
   }
 
+  // Main-thread WebCodecs capability pre-probe + interactive console `/capture pipe` Blob sink
+  (function initMainThreadPipeAndWebCodecs() {
+    if (typeof window === 'undefined') return;
+    if (!window.__jkWebCodecsCaps && typeof VideoEncoder !== 'undefined') {
+      const caps = {
+        supported: true,
+        avcPrefix: 'avc1.6400',
+        quantizer: false,
+        aac: false,
+        opus: false,
+      };
+      window.__jkWebCodecsCaps = caps;
+      (async () => {
+        for (const pfx of ['avc1.6400', 'avc1.4d00', 'avc1.4200']) {
+          try {
+            const sup = await VideoEncoder.isConfigSupported({
+              codec: pfx + '2a',
+              width: 1280,
+              height: 720,
+              framerate: 60,
+              avc: { format: 'avc' },
+            });
+            if (sup && sup.supported) {
+              caps.avcPrefix = pfx;
+              break;
+            }
+          } catch (_) {}
+        }
+        try {
+          const qSup = await VideoEncoder.isConfigSupported({
+            codec: caps.avcPrefix + '2a',
+            width: 1280,
+            height: 720,
+            framerate: 60,
+            avc: { format: 'avc' },
+            bitrateMode: 'quantizer',
+          });
+          caps.quantizer = Boolean(qSup && qSup.supported);
+        } catch (_) {}
+        if (typeof AudioEncoder !== 'undefined') {
+          try {
+            const aSup = await AudioEncoder.isConfigSupported({
+              codec: 'mp4a.40.2',
+              sampleRate: 44100,
+              numberOfChannels: 2,
+              bitrate: 128000,
+            });
+            caps.aac = Boolean(aSup && aSup.supported);
+          } catch (_) {}
+          try {
+            const oSup = await AudioEncoder.isConfigSupported({
+              codec: 'opus',
+              sampleRate: 48000,
+              numberOfChannels: 2,
+              bitrate: 128000,
+            });
+            caps.opus = Boolean(oSup && oSup.supported);
+          } catch (_) {}
+        }
+      })();
+    }
+
+    const interactivePipes = new Map();
+    let nextMainPipeId = 1;
+    if (typeof window.__jkPipeOpen !== 'function') {
+      window.__jkPipeOpen = function (qpath) {
+        const id = nextMainPipeId++;
+        const raw = String(qpath || 'jka-capture.mp4').split('/').pop() || 'jka-capture.mp4';
+        interactivePipes.set(id, {
+          filename: /\.mp4$/i.test(raw) ? raw : raw + '.mp4',
+          chunks: [],
+        });
+        return id;
+      };
+    }
+    if (typeof window.__jkPipeWrite !== 'function') {
+      window.__jkPipeWrite = function (pipeId, uint8View) {
+        const entry = interactivePipes.get(pipeId);
+        if (!entry || !uint8View || uint8View.byteLength === 0) return 0;
+        const copy = new Uint8Array(uint8View.byteLength);
+        copy.set(uint8View);
+        entry.chunks.push(copy);
+        return copy.byteLength;
+      };
+    }
+    if (typeof window.__jkPipeClose !== 'function') {
+      window.__jkPipeClose = function (pipeId) {
+        const entry = interactivePipes.get(pipeId);
+        if (!entry) return;
+        interactivePipes.delete(pipeId);
+        if (entry.chunks.length === 0) return;
+        const blob = new Blob(entry.chunks, { type: 'video/mp4' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = entry.filename;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        if (a.parentNode) a.parentNode.removeChild(a);
+        setTimeout(() => {
+          try {
+            URL.revokeObjectURL(url);
+          } catch (_) {}
+        }, 30000);
+      };
+    }
+  })();
+
+  function getExportSourceDescriptor() {
+    const cfg = window.JKDemoConfig || {};
+    const rawScriptUrl =
+      typeof cfg.scriptUrl === 'string' && cfg.scriptUrl
+        ? cfg.scriptUrl
+        : `/openjk.js?v=${DEFAULT_ENGINE_VERSION}`;
+    const scriptUrl = rawScriptUrl.includes('?')
+      ? rawScriptUrl
+      : `${rawScriptUrl}?v=${DEFAULT_ENGINE_VERSION}`;
+    const scriptPathOnly = scriptUrl.split('?')[0];
+    const scriptQuery = scriptUrl.includes('?')
+      ? scriptUrl.slice(scriptUrl.indexOf('?'))
+      : `?v=${DEFAULT_ENGINE_VERSION}`;
+    const wasmDir = scriptPathOnly.includes('/')
+      ? scriptPathOnly.slice(0, scriptPathOnly.lastIndexOf('/') + 1)
+      : '/';
+    const rawWasmUrl =
+      typeof cfg.wasmUrl === 'string' && cfg.wasmUrl ? cfg.wasmUrl : `${wasmDir}openjk.wasm`;
+    const wasmUrl = rawWasmUrl.includes('?') ? rawWasmUrl : `${rawWasmUrl}${scriptQuery}`;
+    const autoexecUrl =
+      typeof cfg.autoexecUrl === 'string' && cfg.autoexecUrl
+        ? cfg.autoexecUrl
+        : `${wasmDir}autoexec.cfg?v=${DEFAULT_PLAYER_VERSION}`;
+
+    const rawSource =
+      typeof state.lastDemoSource === 'object' && state.lastDemoSource
+        ? String(state.lastDemoSource.url || state.lastDemoSource.demo || state.demoName || '')
+        : String(state.lastDemoSource || state.demoName || '');
+    const customLabel =
+      typeof state.lastDemoSource === 'object' && state.lastDemoSource
+        ? String(state.lastDemoSource.label || state.lastDemoSource.title || '')
+        : '';
+
+    const fileName = normalizeDemoFileName(state.demoName || rawSource) || 'current.dm_26';
+    const shortName = stripDemoExt(fileName) || 'current';
+
+    let mmeInitBytes = null;
+    let mmeMeta = null;
+    if (mmeStreamState.active) {
+      const cached = mmeStreamState.cacheKey ? mmeInitCache.get(mmeStreamState.cacheKey) : null;
+      if (cached && cached.initBytes) {
+        mmeInitBytes = cached.initBytes;
+      } else if (mmeStreamState.chunks.has(0)) {
+        mmeInitBytes = mmeStreamState.chunks.get(0);
+      }
+      if (mmeStreamState.fileSize > 0 && Array.isArray(mmeStreamState.index)) {
+        mmeMeta = {
+          fileSize: mmeStreamState.fileSize,
+          startTime: mmeStreamState.startTime,
+          endTime: mmeStreamState.endTime,
+          totalFrames: mmeStreamState.totalFrames,
+          index: mmeStreamState.index,
+        };
+      }
+    }
+
+    let demoBytes = null;
+    if (!mmeStreamState.active) {
+      demoBytes =
+        demoByteCache.get(rawSource) ||
+        demoByteCache.get(fileName) ||
+        demoByteCache.get(state.demoName) ||
+        null;
+    }
+
+    return {
+      isMmeStream: Boolean(mmeStreamState.active && mmeStreamState.baseUrl),
+      streamUrl: mmeStreamState.active ? mmeStreamState.baseUrl : '',
+      mmeInitBytes,
+      mmeMeta,
+      sourceUrl: rawSource,
+      fileName,
+      shortName,
+      label: customLabel || shortName,
+      demoBytes,
+      durationMs: getDurationMs(),
+      currentTimeMs: getCurrentTimeMs(),
+      thirdPerson: getThirdPerson(),
+      speed: getSpeed(),
+      muted: isMuted(),
+      gamma: getGamma(),
+      overbright: getOverbright(),
+      pk3Manifest: window.__jkPk3Manifest || null,
+      engineConfig: {
+        scriptUrl,
+        wasmUrl,
+        autoexecUrl,
+      },
+    };
+  }
+
   const playerAPI = {
     pause,
     resume,
@@ -5720,6 +5934,7 @@
     getModule: function () {
       return window.Module || null;
     },
+    getExportSourceDescriptor,
     _onInternalDemoCompleted: handleInternalDemoCompleted,
   };
 
@@ -5903,6 +6118,14 @@
     if (btnRenderer) {
       btnRenderer.addEventListener('click', () => {
         toggleSoftwareRenderer();
+      });
+    }
+    const btnExport = document.getElementById('btn-export');
+    if (btnExport) {
+      btnExport.addEventListener('click', () => {
+        if (window.JKVideoExport && typeof window.JKVideoExport.openForStandalone === 'function') {
+          window.JKVideoExport.openForStandalone();
+        }
       });
     }
     const btnFullscreen = document.getElementById('btn-fullscreen');

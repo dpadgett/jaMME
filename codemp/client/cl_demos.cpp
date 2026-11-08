@@ -19,8 +19,9 @@ static qboolean s_mmeStreamActive = qfalse;
 static int s_mmeStreamFileSize = 0;
 
 EM_JS(int, wasm_js_mme_read, (int pos, void *dst, int len), {
-	if (typeof window !== 'undefined' && typeof window.__jkMmeRead === 'function') {
-		return window.__jkMmeRead(pos, dst, len) | 0;
+	var g = typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : window);
+	if (g && typeof g.__jkMmeRead === 'function') {
+		return g.__jkMmeRead(pos, dst, len) | 0;
 	}
 	return 0;
 });
@@ -245,7 +246,7 @@ static void demoFramePack( msg_t *msg, const demoFrame_t *newFrame, const demoFr
 		newEntity = &newFrame->entities[i];
 		if (oldFrame) {
 			oldEntity = &oldFrame->entities[i];
-			if (oldEntity->number == (MAX_GENTITIES -1))
+			if (oldEntity->number != i || oldEntity->number >= (MAX_GENTITIES -1))
 				oldEntity = 0;
 		} else {
 			oldEntity = 0;
@@ -553,6 +554,9 @@ qboolean demoConvertBegin( const char *oldName, const char *newBaseName, qboolea
 	demo.firstPack = qtrue;
 	s_demoConvertState.convert = (demoConvert_t *)Z_Malloc( sizeof( demoConvert_t ), TAG_GENERAL );
 	memset( s_demoConvertState.convert, 0, sizeof( demoConvert_t ) );
+	for ( int t = 0; t < MAX_GENTITIES; t++ ) {
+		s_demoConvertState.convert->frames[0].entities[t].number = MAX_GENTITIES - 1;
+	}
 	s_demoConvertState.active = qtrue;
 	Com_SetLoadingMsg( "Converting the demo..." );
 	return qtrue;
@@ -724,6 +728,8 @@ int demoConvertStep( int maxBytes ) {
 				clientNum = -1;
 				oldTime = -1;
 				Com_Memset( convert, 0, sizeof( *convert ));
+				for (temp = 0; temp < MAX_GENTITIES; temp++)
+					convert->frames[0].entities[temp].number = MAX_GENTITIES - 1;
 				convert->frames[0].string.used = 1;
 				levelCount++;
 				newHandle = FS_FOpenFileWrite( newName );

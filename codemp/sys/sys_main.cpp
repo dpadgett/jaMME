@@ -452,8 +452,19 @@ char *Sys_StripAppBundle( char *dir )
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+EM_JS(int, wasm_js_is_manual_frame_loop, (), {
+	try {
+		var g = typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : window);
+		return (g && g.__jkManualFrameLoop) ? 1 : 0;
+	} catch (e) {}
+	return 0;
+});
 static void Sys_MainLoopFrame( void )
 {
+	if ( wasm_js_is_manual_frame_loop() ) {
+		emscripten_pause_main_loop();
+		return;
+	}
 	Com_Frame();
 }
 #endif

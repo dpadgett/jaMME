@@ -31,6 +31,7 @@ int g_jkPk3RangeRequests = 0;
 #ifdef __EMSCRIPTEN__
 #define WASM_PK3_CHUNK_SIZE 262144
 #define MAX_WASM_PK3_ARCHIVES 1024
+#define WASM_PK3_MAX_RESIDENT_CHUNKS 160
 
 typedef struct WasmPk3Archive_s {
 	char			name[128];
@@ -46,6 +47,49 @@ typedef struct WasmPk3Archive_s {
 	unsigned char	**chunks;
 	pack_t			*loadedPack;
 } WasmPk3Archive;
+
+typedef struct WasmPk3ResidentSlot_s {
+	WasmPk3Archive	*arch;
+	unsigned long	chunkIdx;
+} WasmPk3ResidentSlot;
+
+static WasmPk3ResidentSlot g_wasmPk3ResidentRing[WASM_PK3_MAX_RESIDENT_CHUNKS];
+static int g_wasmPk3ResidentCount = 0;
+static int g_wasmPk3ResidentCursor = 0;
+
+static qboolean WasmPK3_TrackChunkAlloc( WasmPk3Archive *arch, unsigned long chunkIdx, unsigned long pinStart, unsigned long pinEnd ) {
+	if ( g_wasmPk3ResidentCount < WASM_PK3_MAX_RESIDENT_CHUNKS ) {
+		g_wasmPk3ResidentRing[g_wasmPk3ResidentCount].arch = arch;
+		g_wasmPk3ResidentRing[g_wasmPk3ResidentCount].chunkIdx = chunkIdx;
+		g_wasmPk3ResidentCount++;
+		return qtrue;
+	}
+	for ( int step = 0; step < WASM_PK3_MAX_RESIDENT_CHUNKS; step++ ) {
+		int idx = ( g_wasmPk3ResidentCursor + step ) % WASM_PK3_MAX_RESIDENT_CHUNKS;
+		WasmPk3ResidentSlot *slot = &g_wasmPk3ResidentRing[idx];
+		if ( slot->arch == arch && slot->chunkIdx >= pinStart && slot->chunkIdx <= pinEnd ) {
+			continue;
+		}
+		if ( slot->arch && slot->arch->chunks && slot->chunkIdx < slot->arch->num_chunks && slot->arch->chunks[slot->chunkIdx] ) {
+			free( slot->arch->chunks[slot->chunkIdx] );
+			slot->arch->chunks[slot->chunkIdx] = NULL;
+		}
+		slot->arch = arch;
+		slot->chunkIdx = chunkIdx;
+		g_wasmPk3ResidentCursor = ( idx + 1 ) % WASM_PK3_MAX_RESIDENT_CHUNKS;
+		return qtrue;
+	}
+	return qfalse;
+}
+
+static qboolean WasmPK3_IsChunkInRing( WasmPk3Archive *arch, unsigned long chunkIdx ) {
+	for ( int i = 0; i < g_wasmPk3ResidentCount; i++ ) {
+		if ( g_wasmPk3ResidentRing[i].arch == arch && g_wasmPk3ResidentRing[i].chunkIdx == chunkIdx ) {
+			return qtrue;
+		}
+	}
+	return qfalse;
+}
 
 typedef struct WasmPk3Stream_s {
 	WasmPk3Archive	*archive;
@@ -67,7 +111,8 @@ void WasmPK3_ClearLoadedPacks( void ) {
 
 EM_JS(int, wasm_js_fetch_manifest, (char *buf, int maxLen), {
 	try {
-		var data = (typeof window !== 'undefined' && window.__jkPk3Manifest) ? window.__jkPk3Manifest : null;
+		var g = typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : window);
+		var data = (g && g.__jkPk3Manifest) ? g.__jkPk3Manifest : null;
 		if (!data && typeof localStorage !== 'undefined') {
 			try {
 				var raw = localStorage.getItem('openjk_pk3_manifest_v2');
@@ -81,10 +126,11 @@ EM_JS(int, wasm_js_fetch_manifest, (char *buf, int maxLen), {
 		}
 		if (!data) {
 			var xhr = null;
+			var basePrefix = (g && g.__jkPk3BaseUrl) ? g.__jkPk3BaseUrl : '/base/';
 			for (var attempt = 0; attempt < 3; attempt++) {
 				try {
 					xhr = new XMLHttpRequest();
-					xhr.open('GET', '/base/manifest.json', false);
+					xhr.open('GET', basePrefix + 'manifest.json', false);
 					xhr.send(null);
 					if (xhr.status >= 200 && xhr.status < 300 && xhr.responseText) break;
 				} catch (eRetry) {
@@ -93,7 +139,7 @@ EM_JS(int, wasm_js_fetch_manifest, (char *buf, int maxLen), {
 			}
 			if (!xhr || xhr.status < 200 || xhr.status >= 300) return 0;
 			data = JSON.parse(xhr.responseText);
-			if (typeof window !== 'undefined') window.__jkPk3Manifest = data;
+			if (g) g.__jkPk3Manifest = data;
 			if (typeof localStorage !== 'undefined') {
 				try { localStorage.setItem('openjk_pk3_manifest_v2', JSON.stringify(data)); } catch (e1) {}
 			}
@@ -121,8 +167,9 @@ EM_JS(int, wasm_js_fetch_manifest, (char *buf, int maxLen), {
 
 EM_JS(int, wasm_js_get_cached_cd, (const char *namePtr, int start, int end, unsigned char *dst), {
 	try {
-		if (typeof window !== 'undefined' && typeof window.__jkPk3GetCachedCD === 'function') {
-			return window.__jkPk3GetCachedCD(UTF8ToString(namePtr), start, end, dst) | 0;
+		var g = typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : window);
+		if (g && typeof g.__jkPk3GetCachedCD === 'function') {
+			return g.__jkPk3GetCachedCD(UTF8ToString(namePtr), start, end, dst) | 0;
 		}
 	} catch (e) {}
 	return 0;
@@ -130,8 +177,9 @@ EM_JS(int, wasm_js_get_cached_cd, (const char *namePtr, int start, int end, unsi
 
 EM_JS(int, wasm_js_has_cached_chunk, (const char *namePtr, int chunkIdx), {
 	try {
-		if (typeof window !== 'undefined' && typeof window.__jkPk3HasCachedChunk === 'function') {
-			return window.__jkPk3HasCachedChunk(UTF8ToString(namePtr), chunkIdx) ? 1 : 0;
+		var g = typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : window);
+		if (g && typeof g.__jkPk3HasCachedChunk === 'function') {
+			return g.__jkPk3HasCachedChunk(UTF8ToString(namePtr), chunkIdx) ? 1 : 0;
 		}
 	} catch (e) {}
 	return 0;
@@ -139,8 +187,9 @@ EM_JS(int, wasm_js_has_cached_chunk, (const char *namePtr, int chunkIdx), {
 
 EM_JS(int, wasm_js_get_cached_chunk, (const char *namePtr, int chunkIdx, unsigned char *dst, int maxLen), {
 	try {
-		if (typeof window !== 'undefined' && typeof window.__jkPk3GetCachedChunk === 'function') {
-			return window.__jkPk3GetCachedChunk(UTF8ToString(namePtr), chunkIdx, dst, maxLen) | 0;
+		var g = typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : window);
+		if (g && typeof g.__jkPk3GetCachedChunk === 'function') {
+			return g.__jkPk3GetCachedChunk(UTF8ToString(namePtr), chunkIdx, dst, maxLen) | 0;
 		}
 	} catch (e) {}
 	return 0;
@@ -148,13 +197,15 @@ EM_JS(int, wasm_js_get_cached_chunk, (const char *namePtr, int chunkIdx, unsigne
 
 EM_JS(int, wasm_js_fetch_range, (const char *namePtr, int start, int end, unsigned char *dst), {
 	try {
+		var g = typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : window);
+		var basePrefix = (g && g.__jkPk3BaseUrl) ? g.__jkPk3BaseUrl : '/base/';
 		var name = UTF8ToString(namePtr);
 		var xhr = null;
 		var lastErr = null;
 		for (var attempt = 0; attempt < 4; attempt++) {
 			try {
 				xhr = new XMLHttpRequest();
-				var url = '/base/' + name + (attempt >= 2 ? ('?_r=' + attempt + '_' + start) : '');
+				var url = basePrefix + name + (attempt >= 2 ? ('?_r=' + attempt + '_' + start) : '');
 				xhr.open('GET', url, false);
 				xhr.setRequestHeader('Range', 'bytes=' + start + '-' + end);
 				xhr.overrideMimeType('text/plain; charset=x-user-defined');
@@ -178,9 +229,9 @@ EM_JS(int, wasm_js_fetch_range, (const char *namePtr, int start, int end, unsign
 		for (var i = 0; i < copyLen; i++) {
 			HEAPU8[dst + i] = text.charCodeAt(i) & 0xff;
 		}
-		if (typeof window !== 'undefined' && typeof window.__jkPk3OnRangeFetched === 'function' && copyLen > 0) {
+		if (g && typeof g.__jkPk3OnRangeFetched === 'function' && copyLen > 0) {
 			try {
-				window.__jkPk3OnRangeFetched(name, start, end, HEAPU8.subarray(dst, dst + copyLen));
+				g.__jkPk3OnRangeFetched(name, start, end, HEAPU8.subarray(dst, dst + copyLen));
 			} catch (e2) {}
 		}
 		if (typeof Module !== 'undefined') {
@@ -254,6 +305,7 @@ static uLong ZCALLBACK wasm_pk3_read(voidpf opaque, voidpf stream, void *buf, uL
 
 	unsigned long c_start = st->pos / WASM_PK3_CHUNK_SIZE;
 	unsigned long c_end = (target_end - 1) / WASM_PK3_CHUNK_SIZE;
+	qboolean hadRingOverflow = qfalse;
 
 	for (unsigned long c = c_start; c <= c_end; c++) {
 		if (!arch->chunks[c] && wasm_js_has_cached_chunk(arch->name, (int)c)) {
@@ -266,6 +318,8 @@ static uLong ZCALLBACK wasm_pk3_read(voidpf opaque, voidpf stream, void *buf, uL
 				if (wasm_js_get_cached_chunk(arch->name, (int)c, arch->chunks[c], (int)c_len) <= 0) {
 					free(arch->chunks[c]);
 					arch->chunks[c] = NULL;
+				} else if (!WasmPK3_TrackChunkAlloc(arch, c, c_start, c_end)) {
+					hadRingOverflow = qtrue;
 				}
 			}
 		}
@@ -311,6 +365,9 @@ static uLong ZCALLBACK wasm_pk3_read(voidpf opaque, voidpf stream, void *buf, uL
 					} else if (off_in_temp < (unsigned long)fetched) {
 						memcpy(arch->chunks[mc], temp_buf + off_in_temp, (unsigned long)fetched - off_in_temp);
 					}
+					if (!WasmPK3_TrackChunkAlloc(arch, mc, c_start, c_end)) {
+						hadRingOverflow = qtrue;
+					}
 				}
 			}
 			free(temp_buf);
@@ -336,6 +393,15 @@ static uLong ZCALLBACK wasm_pk3_read(voidpf opaque, voidpf stream, void *buf, uL
 		out += to_copy;
 		st->pos += to_copy;
 		remaining -= to_copy;
+	}
+
+	if (hadRingOverflow) {
+		for (unsigned long c = c_start; c <= c_end; c++) {
+			if (arch->chunks[c] && !WasmPK3_IsChunkInRing(arch, c)) {
+				free(arch->chunks[c]);
+				arch->chunks[c] = NULL;
+			}
+		}
 	}
 
 	return size - remaining;
@@ -3752,11 +3818,12 @@ static qboolean WasmPK3_IsPakFileCached( pack_t *pak, fileInPack_t *pakFile ) {
 
 EM_JS(void, wasm_js_prefetch_span_async, (const char *namePtr, int cStart, int cEnd, int archSize), {
 	try {
-		if (typeof window !== 'undefined' && typeof window.__jkPk3PrefetchSpanAsync === 'function') {
-			window.__jkPk3PrefetchSpanAsync(UTF8ToString(namePtr), cStart, cEnd, archSize);
-		} else if (typeof window !== 'undefined' && typeof window.__jkPk3PrefetchChunkAsync === 'function') {
+		var g = typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : window);
+		if (g && typeof g.__jkPk3PrefetchSpanAsync === 'function') {
+			g.__jkPk3PrefetchSpanAsync(UTF8ToString(namePtr), cStart, cEnd, archSize);
+		} else if (g && typeof g.__jkPk3PrefetchChunkAsync === 'function') {
 			for (var c = cStart; c <= cEnd; c++) {
-				window.__jkPk3PrefetchChunkAsync(UTF8ToString(namePtr), c, archSize);
+				g.__jkPk3PrefetchChunkAsync(UTF8ToString(namePtr), c, archSize);
 			}
 		}
 	} catch (e) {}
@@ -5596,6 +5663,52 @@ bool FS_LoadMachOBundle( const char *name )
 #endif
 
 //pipes!!
+#ifdef __EMSCRIPTEN__
+static int s_wasmPipeIds[MAX_FILE_HANDLES] = {0};
+
+EM_JS(int, wasm_js_pipe_open, (const char *cmdPtr, const char *pathPtr, const char *modePtr), {
+	try {
+		var g = typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : window);
+		if (g && typeof g.__jkPipeOpen === 'function') {
+			return g.__jkPipeOpen(
+				cmdPtr ? UTF8ToString(cmdPtr) : '',
+				pathPtr ? UTF8ToString(pathPtr) : '',
+				modePtr ? UTF8ToString(modePtr) : 'wb'
+			) | 0;
+		}
+	} catch (e) {
+		console.error('wasm_js_pipe_open failed:', e);
+	}
+	return 0;
+});
+
+EM_JS(int, wasm_js_pipe_write, (int pipeId, const void *bufPtr, int len), {
+	try {
+		if (len <= 0) return 0;
+		var g = typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : window);
+		if (g && typeof g.__jkPipeWrite === 'function') {
+			var ptr = bufPtr >>> 0;
+			var view = HEAPU8.subarray(ptr, ptr + (len >>> 0));
+			return g.__jkPipeWrite(pipeId | 0, view) | 0;
+		}
+	} catch (e) {
+		console.error('wasm_js_pipe_write failed:', e);
+	}
+	return 0;
+});
+
+EM_JS(void, wasm_js_pipe_close, (int pipeId), {
+	try {
+		var g = typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : window);
+		if (g && typeof g.__jkPipeClose === 'function') {
+			g.__jkPipeClose(pipeId | 0);
+		}
+	} catch (e) {
+		console.error('wasm_js_pipe_close failed:', e);
+	}
+});
+#endif
+
 fileHandle_t FS_PipeOpen(const char *qcmd, const char *qpath, const char *mode) {
     char			*ospath;
     fileHandle_t	f;
@@ -5607,7 +5720,21 @@ fileHandle_t FS_PipeOpen(const char *qcmd, const char *qpath, const char *mode) 
     
     f = FS_HandleForFile();
     fsh[f].zipFile = qfalse;
-    
+
+#ifdef __EMSCRIPTEN__
+    {
+        int pipeId = wasm_js_pipe_open(qcmd, qpath, mode);
+        if (pipeId <= 0) {
+            Com_Memset(&fsh[f], 0, sizeof(fsh[f]));
+            return 0;
+        }
+        s_wasmPipeIds[f] = pipeId;
+        fsh[f].handleFiles.file.o = (FILE *)(intptr_t)pipeId;
+        Q_strncpyz(fsh[f].name, qpath ? qpath : "pipe.mp4", sizeof(fsh[f].name));
+        fsh[f].handleSync = qfalse;
+        return f;
+    }
+#else
     ospath = FS_BuildOSPath(fs_homepath->string, fs_gamedir, qpath);
     
     if (fs_debug->integer) {
@@ -5641,9 +5768,15 @@ fileHandle_t FS_PipeOpen(const char *qcmd, const char *qpath, const char *mode) 
         f = 0;
     }
     return f;
+#endif
 }
 
 int FS_PipeWrite(const void *buffer, int len, fileHandle_t h) {
+#ifdef __EMSCRIPTEN__
+    if (h > 0 && h < MAX_FILE_HANDLES && s_wasmPipeIds[h] > 0) {
+        return wasm_js_pipe_write(s_wasmPipeIds[h], buffer, len);
+    }
+#endif
     return FS_Write(buffer, len, h);
 }
 
@@ -5651,7 +5784,15 @@ void FS_PipeClose(fileHandle_t f) {
     if (!fs_searchpaths) {
         Com_Error(ERR_FATAL, "Filesystem call made without initialization\n");
     }
-    
+#ifdef __EMSCRIPTEN__
+    if (f > 0 && f < MAX_FILE_HANDLES && s_wasmPipeIds[f] > 0) {
+        int pipeId = s_wasmPipeIds[f];
+        s_wasmPipeIds[f] = 0;
+        Com_Memset(&fsh[f], 0, sizeof(fsh[f]));
+        wasm_js_pipe_close(pipeId);
+        return;
+    }
+#endif
     if (fsh[f].streamed) {
         Sys_EndStreamedFile(f);
     }

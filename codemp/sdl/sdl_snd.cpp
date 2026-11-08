@@ -40,8 +40,17 @@ static int dmapos = 0;
 static int dmasize = 0;
 static SDL_AudioDeviceID dev;
 #ifdef __EMSCRIPTEN__
+#include <emscripten.h>
 static int s_lastAudioCallbackMs = 0;
 static int s_lastDmaUpdateMs = 0;
+
+EM_JS(int, wasm_js_is_headless_audio, (), {
+	try {
+		var g = typeof globalThis !== 'undefined' ? globalThis : (typeof self !== 'undefined' ? self : window);
+		return (g && g.__jkHeadlessAudio) ? 1 : 0;
+	} catch (e) {}
+	return 0;
+});
 #endif
 
 /*
@@ -166,6 +175,25 @@ qboolean SNDDMA_Init(void)
 		s_sdlDevSamps = Cvar_Get("s_sdlDevSamps", "0", CVAR_ARCHIVE);
 		s_sdlMixSamps = Cvar_Get("s_sdlMixSamps", "0", CVAR_ARCHIVE);
 	}
+
+#ifdef __EMSCRIPTEN__
+	if (wasm_js_is_headless_audio()) {
+		dev = 0;
+		dmapos = 0;
+		dma.samplebits = 16;
+		dma.channels = 2;
+		dma.samples = 65536;
+		dma.submission_chunk = 1;
+		dma.speed = 44100;
+		dmasize = (dma.samples * (dma.samplebits / 8));
+		dma.buffer = (byte *)calloc(1, dmasize);
+		s_lastAudioCallbackMs = 0;
+		s_lastDmaUpdateMs = Sys_Milliseconds();
+		snd_inited = qtrue;
+		Com_Printf("Headless dummy audio initialized (44100 Hz stereo).\n");
+		return qtrue;
+	}
+#endif
 
 	Com_Printf( "SDL_Init( SDL_INIT_AUDIO )... " );
 
@@ -326,9 +354,12 @@ SNDDMA_Shutdown
 */
 void SNDDMA_Shutdown(void) {
 	Com_Printf("Closing SDL audio device...\n");
-	SDL_PauseAudioDevice(dev, 1);
-	SDL_CloseAudioDevice(dev);
-	SDL_QuitSubSystem(SDL_INIT_AUDIO);
+	if (dev) {
+		SDL_PauseAudioDevice(dev, 1);
+		SDL_CloseAudioDevice(dev);
+		SDL_QuitSubSystem(SDL_INIT_AUDIO);
+		dev = 0;
+	}
 	free(dma.buffer);
 	dma.buffer = NULL;
 	dmapos = dmasize = 0;
@@ -342,7 +373,8 @@ Send sound to device if buffer isn't really the dma buffer
 ===============
 */
 void SNDDMA_Submit(void) {
-	SDL_UnlockAudioDevice(dev);
+	if (dev)
+		SDL_UnlockAudioDevice(dev);
 }
 /*
 ===============
@@ -350,9 +382,11 @@ SNDDMA_BeginPainting
 ===============
 */
 void SNDDMA_BeginPainting (void) {
-	SDL_LockAudioDevice(dev);
+	if (dev)
+		SDL_LockAudioDevice(dev);
 }
 // (De)activates sound playback
 void SNDDMA_Activate(qboolean activate) {
-	SDL_PauseAudioDevice(dev, !activate);
+	if (dev)
+		SDL_PauseAudioDevice(dev, !activate);
 }

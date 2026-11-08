@@ -141,6 +141,8 @@
     '<svg class="jk-icon-svg" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 2.5V6H2.5M13.5 6H10V2.5M10 13.5V10h3.5M2.5 10H6v3.5"/></svg>';
   const ICON_BRIGHTNESS =
     '<svg class="jk-icon-svg" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="2.7"/><path d="M8 1.5v1.8M8 12.7v1.8M1.5 8h1.8M12.7 8h1.8M3.4 3.4l1.3 1.3M11.3 11.3l1.3 1.3M12.6 3.4l-1.3 1.3M4.7 11.3l-1.3 1.3"/></svg>';
+  const ICON_CLIP =
+    '<svg class="jk-icon-svg" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.8" y="3" width="9.4" height="10" rx="1.6"/><path d="M11.2 6.4L14.5 4.5v7l-3.3-1.9"/></svg>';
   const ICON_PLAY_OVERLAY =
     '<svg class="jk-icon-svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor" aria-hidden="true"><path d="M7 5.5v13l11-6.5-11-6.5z"/></svg>';
   const ICON_PAUSE_OVERLAY =
@@ -856,8 +858,12 @@
         border-color: #58a6ff;
         color: #79c0ff;
       }
-      #jk-pip-lighting-btn {
+      #jk-pip-lighting-btn,
+      #jk-pip-export-btn {
         gap: calc(4px * var(--jk-ui-scale, 1));
+      }
+      .jk-pip-timeline-row[hidden] {
+        display: none !important;
       }
       #jk-pip-lighting-panel {
         position: absolute;
@@ -1186,7 +1192,8 @@
         min-inline-size: calc(60px * var(--jk-ui-scale, 1));
         font-size: calc(10px * var(--jk-ui-scale, 1));
       }
-      #jk-pip-card.jk-pip-xs .jk-pip-light-label {
+      #jk-pip-card.jk-pip-xs .jk-pip-light-label,
+      #jk-pip-card.jk-pip-xs .jk-pip-clip-label {
         display: none;
       }
       #jk-pip-card.jk-pip-xs #jk-pip-lighting-panel {
@@ -1200,7 +1207,8 @@
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
       @container jk-card (max-width: 380px) {
-        .jk-pip-light-label {
+        .jk-pip-light-label,
+        .jk-pip-clip-label {
           display: none;
         }
       }
@@ -1555,13 +1563,27 @@
     }
   }
 
+  function isExportTrimActive() {
+    return Boolean(
+      window.JKVideoExport &&
+        typeof window.JKVideoExport.isTrimActive === 'function' &&
+        window.JKVideoExport.isTrimActive()
+    );
+  }
+
   function showFullscreenControls(scheduleAutoHide) {
     const card = document.getElementById('jk-pip-card');
     if (!card) return;
     card.classList.remove('jk-pip-fs-controls-hidden');
     clearFullscreenControlsTimer();
     if (!scheduleAutoHide || !isCardFullscreen()) return;
-    if (isDemoCurrentlyPaused() || pipState.scrubbing || pipState.lightingOpen || pipState.scrubbingGamma) {
+    if (
+      isDemoCurrentlyPaused() ||
+      pipState.scrubbing ||
+      pipState.lightingOpen ||
+      pipState.scrubbingGamma ||
+      isExportTrimActive()
+    ) {
       return;
     }
     pipState.fsControlsTimer = setTimeout(() => {
@@ -1571,7 +1593,8 @@
         isDemoCurrentlyPaused() ||
         pipState.scrubbing ||
         pipState.lightingOpen ||
-        pipState.scrubbingGamma
+        pipState.scrubbingGamma ||
+        isExportTrimActive()
       ) {
         return;
       }
@@ -1864,6 +1887,7 @@
             <button type="button" id="jk-pip-camera" class="jk-pip-ctrl-btn${pipState.thirdPerson ? '' : ' active'}" title="Switch camera view (1st / 3rd person)" aria-label="${pipState.thirdPerson ? 'View: 3rd — Switch to first-person camera' : 'View: 1st — Switch to third-person camera'}">${pipState.thirdPerson ? 'View: 3rd' : 'View: 1st'}</button>
             <button type="button" id="jk-pip-start-over" class="jk-pip-ctrl-btn" title="Restart from 0:00" aria-label="0:00 — Restart from beginning">0:00</button>
             <button type="button" id="jk-pip-lighting-btn" class="jk-pip-ctrl-btn" title="Brightness &amp; Lighting (Gamma / Overbright)" aria-label="Lighting settings" aria-expanded="false" aria-controls="jk-pip-lighting-panel">${ICON_BRIGHTNESS}<span class="jk-pip-light-label">Light</span></button>
+            <button type="button" id="jk-pip-export-btn" class="jk-pip-ctrl-btn" title="Export video clip (.mp4)" aria-label="Export video clip" aria-pressed="false">${ICON_CLIP}<span class="jk-pip-clip-label">Clip</span></button>
           </div>
           <div class="jk-pip-btn-group jk-pip-audio-group">
             <button type="button" id="jk-pip-mute" class="jk-pip-ctrl-btn" title="Mute / Unmute">Mute</button>
@@ -2243,6 +2267,23 @@
     const lightingBtn = card.querySelector('#jk-pip-lighting-btn');
     const lightingPanel = card.querySelector('#jk-pip-lighting-panel');
     const gammaInput = card.querySelector('#jk-pip-gamma');
+    const exportBtn = card.querySelector('#jk-pip-export-btn');
+    if (exportBtn) {
+      exportBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (e && e.isTrusted) primeSharedAudioOnUserGesture();
+        if (pipState.lightingOpen) {
+          setLightingPanelOpen(false);
+        }
+        await ensureVideoExportScriptLoaded().catch(() => {});
+        if (window.JKVideoExport && typeof window.JKVideoExport.openForPiP === 'function') {
+          window.JKVideoExport.openForPiP();
+          if (isCardFullscreen()) {
+            showFullscreenControls(false);
+          }
+        }
+      });
+    }
     if (lightingBtn) {
       lightingBtn.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -2908,9 +2949,50 @@
     }
   }
 
+  let videoExportScriptPromise = null;
+  function ensureVideoExportScriptLoaded() {
+    if (window.JKVideoExport && window.JKVideoExport.__initialized) {
+      return Promise.resolve(window.JKVideoExport);
+    }
+    if (videoExportScriptPromise) return videoExportScriptPromise;
+    const PLAYER_ASSET_VERSION = '20261107m';
+    videoExportScriptPromise = new Promise((resolve, reject) => {
+      const existing = document.querySelector('script[src*="/jkplayer/jk-video-export.js"]');
+      if (existing) {
+        let waited = 0;
+        const poll = setInterval(() => {
+          if (window.JKVideoExport && window.JKVideoExport.__initialized) {
+            clearInterval(poll);
+            resolve(window.JKVideoExport);
+            return;
+          }
+          waited += 50;
+          if (waited >= 10000) {
+            clearInterval(poll);
+            videoExportScriptPromise = null;
+            reject(new Error('Timed out loading jk-video-export.js'));
+          }
+        }, 50);
+        return;
+      }
+      const s = document.createElement('script');
+      s.src = `/jkplayer/jk-video-export.js?v=${PLAYER_ASSET_VERSION}`;
+      s.async = true;
+      s.onload = () => resolve(window.JKVideoExport || null);
+      s.onerror = (err) => {
+        if (s.parentNode) s.parentNode.removeChild(s);
+        videoExportScriptPromise = null;
+        reject(err || new Error('Failed to load jk-video-export.js'));
+      };
+      document.head.appendChild(s);
+    });
+    return videoExportScriptPromise;
+  }
+
   function ensurePlayerScriptLoaded() {
     if (window.JKDemoPlayer || window.OpenJKPlayer) {
       pipState.playerScriptLoaded = true;
+      ensureVideoExportScriptLoaded().catch(() => {});
       return Promise.resolve(getPlayer());
     }
     if (pipState.playerScriptPromise) {
@@ -2918,8 +3000,9 @@
     }
 
     // Separate engine vs wrapper versions so UI/JS updates do not invalidate cached openjk.wasm
-    const ENGINE_ASSET_VERSION = '20261106f';
-    const PLAYER_ASSET_VERSION = '20261106f';
+    const ENGINE_ASSET_VERSION = '20261107m';
+    const PLAYER_ASSET_VERSION = '20261107m';
+    ensureVideoExportScriptLoaded().catch(() => {});
     window.JKDemoConfig = Object.assign(
       {
         preload: true,
@@ -3198,6 +3281,9 @@
     }
 
     const card = createPiPDOM();
+    if (isExportTrimActive() && window.JKVideoExport) {
+      window.JKVideoExport.exitTrimMode(false);
+    }
     const wasAlreadyOpen = Boolean(pipState.open && !card.hidden);
     pipState.open = true;
     pipState.loadFailed = false;
@@ -3297,6 +3383,9 @@
 
   function closePiP() {
     const card = document.getElementById('jk-pip-card');
+    if (isExportTrimActive() && window.JKVideoExport) {
+      window.JKVideoExport.exitTrimMode(false);
+    }
     pipState.open = false;
     pipState.lightingOpen = false;
     syncLightingUI();

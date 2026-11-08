@@ -89,6 +89,11 @@ cvar_t	*mme_saveCubemap;
 
 cvar_t	*mme_aviLimit;
 
+cvar_t	*mme_mp4Bitrate;
+cvar_t	*mme_mp4MaxMegs;
+cvar_t	*mme_mp4Crf;
+cvar_t	*mme_mp4AudioBitrate;
+
 cvar_t  *mme_pipeCommand;
 cvar_t  *mme_combineStereoShots;
 
@@ -96,11 +101,33 @@ static ID_INLINE workData_t *work( qboolean stereo ) {
 	return !stereo ? &mainData.mainWork : &mainData.stereoWork;
 }
 
+static qboolean R_MME_EnsureWorkAlloc( void ) {
+	if ( workAlloc )
+		return qtrue;
+	if ( allocFailed )
+		return qfalse;
+	workSize = mme_workMegs ? mme_workMegs->integer : 64;
+	if ( workSize < 64 )
+		workSize = 64;
+	else if ( workSize > MME_MAX_WORKSIZE )
+		workSize = MME_MAX_WORKSIZE;
+	workSize *= 1024 * 1024;
+	workAlloc = (char *)calloc( workSize + 16, 1 );
+	if ( !workAlloc ) {
+		ri.Printf( PRINT_ALL, "Failed to allocate %zu bytes for mme work buffer\n", workSize );
+		allocFailed = qtrue;
+		return qfalse;
+	}
+	workAlign = (char *)(((intptr_t)workAlloc + 15) & ~15);
+	mainData.pixelCount = 0; // trigger blur block pointer setup if needed
+	return qtrue;
+}
+
 static void R_MME_MakeCubeData( cubeData_t *cubeData, int size ) {
 	memset( cubeData, 0, sizeof( *cubeData ) );
 	size = (size + 15) & ~15;
 
-	if ( mme_saveCubemap->integer ) {
+	if ( mme_saveCubemap->integer && workAlign ) {
 		cubeData->data = (workAlign + workUsed);
 		workUsed += size;
 		if ( workUsed > workSize ) {
@@ -115,6 +142,9 @@ static void R_MME_MakeBlurBlock( mmeBlurBlock_t *block, int size, mmeBlurControl
 	block->count = (size >> 3);
 	block->control = control;
 
+	if ( !workAlign ) {
+		return;
+	}
 	if ( control->totalFrames ) {
 		//Allow for floating point buffer with sse
 		block->accum = (workAlign + workUsed);
@@ -484,6 +514,41 @@ qboolean R_MME_TakeShot( qboolean stereo ) {
 	doGamma = (qboolean)(( mme_screenShotGamma->integer || (tr.overbrightBits > 0) ) && (glConfig.deviceSupportsGamma ));
 	R_MME_CheckCvars();
 
+#ifdef __EMSCRIPTEN__
+	if ( mme_saveShot->integer && w->shotData.fps > 0.0f &&
+		( w->shotData.main.format == mmeShotFormatPIPE || w->shotData.main.format == mmeShotFormatMP4 ) &&
+		!mme_saveCubemap->integer && !mme_dofFrames->integer && !takingStereo ) {
+		float outFps = w->shotData.fps;
+		if ( blurControl->totalFrames > 0 ) {
+			if ( R_FrameBuffer_Blur( blurControl->Float[ blurControl->totalIndex ], blurControl->totalIndex, blurControl->totalFrames ) ) {
+				if ( ++(blurControl->totalIndex) < blurControl->totalFrames ) {
+					return qtrue;
+				}
+				blurControl->totalIndex = 0;
+				outFps = w->shotData.fps / blurControl->totalFrames;
+			} else {
+				// Fallback if FBO blur was not active: skip intermediate subframes cleanly
+				if ( ++(blurControl->totalIndex) < blurControl->totalFrames ) {
+					return qtrue;
+				}
+				blurControl->totalIndex = 0;
+				outFps = w->shotData.fps / blurControl->totalFrames;
+			}
+		}
+		// Resolve FBO + GLSL gamma to default framebuffer before WebCodecs VideoFrame snapshot
+		R_FrameBuffer_EndFrame();
+		if ( !audioTaken ) {
+			audio = ri.S_MMEAviImport( inSound, &sizeSound );
+		}
+		R_MME_SaveShot( &work(workStereo)->shotData.main, width, height, outFps, NULL, audio, sizeSound, inSound, stereo );
+		return qtrue;
+	}
+	if ( !R_MME_EnsureWorkAlloc() ) {
+		return qfalse;
+	}
+	R_MME_CheckCvars();
+#endif
+
 	//Special early version using the framebuffer
 	if ( mme_saveShot->integer && blurControl->totalFrames > 0 &&
 		R_FrameBuffer_Blur( blurControl->Float[ blurControl->totalIndex ], blurControl->totalIndex, blurControl->totalFrames ) ) {
@@ -736,6 +801,8 @@ static void R_MME_PrepareCapture( const captureCommand_t *cmd, qboolean stereo )
 			w->shotData.main.format = mmeShotFormatAVI;
         } else if (!Q_stricmp(mme_screenShotFormat->string, "pipe")) {
 			w->shotData.main.format = mmeShotFormatPIPE;
+		} else if (!Q_stricmp(mme_screenShotFormat->string, "mp4")) {
+			w->shotData.main.format = mmeShotFormatMP4;
 		} else {
 			w->shotData.main.format = mmeShotFormatTGA;
 		}
@@ -821,6 +888,12 @@ void R_MME_Shutdown(void) {
 	aviClose( &work(qtrue)->shotData.main.avi );
 	aviClose( &work(qtrue)->shotData.depth.avi );
 	aviClose( &work(qtrue)->shotData.stencil.avi );
+	mp4Close( &work(qfalse)->shotData.main.mp4 );
+	mp4Close( &work(qtrue)->shotData.main.mp4 );
+	work(qfalse)->shotData.main.name[0] = '\0';
+	work(qtrue)->shotData.main.name[0] = '\0';
+	work(qfalse)->blurData.control.totalIndex = 0;
+	work(qtrue)->blurData.control.totalIndex = 0;
 }
 
 void R_MME_Init(void) {
@@ -831,6 +904,11 @@ void R_MME_Init(void) {
 	
 	mme_aviFormat = ri.Cvar_Get ("mme_aviFormat", "0", CVAR_ARCHIVE);
 	mme_aviLimit = ri.Cvar_Get ("mme_aviLimit", "1", CVAR_ARCHIVE);
+
+	mme_mp4Bitrate = ri.Cvar_Get ("mme_mp4Bitrate", "0", 0);
+	mme_mp4MaxMegs = ri.Cvar_Get ("mme_mp4MaxMegs", "0", 0);
+	mme_mp4Crf = ri.Cvar_Get ("mme_mp4Crf", "20", CVAR_ARCHIVE);
+	mme_mp4AudioBitrate = ri.Cvar_Get ("mme_mp4AudioBitrate", "128000", CVAR_ARCHIVE);
 
 	mme_jpegQuality = ri.Cvar_Get ("mme_jpegQuality", "100", CVAR_ARCHIVE);
 	mme_jpegDownsampleChroma = ri.Cvar_Get ("mme_jpegDownsampleChroma", "0", CVAR_ARCHIVE);
@@ -879,21 +957,10 @@ void R_MME_Init(void) {
 	mme_saveCubemap->modified = qtrue;
 
 	Com_Memset( &mainData, 0, sizeof(mainData));
-	//CANATODO, not exactly the best way to do this probably, but it works
-	if (!workAlloc) {
-		workSize = mme_workMegs->integer;
-		if (workSize < 64)
-			workSize = 64;
-		else if (workSize > MME_MAX_WORKSIZE)
-			workSize = MME_MAX_WORKSIZE;
-		workSize *= 1024 * 1024;
-		workAlloc = (char *)calloc( workSize + 16, 1 );
-		if (!workAlloc) {
-			ri.Printf(PRINT_ALL, "Failed to allocate %zu bytes for mme work buffer\n", workSize );
-			allocFailed = qtrue;
-			return;
-		}
-		workAlign = (char *)(((intptr_t)workAlloc + 15) & ~15);
+#ifndef __EMSCRIPTEN__
+	if (!R_MME_EnsureWorkAlloc()) {
+		return;
 	}
+#endif
 	R_MME_CheckCvars();
 }

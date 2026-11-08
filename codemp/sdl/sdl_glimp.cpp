@@ -7,6 +7,28 @@
 #endif
 #include "sdl_qgl.h"
 #include "../sys/sys_local.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+EM_JS(int, wasm_js_enable_fbo_extensions, (), {
+	try {
+		if (typeof GLctx === 'undefined' || !GLctx) return 0;
+		var exts = [
+			'OES_texture_half_float',
+			'OES_texture_half_float_linear',
+			'EXT_color_buffer_half_float',
+			'OES_texture_float',
+			'OES_texture_float_linear',
+			'WEBGL_color_buffer_float',
+			'EXT_float_blend'
+		];
+		for (var i = 0; i < exts.length; i++) {
+			try { GLctx.getExtension(exts[i]); } catch (e0) {}
+		}
+		return (typeof GLctx.createFramebuffer === 'function') ? 1 : 0;
+	} catch (e) {}
+	return 0;
+});
+#endif
 
 static SDL_Window *window = NULL;
 
@@ -1097,9 +1119,44 @@ static void GLimp_InitExtensions( void )
 	g_bDynamicGlowSupported = false;
 	ri.Cvar_Set( "r_DynamicGlow", "0" );
 	glMMEConfig.maxAnisotropy = 0;
-	glMMEConfig.framebufferObject = qfalse;
-	glMMEConfig.shaderSupport = qfalse;
 	glMMEConfig.framebufferMultiSample = qfalse;
+	if ( wasm_js_enable_fbo_extensions() ) {
+		qglGenFramebuffers = glGenFramebuffers;
+		qglBindFramebuffer = glBindFramebuffer;
+		qglGenRenderbuffers = glGenRenderbuffers;
+		qglBindRenderbuffer = glBindRenderbuffer;
+		qglRenderbufferStorage = glRenderbufferStorage;
+		qglFramebufferRenderbuffer = glFramebufferRenderbuffer;
+		qglFramebufferTexture2D = glFramebufferTexture2D;
+		qglCheckFramebufferStatus = glCheckFramebufferStatus;
+		qglDeleteFramebuffers = glDeleteFramebuffers;
+		qglDeleteRenderbuffers = glDeleteRenderbuffers;
+
+		qglAttachShader = glAttachShader;
+		qglBindAttribLocation = glBindAttribLocation;
+		qglCompileShader = glCompileShader;
+		qglCreateProgram = glCreateProgram;
+		qglCreateShader = glCreateShader;
+		qglDeleteProgram = glDeleteProgram;
+		qglDeleteShader = glDeleteShader;
+		qglShaderSource = (void (APIENTRYP)(GLuint, GLsizei, const GLchar **, const GLint *))glShaderSource;
+		qglLinkProgram = glLinkProgram;
+		qglUseProgram = glUseProgram;
+		qglGetUniformLocation = glGetUniformLocation;
+		qglUniform1f = glUniform1f;
+		qglUniform2f = glUniform2f;
+		qglUniform1i = glUniform1i;
+		qglGetProgramiv = glGetProgramiv;
+		qglGetProgramInfoLog = glGetProgramInfoLog;
+		qglGetShaderiv = glGetShaderiv;
+		qglGetShaderInfoLog = glGetShaderInfoLog;
+
+		glMMEConfig.framebufferObject = qtrue;
+		glMMEConfig.shaderSupport = qtrue;
+	} else {
+		glMMEConfig.framebufferObject = qfalse;
+		glMMEConfig.shaderSupport = qfalse;
+	}
 	return;
 #endif
 

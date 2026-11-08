@@ -205,10 +205,28 @@ void R_MME_SaveShot( mmeShot_t *shot, int width, int height, float fps, byte *in
 	case mmeShotFormatPNG:
 		extension = "png";
 		break;
+	case mmeShotFormatMP4:
+#ifdef __EMSCRIPTEN__
+		shot->mp4.pipe = qtrue;
+#else
+		shot->mp4.pipe = qfalse;
+#endif
+		mmeMp4Shot( &shot->mp4, tempName, width, height, fps, shotBuf, audio );
+		if (audio)
+			mmeMp4Sound( &shot->mp4, aBuf, aSize );
+		goto complete;
 	case mmeShotFormatPIPE:
+#ifdef __EMSCRIPTEN__
+		shot->mp4.pipe = qtrue;
+		mmeMp4Shot( &shot->mp4, tempName, width, height, fps, shotBuf, audio );
+		if (audio)
+			mmeMp4Sound( &shot->mp4, aBuf, aSize );
+		goto complete;
+#else
 		if (!shot->avi.f) {
 			shot->avi.pipe = qtrue;
 		}
+#endif
 	case mmeShotFormatAVI:
 		mmeAviShot( &shot->avi, tempName, shot->type, width, height, fps, shotBuf, audio );
 		if (audio)

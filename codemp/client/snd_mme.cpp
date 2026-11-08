@@ -72,23 +72,35 @@ void S_MMEWavClose(void) {
 	Com_Memset( &mmeSound, 0, sizeof(mmeSound) );
 }
 
-static byte wavExportBuf[MME_SAMPLERATE] = {0};
+static byte wavExportBuf[MME_SAMPLERATE * 4] = {0};
 static int bytesInBuf = 0;
+
+void S_MMEResetExport(void) {
+	mmeSound.baseName[0] = '\0';
+	mmeSound.deltaSamples = 0;
+	mmeSound.fileSize = 0;
+	mmeSound.gotFrame = qfalse;
+	bytesInBuf = 0;
+}
+
 qboolean S_MMEAviImport(byte *out, int *size) {
 	const char *format = Cvar_VariableString("mme_screenShotFormat");
 	const int shot = Cvar_VariableIntegerValue("mme_saveShot");
 	const int depth = Cvar_VariableIntegerValue("mme_saveDepth");
 	if (!MME_AVIIMPORT
-        || (!(!Q_stricmp(format, "avi") || !Q_stricmp(format, "pipe")))
+        || (!(!Q_stricmp(format, "avi") || !Q_stricmp(format, "pipe") || !Q_stricmp(format, "mp4")))
         || (!shot && !depth))
 		return qfalse;
 	*size = 0;
-	while (bytesInBuf >= MME_SAMPLERATE)
-		bytesInBuf -= MME_SAMPLERATE;
 	if (bytesInBuf <= 0)
 		return qtrue;
-	Com_Memcpy( out, wavExportBuf, bytesInBuf );
-	*size = bytesInBuf;
+	if (bytesInBuf > MME_SAMPLERATE) {
+		Com_Memcpy( out, wavExportBuf + (bytesInBuf - MME_SAMPLERATE), MME_SAMPLERATE );
+		*size = MME_SAMPLERATE;
+	} else {
+		Com_Memcpy( out, wavExportBuf, bytesInBuf );
+		*size = bytesInBuf;
+	}
 	bytesInBuf = 0;
 	return qtrue;
 }
@@ -133,8 +145,15 @@ void S_MMEUpdate( float scale ) {
 	if (!MME_AVIIMPORT) {
 		FS_Write( mixClip, count*4, mmeSound.fileHandle );
 	} else if (MME_AVIIMPORT) {
-		while (bytesInBuf >= MME_SAMPLERATE)
-			bytesInBuf -= MME_SAMPLERATE;
+		if (bytesInBuf + count * 4 > (int)sizeof(wavExportBuf)) {
+			int keep = (int)sizeof(wavExportBuf) - count * 4;
+			if (keep > 0) {
+				memmove(wavExportBuf, wavExportBuf + (bytesInBuf - keep), keep);
+				bytesInBuf = keep;
+			} else {
+				bytesInBuf = 0;
+			}
+		}
 		Com_Memcpy(&wavExportBuf[bytesInBuf], mixClip, count*4 );
 		bytesInBuf += count*4;
 	}
@@ -146,7 +165,7 @@ void S_MMERecord( const char *baseName, float deltaTime ) {
 	const char *format = Cvar_VariableString("mme_screenShotFormat");
 	const int shot = Cvar_VariableIntegerValue("mme_saveShot");
 	const int depth = Cvar_VariableIntegerValue("mme_saveDepth");
-	if (!mme_saveWav->integer || (MME_AVIIMPORT && ((!(!Q_stricmp(format, "avi") || !Q_stricmp(format, "pipe"))) || (!shot && !depth))))
+	if (!mme_saveWav->integer || (MME_AVIIMPORT && ((!(!Q_stricmp(format, "avi") || !Q_stricmp(format, "pipe") || !Q_stricmp(format, "mp4"))) || (!shot && !depth))))
 		return;
 	if (Q_stricmp(baseName, mmeSound.baseName) && !MME_AVIIMPORT) {
 		char fileName[MAX_OSPATH];

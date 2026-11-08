@@ -615,6 +615,11 @@ void CG_DemosDrawActiveFrame( int serverTime, stereoFrame_t stereoView ) {
 		if ( left > 2000) {
 			left -= 1000;
 			captureFrame = qfalse;
+#ifdef __EMSCRIPTEN__
+		} else if (left > 50) {
+			captureFrame = qfalse;
+			left = 25;
+#endif
 		} else if (left > 5) {
 			captureFrame = qfalse;
 			left = 5;
@@ -1046,6 +1051,7 @@ void CG_DemosDrawActiveFrame( int serverTime, stereoFrame_t stereoView ) {
 	if ( demo.capture.active && demo.capture.locked && demo.play.time > demo.capture.end  ) {
 		CG_ShowNotification( va( "Capturing %s ended", mov_captureName.string ), NOTIFICATION_CAPTURE_END );
 		Com_Printf( "Capturing ended\n" );
+		trap_SendConsoleCommand( "capturestop;\n" );
 		if (demo.autoLoad) {
 			trap_SendConsoleCommand( "disconnect\n" );
 		} 
@@ -1730,5 +1736,65 @@ float CG_MME_GetSpeed( void ) {
 
 void CG_MME_SetSpeed( float speed ) {
 	demo.play.speed = speed;
+}
+
+void CG_MME_StartCapture( int startMs, int endMs, float fps, float speed, const char *format, const char *name ) {
+	int prerollMs;
+	if ( !format || !format[0] ) {
+		format = "mp4";
+	}
+	if ( !name || !name[0] ) {
+		name = "clip";
+	}
+	if ( fps <= 0.0f ) {
+		fps = 60.0f;
+	}
+	if ( speed <= 0.0f ) {
+		speed = 1.0f;
+	}
+	if ( startMs < 0 ) {
+		startMs = 0;
+	}
+	if ( endMs <= startMs ) {
+		endMs = startMs + 500;
+	}
+
+	demo.loop.total = 0;
+	demo.play.speed = speed;
+	demo.play.paused = qfalse;
+	trap_Cvar_Set( "mme_demoPaused", "0" );
+
+	trap_Cvar_Set( "mme_screenShotFormat", format );
+	trap_Cvar_Set( "mov_captureFPS", va( "%g", fps ) );
+	trap_Cvar_Update( &mov_captureFPS );
+	trap_Cvar_Set( "mov_captureName", name );
+	trap_Cvar_Update( &mov_captureName );
+
+	demo.capture.start = startMs;
+	demo.capture.end = endMs;
+	demo.capture.locked = qtrue;
+	demo.capture.active = qtrue;
+
+#ifdef __EMSCRIPTEN__
+	prerollMs = startMs - 1000;
+#else
+	prerollMs = startMs - 2000;
+#endif
+	if ( prerollMs < 0 ) {
+		prerollMs = 0;
+	}
+	CG_MME_SetTimeMs( prerollMs );
+}
+
+void CG_MME_StopCapture( void ) {
+	demo.capture.active = qfalse;
+	demo.loop.total = 0;
+	demo.play.paused = qtrue;
+	trap_Cvar_Set( "mme_demoPaused", "1" );
+	trap_SendConsoleCommand( "capturestop;\n" );
+}
+
+int CG_MME_IsCapturing( void ) {
+	return demo.capture.active ? 1 : 0;
 }
 

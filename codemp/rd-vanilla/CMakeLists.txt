@@ -37,6 +37,7 @@ set(MPVanillaRendererFiles
 	"${MPDir}/rd-vanilla/tr_mme.h"
 	"${MPDir}/rd-vanilla/tr_mme.cpp"
 	"${MPDir}/rd-vanilla/tr_mme_avi.cpp"
+	"${MPDir}/rd-vanilla/tr_mme_mp4.cpp"
 	"${MPDir}/rd-vanilla/tr_mme_common.cpp"
 	"${MPDir}/rd-vanilla/tr_mme_sse2.cpp"
 	"${MPDir}/rd-vanilla/tr_model.cpp"
@@ -98,6 +99,45 @@ set(MPVanillaRendererLibPngFiles
 	"${MPDir}/libpng/pngwutil.c")
 source_group("libpng" FILES ${MPVanillaRendererLibPngFiles})
 set(MPVanillaRendererFiles ${MPVanillaRendererFiles} ${MPVanillaRendererLibPngFiles})
+
+if(EMSCRIPTEN)
+	set(MPVanillaRendererVoAacFiles
+		"${MPDir}/vo-aacenc/common/cmnMemory.c"
+		"${MPDir}/vo-aacenc/aacenc/basic_op/basicop2.c"
+		"${MPDir}/vo-aacenc/aacenc/basic_op/oper_32b.c"
+		"${MPDir}/vo-aacenc/aacenc/src/aacenc.c"
+		"${MPDir}/vo-aacenc/aacenc/src/aacenc_core.c"
+		"${MPDir}/vo-aacenc/aacenc/src/aac_rom.c"
+		"${MPDir}/vo-aacenc/aacenc/src/adj_thr.c"
+		"${MPDir}/vo-aacenc/aacenc/src/band_nrg.c"
+		"${MPDir}/vo-aacenc/aacenc/src/bitbuffer.c"
+		"${MPDir}/vo-aacenc/aacenc/src/bit_cnt.c"
+		"${MPDir}/vo-aacenc/aacenc/src/bitenc.c"
+		"${MPDir}/vo-aacenc/aacenc/src/block_switch.c"
+		"${MPDir}/vo-aacenc/aacenc/src/channel_map.c"
+		"${MPDir}/vo-aacenc/aacenc/src/dyn_bits.c"
+		"${MPDir}/vo-aacenc/aacenc/src/grp_data.c"
+		"${MPDir}/vo-aacenc/aacenc/src/interface.c"
+		"${MPDir}/vo-aacenc/aacenc/src/line_pe.c"
+		"${MPDir}/vo-aacenc/aacenc/src/memalign.c"
+		"${MPDir}/vo-aacenc/aacenc/src/ms_stereo.c"
+		"${MPDir}/vo-aacenc/aacenc/src/pre_echo_control.c"
+		"${MPDir}/vo-aacenc/aacenc/src/psy_configuration.c"
+		"${MPDir}/vo-aacenc/aacenc/src/psy_main.c"
+		"${MPDir}/vo-aacenc/aacenc/src/qc_main.c"
+		"${MPDir}/vo-aacenc/aacenc/src/quantize.c"
+		"${MPDir}/vo-aacenc/aacenc/src/sf_estim.c"
+		"${MPDir}/vo-aacenc/aacenc/src/spreading.c"
+		"${MPDir}/vo-aacenc/aacenc/src/stat_bits.c"
+		"${MPDir}/vo-aacenc/aacenc/src/tns.c"
+		"${MPDir}/vo-aacenc/aacenc/src/transform.c")
+	set_source_files_properties(${MPVanillaRendererVoAacFiles} PROPERTIES
+		COMPILE_FLAGS "-I${MPDir}/vo-aacenc/common/include -I${MPDir}/vo-aacenc/aacenc/inc -I${MPDir}/vo-aacenc/aacenc/basic_op -Wno-parentheses-equality")
+	source_group("vo-aacenc" FILES ${MPVanillaRendererVoAacFiles})
+	set(MPVanillaRendererFiles ${MPVanillaRendererFiles} ${MPVanillaRendererVoAacFiles})
+	set_source_files_properties("${MPDir}/rd-vanilla/tr_mme_mp4.cpp" PROPERTIES
+		COMPILE_FLAGS "-I${MPDir}/vo-aacenc/common/include")
+endif()
 
 if(UseInternalZlib)
 	set(MPVanillaRendererIncludeDirectories ${MPVanillaRendererIncludeDirectories} "${MPDir}/zlib")

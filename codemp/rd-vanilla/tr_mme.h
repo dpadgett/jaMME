@@ -62,6 +62,16 @@ typedef struct mmeAviFile_s {
 	mmeShotType_t type;
 } mmeAviFile_t;
 
+typedef struct mmeMp4File_s {
+	char name[MAX_OSPATH];
+	fileHandle_t f;
+	float fps;
+	int width, height;
+	qboolean audio;
+	qboolean pipe;
+	void *session;
+} mmeMp4File_t;
+
 typedef struct {
 	char name[MAX_OSPATH];
 	char nameOld[MAX_OSPATH];
@@ -69,6 +79,7 @@ typedef struct {
 	mmeShotFormat_t format;
 	mmeShotType_t type;
     mmeAviFile_t avi;
+    mmeMp4File_t mp4;
 	byte *stereoTemp;
 } mmeShot_t;
 
@@ -100,6 +111,14 @@ void mmeAviShot( mmeAviFile_t *aviFile, const char *name, mmeShotType_t type, in
 void mmeAviSound( mmeAviFile_t *aviFile, const char *name, mmeShotType_t type, int width, int height, float fps, const byte *soundBuf, int size );
 void aviClose( mmeAviFile_t *aviFile );
 
+void mmeMp4Shot( mmeMp4File_t *mp4File, const char *name, int width, int height, float fps, const byte *inBuf, qboolean audio );
+void mmeMp4Sound( mmeMp4File_t *mp4File, const byte *soundBuf, int size );
+void mp4Close( mmeMp4File_t *mp4File );
+int R_MME_GetMp4CapturedFrames( void );
+double R_MME_GetMp4EncodedBytes( void );
+int R_MME_IsMp4FlushPending( void );
+int R_MME_GetWebCodecsQueueSize( void );
+
 #if (!defined (HAVE_GLES) || defined (X86_OR_64)) && !defined (__arm64__) && !defined (__EMSCRIPTEN__)
 void MME_AccumClearSSE( void* Q_RESTRICT w, const void* Q_RESTRICT r, short int mul, int count );
 void MME_AccumAddSSE( void* Q_RESTRICT w, const void* Q_RESTRICT r, short int mul, int count );
@@ -121,6 +140,11 @@ extern cvar_t	*mme_pipeCommand;
 
 extern cvar_t	*mme_aviFormat;
 extern cvar_t	*mme_aviLimit;
+
+extern cvar_t	*mme_mp4Bitrate;
+extern cvar_t	*mme_mp4MaxMegs;
+extern cvar_t	*mme_mp4Crf;
+extern cvar_t	*mme_mp4AudioBitrate;
 
 extern cvar_t	*mme_blurJitter;
 extern cvar_t	*mme_blurStrength;

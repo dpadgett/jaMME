@@ -64,14 +64,22 @@ extern "C" void CG_MME_SetPaused( int paused );
 extern "C" int CG_MME_GetPaused( void );
 extern "C" void CG_MME_SetSpeed( float speed );
 extern "C" float CG_MME_GetSpeed( void );
+extern "C" void CG_MME_StartCapture( int startMs, int endMs, float fps, float speed, const char *format, const char *name );
+extern "C" void CG_MME_StopCapture( void );
+extern "C" int CG_MME_IsCapturing( void );
+extern int R_MME_GetMp4CapturedFrames( void );
+extern double R_MME_GetMp4EncodedBytes( void );
+extern int R_MME_IsMp4FlushPending( void );
+extern int R_MME_GetWebCodecsQueueSize( void );
 
 EM_JS(void, JK_NotifyDemoCompletedJS, (const char *demoName, int serverTime, int frameCount, int completedCount), {
 	var nameStr = demoName ? UTF8ToString(demoName) : "";
-	if (typeof window !== "undefined") {
-		if (typeof window.__jkNotifyDemoCompleted === "function") {
-			window.__jkNotifyDemoCompleted(nameStr, serverTime, frameCount, completedCount);
-		} else if (window.JKDemoPlayer && typeof window.JKDemoPlayer._onInternalDemoCompleted === "function") {
-			window.JKDemoPlayer._onInternalDemoCompleted(nameStr, serverTime, frameCount, completedCount);
+	var g = typeof globalThis !== "undefined" ? globalThis : (typeof self !== "undefined" ? self : window);
+	if (g) {
+		if (typeof g.__jkNotifyDemoCompleted === "function") {
+			g.__jkNotifyDemoCompleted(nameStr, serverTime, frameCount, completedCount);
+		} else if (g.JKDemoPlayer && typeof g.JKDemoPlayer._onInternalDemoCompleted === "function") {
+			g.JKDemoPlayer._onInternalDemoCompleted(nameStr, serverTime, frameCount, completedCount);
 		}
 	}
 });
@@ -4490,7 +4498,7 @@ EMSCRIPTEN_KEEPALIVE float JK_DemoGetVolume( void ) {
 	return g_jkSavedVolume;
 }
 
-extern void Com_RecoverFromThrownError( int code );
+extern "C++" void Com_RecoverFromThrownError( int code );
 
 EMSCRIPTEN_KEEPALIVE int JK_DemoLoad( const char *demoName ) {
 	try {
@@ -5465,6 +5473,97 @@ EMSCRIPTEN_KEEPALIVE int JK_DemoGetMapOverbright( void ) {
 	}
 #endif
 	return (int)Cvar_VariableIntegerValue( "r_mapOverBrightBits" );
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_ExportStartCapture(
+	int startMs,
+	int endMs,
+	float fps,
+	float speed,
+	const char *format,
+	const char *name
+) {
+#ifdef __EMSCRIPTEN__
+	if ( cls.state != CA_ACTIVE || !cgvm ) {
+		return 0;
+	}
+	S_MMEResetExport();
+	Cvar_Set( "com_timescale", "1" );
+	CG_MME_StartCapture( startMs, endMs, fps, speed, format ? format : "mp4", name ? name : "clip" );
+	return 1;
+#else
+	(void)startMs; (void)endMs; (void)fps; (void)speed; (void)format; (void)name;
+	return 0;
+#endif
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_ExportStepFrame( void ) {
+#ifdef __EMSCRIPTEN__
+	Com_Frame();
+	if ( cls.state == CA_ACTIVE && cgvm && !CG_MME_IsCapturing() ) {
+		// Execute any queued capturestop; immediately so encoders flush on the exact end frame
+		Cbuf_Execute();
+		return 0;
+	}
+	return ( cls.state == CA_ACTIVE && cgvm ) ? CG_MME_IsCapturing() : 0;
+#else
+	return 0;
+#endif
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_ExportIsCapturing( void ) {
+#ifdef __EMSCRIPTEN__
+	if ( cls.state != CA_ACTIVE || !cgvm ) {
+		return 0;
+	}
+	return CG_MME_IsCapturing();
+#else
+	return 0;
+#endif
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_ExportIsFlushPending( void ) {
+#ifdef __EMSCRIPTEN__
+	return R_MME_IsMp4FlushPending();
+#else
+	return 0;
+#endif
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_ExportGetCapturedFrames( void ) {
+#ifdef __EMSCRIPTEN__
+	return R_MME_GetMp4CapturedFrames();
+#else
+	return 0;
+#endif
+}
+
+EMSCRIPTEN_KEEPALIVE double JK_ExportGetEncodedBytes( void ) {
+#ifdef __EMSCRIPTEN__
+	return R_MME_GetMp4EncodedBytes();
+#else
+	return 0.0;
+#endif
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_ExportGetQueueSize( void ) {
+#ifdef __EMSCRIPTEN__
+	return R_MME_GetWebCodecsQueueSize();
+#else
+	return 0;
+#endif
+}
+
+EMSCRIPTEN_KEEPALIVE void JK_ExportStopCapture( void ) {
+#ifdef __EMSCRIPTEN__
+	if ( cgvm ) {
+		CG_MME_StopCapture();
+	} else {
+		Cbuf_AddText( "capturestop;\n" );
+	}
+	Cbuf_Execute();
+	S_MMEResetExport();
+#endif
 }
 
 } // extern "C"
