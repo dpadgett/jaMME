@@ -2427,11 +2427,14 @@ void CFlash::Draw( void )
 		VectorCopy( theFxHelper.refdef->vieworg, mRefEnt.origin );
 		VectorMA( mRefEnt.origin, FLASH_DISTANCE_FROM_VIEWER, theFxHelper.refdef->viewaxis[0], mRefEnt.origin );
 
-        // This is assuming that the screen is wider than it is tall.
+		// Cover both horizontal and vertical frustum extents (including 9:16 portrait where fov_y > fov_x).
+		const float maxFov = (theFxHelper.refdef->fov_y > theFxHelper.refdef->fov_x)
+			? theFxHelper.refdef->fov_y
+			: theFxHelper.refdef->fov_x;
 		stereoSep = Cvar_VariableValue( "r_stereoSeparation" );
 		if (stereoSep != 0)
 			stereoCoeff = stereoSep / 0.017f; //not accurate but works
-        mRefEnt.radius = FLASH_DISTANCE_FROM_VIEWER * tan (DEG2RAD (theFxHelper.refdef->fov_x * 0.5f)) * stereoCoeff;
+		mRefEnt.radius = FLASH_DISTANCE_FROM_VIEWER * tan (DEG2RAD (maxFov * 0.5f)) * 1.01f * stereoCoeff;
 
 		theFxHelper.AddFxToScene( &mRefEnt );
 	}

@@ -2109,6 +2109,13 @@ void CG_DrawSkyBoxPortal(const char *cstr)
 	}
 
 skyBoxFovDone:
+	if ( cg_fovAspectAdjust.integer ) {
+		const float baseAspect = 0.75f; // 3/4
+		const float aspect = (float)cgs.glconfig.vidWidth / (float)cgs.glconfig.vidHeight;
+		const float desiredFov = fov_x;
+
+		fov_x = atan( tan( desiredFov * M_PI / 360.0f ) * baseAspect * aspect ) * 360.0f / M_PI;
+	}
 	x = cg.refdef.width / tan( fov_x / 360 * M_PI );
 	fov_y = atan2( cg.refdef.height, x );
 	fov_y = fov_y * 360 / M_PI;

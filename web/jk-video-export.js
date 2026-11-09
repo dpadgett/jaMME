@@ -5,7 +5,7 @@
     return;
   }
 
-  const ASSET_VERSION = '20261107n';
+  const ASSET_VERSION = '20261108a';
   const MIN_CLIP_MS = 500;
   const DEFAULT_PRE_MS = 10000;
   const DEFAULT_POST_MS = 5000;

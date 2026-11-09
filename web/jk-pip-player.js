@@ -2955,7 +2955,7 @@
       return Promise.resolve(window.JKVideoExport);
     }
     if (videoExportScriptPromise) return videoExportScriptPromise;
-    const PLAYER_ASSET_VERSION = '20261107n';
+    const PLAYER_ASSET_VERSION = '20261108a';
     videoExportScriptPromise = new Promise((resolve, reject) => {
       const existing = document.querySelector('script[src*="/jkplayer/jk-video-export.js"]');
       if (existing) {
@@ -3000,8 +3000,8 @@
     }
 
     // Separate engine vs wrapper versions so UI/JS updates do not invalidate cached openjk.wasm
-    const ENGINE_ASSET_VERSION = '20261107m';
-    const PLAYER_ASSET_VERSION = '20261107n';
+    const ENGINE_ASSET_VERSION = '20261108a';
+    const PLAYER_ASSET_VERSION = '20261108a';
     ensureVideoExportScriptLoaded().catch(() => {});
     window.JKDemoConfig = Object.assign(
       {

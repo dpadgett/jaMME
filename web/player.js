@@ -18,8 +18,8 @@
   const MAX_OVERBRIGHT = 3;
 
   const BOOT_START_MS = typeof performance !== 'undefined' ? performance.now() : Date.now();
-  const DEFAULT_ENGINE_VERSION = '20261107m';
-  const DEFAULT_PLAYER_VERSION = '20261107n';
+  const DEFAULT_ENGINE_VERSION = '20261108a';
+  const DEFAULT_PLAYER_VERSION = '20261108a';
 
   function installDocumentTitleGuard() {
     if (typeof document === 'undefined' || document.__jkTitleGuardInstalled) return;
