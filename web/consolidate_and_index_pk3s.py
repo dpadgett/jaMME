@@ -24,6 +24,7 @@ SOURCE_DIRS = [
     "/media/dan/Elements/pk3/m0n573r",
     "/media/dan/Elements/pk3/m0n573rii",
     "/media/dan/Elements/pk3/MyGames",
+    "/media/dan/Elements/pk3/duo2",
 ]
 
 OUTPUT_DIR = "/media/dan/Elements/pk3/base"
@@ -333,7 +334,7 @@ def main() -> int:
         )
 
     manifest_data = {
-        "version": 2,
+        "version": 3,
         "pk3s": manifest_entries,
     }
     tmp_manifest = MANIFEST_PATH + ".tmp"

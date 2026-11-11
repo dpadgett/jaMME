@@ -18,8 +18,8 @@
   const MAX_OVERBRIGHT = 3;
 
   const BOOT_START_MS = typeof performance !== 'undefined' ? performance.now() : Date.now();
-  const DEFAULT_ENGINE_VERSION = '20261111a';
-  const DEFAULT_PLAYER_VERSION = '20261111a';
+  const DEFAULT_ENGINE_VERSION = '20261111b';
+  const DEFAULT_PLAYER_VERSION = '20261111b';
 
   function installDocumentTitleGuard() {
     if (typeof document === 'undefined' || document.__jkTitleGuardInstalled) return;
@@ -2435,36 +2435,54 @@
     }
   }
 
+  const MIN_MANIFEST_VERSION = 3;
+
   async function fetchManifestWithRetry() {
+    let cachedParsed = null;
     if (!state.bypassCache) {
       try {
         const cachedRaw = localStorage.getItem(LS_MANIFEST_KEY);
         if (cachedRaw) {
           const parsed = JSON.parse(cachedRaw);
-          if (parsed && Array.isArray(parsed.pk3s) && parsed.pk3s.length > 0) {
-            window.__jkPk3Manifest = parsed;
-            return parsed;
+          if (
+            parsed &&
+            Number(parsed.version) >= MIN_MANIFEST_VERSION &&
+            Array.isArray(parsed.pk3s) &&
+            parsed.pk3s.length > 0
+          ) {
+            cachedParsed = parsed;
+          } else {
+            localStorage.removeItem(LS_MANIFEST_KEY);
           }
         }
       } catch (_) {}
     }
-    for (let attempt = 0; attempt < 4; attempt++) {
+    const maxAttempts = cachedParsed ? 2 : 4;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (attempt > 0 || isPageHidden()) {
         await waitForPageVisible(attempt * 250);
       }
       try {
-        const resp = await fetch('/base/manifest.json');
+        const resp = await fetch('/base/manifest.json?v=' + MIN_MANIFEST_VERSION, {
+          cache: 'no-cache',
+        });
         if (resp.ok) {
           const data = await resp.json();
-          window.__jkPk3Manifest = data;
-          if (!state.bypassCache) {
-            try {
-              localStorage.setItem(LS_MANIFEST_KEY, JSON.stringify(data));
-            } catch (_) {}
+          if (data && Array.isArray(data.pk3s) && data.pk3s.length > 0) {
+            window.__jkPk3Manifest = data;
+            if (!state.bypassCache) {
+              try {
+                localStorage.setItem(LS_MANIFEST_KEY, JSON.stringify(data));
+              } catch (_) {}
+            }
+            return data;
           }
-          return data;
         }
       } catch (_) {}
+    }
+    if (cachedParsed) {
+      window.__jkPk3Manifest = cachedParsed;
+      return cachedParsed;
     }
     return window.__jkPk3Manifest || null;
   }

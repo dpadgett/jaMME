@@ -3042,7 +3042,7 @@
       return Promise.resolve(window.JKVideoExport);
     }
     if (videoExportScriptPromise) return videoExportScriptPromise;
-    const PLAYER_ASSET_VERSION = '20261111a';
+    const PLAYER_ASSET_VERSION = '20261111b';
     videoExportScriptPromise = new Promise((resolve, reject) => {
       const existing = document.querySelector('script[src*="/jkplayer/jk-video-export.js"]');
       if (existing) {
@@ -3087,8 +3087,8 @@
     }
 
     // Separate engine vs wrapper versions so UI/JS updates do not invalidate cached openjk.wasm
-    const ENGINE_ASSET_VERSION = '20261111a';
-    const PLAYER_ASSET_VERSION = '20261111a';
+    const ENGINE_ASSET_VERSION = '20261111b';
+    const PLAYER_ASSET_VERSION = '20261111b';
     ensureVideoExportScriptLoaded().catch(() => {});
     window.JKDemoConfig = Object.assign(
       {
@@ -4085,8 +4085,17 @@
   function ensureManifestV2Cached() {
     try {
       const existing = localStorage.getItem('openjk_pk3_manifest_v2');
-      if (existing && existing.length > 1000) return;
-      fetch('/base/manifest.json')
+      if (existing) {
+        try {
+          const parsed = JSON.parse(existing);
+          if (!parsed || Number(parsed.version) < 3) {
+            localStorage.removeItem('openjk_pk3_manifest_v2');
+          }
+        } catch (_) {
+          localStorage.removeItem('openjk_pk3_manifest_v2');
+        }
+      }
+      fetch('/base/manifest.json?v=3', { cache: 'no-cache' })
         .then((r) => (r.ok ? r.text() : ''))
         .then((txt) => {
           if (txt && txt.length > 1000) {

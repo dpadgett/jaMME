@@ -1719,7 +1719,7 @@ async function fetchManifestIfNeeded(providedManifest) {
       await new Promise((r) => setTimeout(r, attempt * 250));
     }
     try {
-      const resp = await fetch('/base/manifest.json');
+      const resp = await fetch('/base/manifest.json?v=3', { cache: 'no-cache' });
       if (resp.ok) {
         const data = await resp.json();
         self.__jkPk3Manifest = data;

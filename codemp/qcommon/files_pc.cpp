@@ -118,7 +118,7 @@ EM_JS(int, wasm_js_fetch_manifest, (char *buf, int maxLen), {
 				var raw = localStorage.getItem('openjk_pk3_manifest_v2');
 				if (raw) {
 					var parsed = JSON.parse(raw);
-					if (parsed && parsed.pk3s && parsed.pk3s.length > 0 && typeof parsed.pk3s[0].checksum === 'number') {
+					if (parsed && Number(parsed.version) >= 3 && parsed.pk3s && parsed.pk3s.length > 0 && typeof parsed.pk3s[0].checksum === 'number') {
 						data = parsed;
 					}
 				}
