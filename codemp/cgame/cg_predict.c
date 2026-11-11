@@ -243,8 +243,12 @@ static void CG_ClipMoveToEntities ( const vec3_t start, const vec3_t mins, const
 		if ( ent->solid == SOLID_BMODEL ) {
 			// special value for bmodel
 			cmodel = trap_CM_InlineModel( ent->modelindex );
-			VectorCopy( cent->lerpAngles, angles );
-			BG_EvaluateTrajectory( &cent->currentState.pos, cg.physicsTime, origin );
+			if ( cg.demoPlayback == 2 && ent->eType == ET_MOVER ) {
+				CG_EvaluateMoverPosition( cent, cg.time, cg.timeFraction, origin, angles );
+			} else {
+				VectorCopy( cent->lerpAngles, angles );
+				BG_EvaluateTrajectory( &cent->currentState.pos, cg.physicsTime, origin );
+			}
 		} else {
 			// encoded bbox
 			x = (ent->solid & 255);
@@ -413,7 +417,13 @@ int		CG_PointContents( const vec3_t point, int passEntityNum ) {
 			continue;
 		}
 
-		contents |= trap_CM_TransformedPointContents( point, cmodel, ent->origin, ent->angles );
+		if ( cg.demoPlayback == 2 && ent->eType == ET_MOVER ) {
+			vec3_t moverOrg, moverAng;
+			CG_EvaluateMoverPosition( cent, cg.time, cg.timeFraction, moverOrg, moverAng );
+			contents |= trap_CM_TransformedPointContents( point, cmodel, moverOrg, moverAng );
+		} else {
+			contents |= trap_CM_TransformedPointContents( point, cmodel, ent->origin, ent->angles );
+		}
 	}
 
 	return contents;
@@ -461,6 +471,43 @@ Generates cg.predictedPlayerState by interpolating between
 cg.snap->player_state and cg.nextFrame->player_state
 ========================
 */
+static const playerState_t *CG_FindLandedPlayerStateOnMover( int startIdx, int moverNum, int refServerTime ) {
+	int idx;
+	if ( moverNum <= 0 || moverNum >= ENTITYNUM_MAX_NORMAL ) {
+		return NULL;
+	}
+	for ( idx = startIdx; idx < cg.psHistory.nextSlot; idx++ ) {
+		const timedPlayerState_t *cand = &cg.psHistory.states[idx % MAX_STATE_HISTORY];
+		if ( cand->serverTime < refServerTime ) {
+			continue;
+		}
+		if ( idx > startIdx && cand->isTeleport ) {
+			break;
+		}
+		if ( cand->serverTime > refServerTime + 200 ) {
+			break;
+		}
+		if ( cand->ps.groundEntityNum == moverNum ) {
+			return &cand->ps;
+		}
+	}
+	return NULL;
+}
+
+static void CG_ApplyLandedAnimToPlayerState(
+	playerState_t *out, const playerState_t *curps,
+	const playerState_t *landedPs, int moverNum )
+{
+	out->groundEntityNum = moverNum;
+	out->legsAnim = landedPs->legsAnim;
+	out->legsFlip = landedPs->legsFlip;
+	out->movementDir = landedPs->movementDir;
+	if ( out->torsoAnim == curps->legsAnim ) {
+		out->torsoAnim = landedPs->torsoAnim;
+		out->torsoFlip = landedPs->torsoFlip;
+	}
+}
+
 void CG_InterpolatePlayerState( qboolean grabAngles ) {
 	float			f;
 	int				i;
@@ -472,7 +519,7 @@ void CG_InterpolatePlayerState( qboolean grabAngles ) {
 	out = &cg.predictedPlayerState;
 	prev = cg.snap;
 	next = cg.nextSnap;
-	if (cg_commandSmooth.integer && cg.demoPlayback == 2) {
+	if (cg_commandSmooth.integer && cg.demoPlayback == 2 && cg.psHistory.nextSlot > 0) {
 		timedPlayerState_t *tps, *nexttps;
 		CG_ComputeCommandSmoothPlayerstates( &tps, &nexttps, &nextPsTeleport );
 		curps = &tps->ps;
@@ -498,32 +545,6 @@ void CG_InterpolatePlayerState( qboolean grabAngles ) {
 		}
 		nextPsTeleport = cg.nextFrameTeleport;
 	}
-	if ( !nextps ) {
-		return;
-	}
-	if ( cg.demoPlayback != 2 && ( next->serverTime <= prev->serverTime ) ) {
-		return;
-	}
-#ifdef _DEBUG
-	if ( !( currentTime <= cg.time + (double) cg.timeFraction && nextTime >= cg.time + (double) cg.timeFraction ) ) {
-		Com_Printf( "WARNING: Couldn't locate slots with correct time\n" );
-	}
-	if ( nextTime - currentTime < 0 ) {
-		Com_Printf( "WARNING: nexttps->time - tps->time < 0 (%d, %d)\n", nextTime, currentTime );
-	}
-#endif
-	if ( currentTime != nextTime ) {
-		f = ( (double) cg.timeFraction + ( cg.time - currentTime ) ) / ( nextTime - currentTime );
-#ifdef _DEBUG
-		if ( f > 1 ) {
-			Com_Printf("EXTRAPOLATING (f=%f)\n", f );
-		} else if ( f < 0 ) {
-			Com_Printf("GOING BACKWARDS (f=%f)\n", f );
-		}
-#endif
-	} else {
-		f = 0;
-	}
 	*out = *curps;
 	if (cg.demoPlayback == 2)
 		out->stats[STAT_HEALTH] = cg.snap->ps.stats[STAT_HEALTH];
@@ -536,48 +557,174 @@ void CG_InterpolatePlayerState( qboolean grabAngles ) {
 
 		PM_UpdateViewAngles( out, &cmd );
 	}
-	// if the next frame is a teleport, we can't lerp to it
-	if ( nextPsTeleport ) {
+	if ( !nextps || nextPsTeleport || ( cg.demoPlayback != 2 && ( next->serverTime <= prev->serverTime ) ) ) {
+		if ( cg_commandSmooth.integer && cg.demoPlayback == 2 ) {
+			float curDeltaYaw = 0.0f;
+			vec3_t curSnapOrigin;
+			qboolean curCaughtFalling = qfalse;
+			int curMover = CG_ResolveEndpointMover( curps->origin, curps->velocity,
+				curps->groundEntityNum, currentServerTime, curSnapOrigin, &curCaughtFalling );
+			if ( curCaughtFalling ) {
+				const playerState_t *curLandedPs = CG_FindLandedPlayerStateOnMover(
+					cg.currentPsHistory, curMover, currentServerTime );
+				if ( !curLandedPs ) {
+					VectorCopy( curps->origin, curSnapOrigin );
+				} else {
+					CG_ApplyLandedAnimToPlayerState( out, curps, curLandedPs, curMover );
+				}
+			}
+			CG_AdjustEndpointForMover( curSnapOrigin, curMover,
+				currentServerTime, cg.time, cg.timeFraction, out->origin, &curDeltaYaw );
+			if ( !grabAngles && curDeltaYaw != 0.0f ) {
+				out->viewangles[YAW] = AngleNormalize360( out->viewangles[YAW] + curDeltaYaw );
+			}
+			curps->stats[STAT_HEALTH] = cg.snap->ps.stats[STAT_HEALTH];
+			BG_PlayerStateToEntityState( curps, &cg_entities[ curps->clientNum ].currentState, qfalse );
+			cg.playerInterpolation = 0.0f;
+			if ( cg.nextSnap && cg.timeFraction >= cg.nextSnap->serverTime - cg.time ) {
+				cg.physicsTime = cg.nextSnap->serverTime;
+			} else {
+				cg.physicsTime = cg.snap->serverTime;
+			}
+		}
 		return;
 	}
-	/*if ( !next || next->serverTime <= prev->serverTime ) {
-		return;
-	}*/
+	if ( currentTime != nextTime ) {
+		f = ( (double) cg.timeFraction + ( cg.time - currentTime ) ) / ( nextTime - currentTime );
+	} else {
+		f = 0;
+	}
 	i = nextps->bobCycle;
 	if ( i < curps->bobCycle ) {
 		i += 256;		// handle wraparound
 	}
 	out->bobCycle = curps->bobCycle + f * ( i - curps->bobCycle );
-	for ( i = 0 ; i < 3 ; i++ ) {
-		out->origin[i] = curps->origin[i] + f * ( nextps->origin[i] - curps->origin[i] );
-		if ( !grabAngles ) {
-			out->viewangles[i] = LerpAngle( 
-				curps->viewangles[i], nextps->viewangles[i], f );
+	if ( cg_commandSmooth.integer && cg.demoPlayback == 2 ) {
+		vec3_t curOrigin, nextOrigin, curSnapOrigin, nextSnapOrigin;
+		float curDeltaYaw = 0.0f, nextDeltaYaw = 0.0f;
+		qboolean curCaughtFalling = qfalse, nextCaughtFalling = qfalse;
+		const playerState_t *curLandedPs = NULL, *nextLandedPs = NULL;
+		int curMover = CG_ResolveEndpointMover( curps->origin, curps->velocity,
+			curps->groundEntityNum, currentServerTime, curSnapOrigin, &curCaughtFalling );
+		int nextMover = CG_ResolveEndpointMover( nextps->origin, nextps->velocity,
+			nextps->groundEntityNum, nextServerTime, nextSnapOrigin, &nextCaughtFalling );
+		qboolean customZVel = qfalse;
+
+		if ( curCaughtFalling ) {
+			curLandedPs = CG_FindLandedPlayerStateOnMover( cg.currentPsHistory, curMover, currentServerTime );
+			if ( !curLandedPs ) {
+				VectorCopy( curps->origin, curSnapOrigin );
+				curCaughtFalling = qfalse;
+			} else {
+				CG_ApplyLandedAnimToPlayerState( out, curps, curLandedPs, curMover );
+			}
 		}
-		out->velocity[i] = curps->velocity[i] + 
-			f * (nextps->velocity[i] - curps->velocity[i] );
+		if ( nextCaughtFalling ) {
+			nextLandedPs = CG_FindLandedPlayerStateOnMover( cg.currentPsHistory + 1, nextMover, nextServerTime );
+			if ( !nextLandedPs ) {
+				VectorCopy( nextps->origin, nextSnapOrigin );
+				nextCaughtFalling = qfalse;
+			}
+		}
+
+		if ( curMover == nextMover ) {
+			CG_AdjustEndpointForMover( curSnapOrigin, curMover,
+				currentServerTime, cg.time, cg.timeFraction, curOrigin, &curDeltaYaw );
+			CG_AdjustEndpointForMover( nextSnapOrigin, nextMover,
+				nextServerTime, cg.time, cg.timeFraction, nextOrigin, &nextDeltaYaw );
+			for ( i = 0 ; i < 3 ; i++ ) {
+				out->origin[i] = curOrigin[i] + f * ( nextOrigin[i] - curOrigin[i] );
+			}
+		} else if ( curMover == ENTITYNUM_NONE && nextMover != ENTITYNUM_NONE ) {
+			vec3_t nextNow, nextEnd, nextStart;
+			float dtTotal = ( nextTime - currentTime ) * 0.001f;
+			float grav = ( curps->gravity > 0 ) ? (float)curps->gravity : (float)DEFAULT_GRAVITY;
+			float zAirEnd = curSnapOrigin[2] + curps->velocity[2] * dtTotal - 0.5f * grav * dtTotal * dtTotal;
+			VectorCopy( curSnapOrigin, curOrigin );
+			CG_AdjustEndpointForMover( nextSnapOrigin, nextMover,
+				nextServerTime, cg.time, cg.timeFraction, nextNow, NULL );
+			CG_AdjustEndpointForMover( nextSnapOrigin, nextMover,
+				nextServerTime, nextTime, 0.0f, nextEnd, &nextDeltaYaw );
+			CG_AdjustEndpointForMover( nextSnapOrigin, nextMover,
+				nextServerTime, currentTime, 0.0f, nextStart, NULL );
+			out->origin[0] = curOrigin[0] + f * ( nextEnd[0] - curOrigin[0] );
+			out->origin[1] = curOrigin[1] + f * ( nextEnd[1] - curOrigin[1] );
+			if ( dtTotal > 0.0f && curOrigin[2] > nextStart[2] && zAirEnd <= nextEnd[2] ) {
+				float dt = (float)( ( (double)( cg.time - currentTime ) + (double)cg.timeFraction ) * 0.001 );
+				float zAir = curOrigin[2] + curps->velocity[2] * dt - 0.5f * grav * dt * dt;
+				const playerState_t *landedPs = ( nextps->groundEntityNum == nextMover ) ? nextps : nextLandedPs;
+				if ( zAir <= nextNow[2] ) {
+					out->origin[2] = nextNow[2];
+					out->velocity[2] = 0.0f;
+					customZVel = qtrue;
+					if ( landedPs ) {
+						CG_ApplyLandedAnimToPlayerState( out, curps, landedPs, nextMover );
+					}
+				} else {
+					float vMoverZ = ( nextEnd[2] - nextStart[2] ) / dtTotal;
+					float closingSpeed = vMoverZ - ( curps->velocity[2] - grav * dt );
+					float leadDist = Com_Clamp( 6.0f, 48.0f, closingSpeed * 0.045f );
+					out->origin[2] = zAir;
+					out->velocity[2] = curps->velocity[2] - grav * dt;
+					customZVel = qtrue;
+					if ( landedPs && ( zAir - nextNow[2] ) <= leadDist ) {
+						CG_ApplyLandedAnimToPlayerState( out, curps, landedPs, nextMover );
+					}
+				}
+			} else {
+				out->origin[2] = curOrigin[2] + f * ( nextEnd[2] - curOrigin[2] );
+			}
+		} else if ( curMover != ENTITYNUM_NONE && nextMover == ENTITYNUM_NONE ) {
+			CG_AdjustEndpointForMover( curSnapOrigin, curMover,
+				currentServerTime, currentTime, 0.0f, curOrigin, &curDeltaYaw );
+			VectorCopy( nextSnapOrigin, nextOrigin );
+			for ( i = 0 ; i < 3 ; i++ ) {
+				out->origin[i] = curOrigin[i] + f * ( nextOrigin[i] - curOrigin[i] );
+			}
+		} else {
+			CG_AdjustEndpointForMover( curSnapOrigin, curMover,
+				currentServerTime, currentTime, 0.0f, curOrigin, &curDeltaYaw );
+			CG_AdjustEndpointForMover( nextSnapOrigin, nextMover,
+				nextServerTime, nextTime, 0.0f, nextOrigin, &nextDeltaYaw );
+			for ( i = 0 ; i < 3 ; i++ ) {
+				out->origin[i] = curOrigin[i] + f * ( nextOrigin[i] - curOrigin[i] );
+			}
+		}
+
+		for ( i = 0 ; i < 3 ; i++ ) {
+			if ( !grabAngles ) {
+				float a0 = curps->viewangles[i];
+				float a1 = nextps->viewangles[i];
+				if ( i == YAW ) {
+					a0 = AngleNormalize360( a0 + curDeltaYaw );
+					a1 = AngleNormalize360( a1 + nextDeltaYaw );
+				}
+				out->viewangles[i] = LerpAngle( a0, a1, f );
+			}
+			if ( i != 2 || !customZVel ) {
+				out->velocity[i] = curps->velocity[i] +
+					f * ( nextps->velocity[i] - curps->velocity[i] );
+			}
+		}
+	} else {
+		for ( i = 0 ; i < 3 ; i++ ) {
+			out->origin[i] = curps->origin[i] + f * ( nextps->origin[i] - curps->origin[i] );
+			if ( !grabAngles ) {
+				out->viewangles[i] = LerpAngle( 
+					curps->viewangles[i], nextps->viewangles[i], f );
+			}
+			out->velocity[i] = curps->velocity[i] + 
+				f * (nextps->velocity[i] - curps->velocity[i] );
+		}
 	}
 	if (cg.demoPlayback != 2)
 		return;
-	// requires commandSmooth 2, since it needs entity state history of the mover
-	if (cg_commandSmooth.integer > 1 && cg.demoPlayback == 2) {
-		// adjust for the movement of the groundentity
-		// step 1: remove the delta introduced by cur->next origin interpolation
-		int curTime = currentServerTime + (int)(f * (nextServerTime - currentServerTime));
-		float curTimeFraction = (f * (nextServerTime - currentServerTime));
-		curTimeFraction -= (long)curTimeFraction;
-		CG_AdjustInterpolatedPositionForMover(out->origin,
-			curps->groundEntityNum, curTime, curTimeFraction, currentServerTime, 0, out->origin);
-		// step 2: mover state should now be what it was at currentServerTime, now redo calculation of mover effect to cg.time
-		CG_AdjustInterpolatedPositionForMover(out->origin,
-			curps->groundEntityNum, currentServerTime, 0, cg.time, cg.timeFraction, out->origin);
-	}
 
 	curps->stats[STAT_HEALTH] = cg.snap->ps.stats[STAT_HEALTH];
 	BG_PlayerStateToEntityState( curps, &cg_entities[ curps->clientNum ].currentState, qfalse );
 	BG_PlayerStateToEntityState( nextps, &cg_entities[ nextps->clientNum ].nextState, qfalse );
 	cg.playerInterpolation = f;
-	if ( cg.timeFraction >= cg.nextSnap->serverTime - cg.time ) {
+	if ( cg.nextSnap && cg.timeFraction >= cg.nextSnap->serverTime - cg.time ) {
 		cg.physicsTime = cg.nextSnap->serverTime;
 	} else {
 		cg.physicsTime = cg.snap->serverTime;

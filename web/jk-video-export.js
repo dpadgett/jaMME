@@ -5,7 +5,7 @@
     return;
   }
 
-  const ASSET_VERSION = '20261108a';
+  const ASSET_VERSION = '20261111a';
   const MIN_CLIP_MS = 500;
   const DEFAULT_PRE_MS = 10000;
   const DEFAULT_POST_MS = 5000;
@@ -1263,6 +1263,14 @@
         ? Number(player.getOverbright())
         : Number(st.overbright || 0);
     dialogOptions.lighting = 'current';
+
+    const musicOn =
+      typeof player.isMusicEnabled === 'function'
+        ? player.isMusicEnabled()
+        : st.musicEnabled !== false;
+    if (dialogOptions.audio !== 'off') {
+      dialogOptions.audio = musicOn ? 'on' : 'sfx';
+    }
   }
 
   function enterTrimMode(hostMode) {
@@ -1482,8 +1490,9 @@
               <div class="jk-exp-label-row">
                 <span class="jk-exp-label">Audio</span>
               </div>
-              <div class="jk-exp-seg" style="--seg-cols: 2;" role="group" aria-label="Audio export">
-                <button type="button" class="jk-exp-seg-btn" data-opt-group="audio" data-opt-val="on" aria-pressed="true"><span>Sound On</span></button>
+              <div class="jk-exp-seg" style="--seg-cols: 3;" role="group" aria-label="Audio export">
+                <button type="button" class="jk-exp-seg-btn" data-opt-group="audio" data-opt-val="on" aria-pressed="true"><span>All Sound</span></button>
+                <button type="button" class="jk-exp-seg-btn" data-opt-group="audio" data-opt-val="sfx" aria-pressed="false"><span>SFX Only</span></button>
                 <button type="button" class="jk-exp-seg-btn" data-opt-group="audio" data-opt-val="off" aria-pressed="false"><span>No Sound</span></button>
               </div>
             </div>
@@ -1804,6 +1813,7 @@
         quality: dialogOptions.quality,
         hud: dialogOptions.hud,
         audio: dialogOptions.audio !== 'off',
+        music: dialogOptions.audio === 'on',
         blurFrames: Number(dialogOptions.blur) || 0,
         thirdPerson: dialogOptions.camera === '3rd',
         speed: Number(dialogOptions.speed) || 1.0,

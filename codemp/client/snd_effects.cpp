@@ -229,7 +229,7 @@ void S_EffectUnderWater(mixEffect_t *effect, int speed, const int count, int *ou
 
 	const mixSound_t *sound;
 	int i, volume;
-	int index, indexAdd, indexTotal;
+	int64_t index, indexAdd, indexTotal;
 	const short *data;
 
 	if(ntaps <= 0)
@@ -248,6 +248,8 @@ void S_EffectUnderWater(mixEffect_t *effect, int speed, const int count, int *ou
 	/* the underwater echo sounds "data/underwater_loop" */
 	volume = s_volume->value * (1 << MIX_SHIFT) * 0.5f;
 	sound = S_MixGetSound(underWater);
+	if (!sound || sound->handle <= 0 || sound->samples <= 0)
+		return;
 
 	index = effect->index;
 	indexAdd = (sound->speed * speed) >> MIX_SHIFT;
@@ -255,7 +257,7 @@ void S_EffectUnderWater(mixEffect_t *effect, int speed, const int count, int *ou
 	data = sound->data;
 	for (i = 0; i < count; i++) {
 		int sample;
-		if (index >= indexTotal) {
+		while (index >= indexTotal) {
 			index -= indexTotal;
 		}
 		sample = data[index >> MIX_SHIFT];
@@ -263,7 +265,7 @@ void S_EffectUnderWater(mixEffect_t *effect, int speed, const int count, int *ou
 		output[i*2+1] += sample * volume;
 		index += indexAdd;
 	}
-	effect->index = index;
+	effect->index = (int)index;
 }
 
 void S_MixEffects(mixEffect_t *effect, int speed, const int count, int *output) {

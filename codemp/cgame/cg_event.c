@@ -1344,11 +1344,32 @@ static float CG_EventCoeff (int weapon, qboolean alt) {
 	return 0;
 }
 
-static void CG_GetEventStuff(const float coeff, const int time, const float radius) {
-	if ((radius < cg.eventRadius && cg.eventTime == time) || cg.eventRadius == 0 || cg.eventTime != time) {
+qboolean CG_IsExplosionOccluded( const vec3_t camOrigin, const vec3_t eventPos ) {
+	trace_t tr;
+	if ( VectorCompare( camOrigin, vec3_origin ) ) {
+		return qfalse;
+	}
+	CG_Trace( &tr, camOrigin, NULL, NULL, eventPos, ENTITYNUM_NONE, CONTENTS_SOLID );
+	if ( tr.fraction < 1.0f && Distance( tr.endpos, eventPos ) > 8.0f ) {
+		return qtrue;
+	}
+	return qfalse;
+}
+
+static void CG_GetEventStuff( const float coeff, const int time, const vec3_t position ) {
+	float radius;
+	if ( coeff <= 0.0f ) {
+		return;
+	}
+	if ( CG_IsExplosionOccluded( cg.refdef.vieworg, position ) ) {
+		return;
+	}
+	radius = Distance( position, cg.refdef.vieworg );
+	if ( ( radius < cg.eventRadius && cg.eventTime == time ) || cg.eventRadius == 0 || cg.eventTime != time ) {
 		cg.eventCoeff = coeff;
 		cg.eventTime = time;
 		cg.eventRadius = radius;
+		VectorCopy( position, cg.eventOrigin );
 	}
 }
 
@@ -2689,7 +2710,7 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 		else //secondary
 			FX_DisruptorAltMiss(cent->lerpOrigin, dir);
 
-		CG_GetEventStuff(CG_EventCoeff(WP_DISRUPTOR, qtrue), cg.time, Distance(position, cg.refdef.vieworg));
+		CG_GetEventStuff(CG_EventCoeff(WP_DISRUPTOR, qtrue), cg.time, position);
 		break;
 	case EV_DISRUPTOR_HIT:
 		{
@@ -2708,7 +2729,7 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 			else //non-client
 				FX_DisruptorHitWall(cent->lerpOrigin, dir);
 
-			CG_GetEventStuff(CG_EventCoeff(WP_DISRUPTOR, alt), cg.time, Distance(position, cg.refdef.vieworg));
+			CG_GetEventStuff(CG_EventCoeff(WP_DISRUPTOR, alt), cg.time, position);
 		}
 		break;
 	case EV_DISRUPTOR_ZOOMSOUND:
@@ -3107,7 +3128,7 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 			FX_DisruptorAltMiss(position, dir);
 		}
 
-		CG_GetEventStuff(CG_EventCoeff(WP_CONCUSSION, qtrue), cg.time, Distance(position, cg.refdef.vieworg));
+		CG_GetEventStuff(CG_EventCoeff(WP_CONCUSSION, qtrue), cg.time, position);
 		break;
 
 	case EV_MISSILE_STICK:
@@ -3144,7 +3165,7 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 				CG_G2MarkEvent(es);
 			}
 			if (es->weapon != 0) { //0 - putting detpack
-				CG_GetEventStuff(CG_EventCoeff(es->weapon, alt), cg.time, Distance(position, cg.refdef.vieworg));
+				CG_GetEventStuff(CG_EventCoeff(es->weapon, alt), cg.time, position);
 			}
 		}
 		break;
@@ -3178,7 +3199,7 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 				CG_G2MarkEvent(es);
 			}
 			if (es->weapon != 0) { //0 - putting detpack
-				CG_GetEventStuff(CG_EventCoeff(es->weapon, alt), cg.time, Distance(position, cg.refdef.vieworg));
+				CG_GetEventStuff(CG_EventCoeff(es->weapon, alt), cg.time, position);
 			}
 		}
 		break;
@@ -3206,7 +3227,7 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 				CG_MissileHitWall(es->weapon, 0, position, dir, IMPACTSOUND_METAL, qfalse, 0);
 			}
 			if (es->weapon != 0) { //0 - putting detpack
-				CG_GetEventStuff(CG_EventCoeff(es->weapon, alt), cg.time, Distance(position, cg.refdef.vieworg));
+				CG_GetEventStuff(CG_EventCoeff(es->weapon, alt), cg.time, position);
 			}
 		}
 		break;
@@ -3233,11 +3254,11 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 				break;
 			case EFFECT_EXPLOSION_DETPACK:
 				eID = cgs.effects.mDetpackExplosion;
-				CG_GetEventStuff(CG_EventCoeff(WP_DET_PACK, qtrue), cg.time, Distance(position, cg.refdef.vieworg));
+				CG_GetEventStuff(CG_EventCoeff(WP_DET_PACK, qtrue), cg.time, position);
 				break;
 			case EFFECT_EXPLOSION_FLECHETTE:
 				eID = cgs.effects.mFlechetteAltBlow;
-				CG_GetEventStuff(CG_EventCoeff(WP_FLECHETTE, qtrue), cg.time, Distance(position, cg.refdef.vieworg));
+				CG_GetEventStuff(CG_EventCoeff(WP_FLECHETTE, qtrue), cg.time, position);
 				break;
 			case EFFECT_STUNHIT:
 				eID = cgs.effects.mStunBatonFleshImpact;

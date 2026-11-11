@@ -49,6 +49,8 @@ typedef struct {
 } demoConvert_t;
 
 #define FRAME_BUF_SIZE 20
+#define DEMO_SMOOTH_LOOKAHEAD_MS 250
+#define DEMO_SMOOTH_MAX_AHEAD_FRAMES 8
 typedef struct {
 	fileHandle_t		fileHandle;
 	char				fileName[MAX_QPATH];
@@ -56,8 +58,11 @@ typedef struct {
 	int					totalFrames;
 	int					startTime, endTime;			//serverTime from first snapshot 
 	int					seekTime;
+	int					lastSeekTime;
 	qboolean			lastFrame;
 	int					frameNumber;
+	int					earliestFrame;
+	int					baseFrame;
 
 	char				commandData[DEMO_PLAY_CMDS*1024];
 	int					commandFree;

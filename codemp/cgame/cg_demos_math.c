@@ -731,10 +731,9 @@ void demoTrajectory( const trajectory_t *tr, int time, float timeFraction, vec3_
 		VectorMA( tr->trBase, phase, tr->trDelta, result );
 		break;
 	case TR_LINEAR_STOP:
-		if ( time > tr->trTime + tr->trDuration ) {
-			deltaTime = tr->trDuration * 0.001;
-		} else {
-			deltaTime = ( time - tr->trTime ) * 0.001 + timeFraction * 0.001;
+		deltaTime = ( time - tr->trTime ) * 0.001f + timeFraction * 0.001f;
+		if ( deltaTime > tr->trDuration * 0.001f ) {
+			deltaTime = tr->trDuration * 0.001f;
 		}
 		if ( deltaTime < 0 ) {
 			deltaTime = 0;
@@ -742,14 +741,13 @@ void demoTrajectory( const trajectory_t *tr, int time, float timeFraction, vec3_
 		VectorMA( tr->trBase, deltaTime, tr->trDelta, result );
 		break;
 	case TR_NONLINEAR_STOP:
-		if ( timeFraction > tr->trTime + tr->trDuration - time ) {
+		deltaTime = ( time - tr->trTime ) + timeFraction;
+		if ( deltaTime > (float)tr->trDuration ) {
 			deltaTime = (float)tr->trDuration;
-		} else {
-			deltaTime = ( time - tr->trTime ) + timeFraction;
 		}
 		//new slow-down at end
-		if ( deltaTime > tr->trDuration || deltaTime <= 0 ) {
-			deltaTime = 0;
+		if ( deltaTime <= 0.0f || tr->trDuration <= 0 ) {
+			deltaTime = 0.0f;
 		} else {//FIXME: maybe scale this somehow?  So that it starts out faster and stops faster?
 			deltaTime = tr->trDuration*0.001f*((float)cos( DEG2RAD(90.0f - (90.0f*(deltaTime)/(float)tr->trDuration)) ));
 		}

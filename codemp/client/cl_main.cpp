@@ -37,6 +37,7 @@ static char		g_jkLastDemoName[MAX_OSPATH] = "";
 static char		g_jkLastMapName[MAX_QPATH] = "";
 static float	g_jkSavedVolume = 0.8f;
 static qboolean	g_jkIsMuted = qfalse;
+static qboolean	g_jkMusicEnabled = qtrue;
 static float	s_jkPlaybackSpeed = 1.0f;
 int				g_jkActiveRenderedFrames = 0;
 int				s_jkDemoStartTimeMs = 0;
@@ -4462,7 +4463,7 @@ EMSCRIPTEN_KEEPALIVE int JK_DemoSetMuted( int muted ) {
 		Cvar_SetValue( "s_volumeVoice", 0.0f );
 	} else {
 		Cvar_SetValue( "s_volume", g_jkSavedVolume );
-		Cvar_SetValue( "s_musicVolume", g_jkSavedVolume * 0.5f );
+		Cvar_SetValue( "s_musicVolume", g_jkMusicEnabled ? ( g_jkSavedVolume * 0.5f ) : 0.0f );
 		Cvar_SetValue( "s_volumeVoice", 1.0f );
 	}
 	return g_jkIsMuted ? 1 : 0;
@@ -4480,6 +4481,20 @@ EMSCRIPTEN_KEEPALIVE int JK_DemoIsMuted( void ) {
 	return g_jkIsMuted ? 1 : 0;
 }
 
+EMSCRIPTEN_KEEPALIVE int JK_DemoSetMusicEnabled( int enabled ) {
+	g_jkMusicEnabled = enabled ? qtrue : qfalse;
+	if ( g_jkIsMuted || !g_jkMusicEnabled ) {
+		Cvar_SetValue( "s_musicVolume", 0.0f );
+	} else {
+		Cvar_SetValue( "s_musicVolume", g_jkSavedVolume * 0.5f );
+	}
+	return g_jkMusicEnabled ? 1 : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int JK_DemoIsMusicEnabled( void ) {
+	return g_jkMusicEnabled ? 1 : 0;
+}
+
 EMSCRIPTEN_KEEPALIVE float JK_DemoSetVolume( float level ) {
 	if ( !(level == level) ) {
 		return g_jkSavedVolume;
@@ -4489,7 +4504,7 @@ EMSCRIPTEN_KEEPALIVE float JK_DemoSetVolume( float level ) {
 	g_jkSavedVolume = level;
 	if ( !g_jkIsMuted ) {
 		Cvar_SetValue( "s_volume", g_jkSavedVolume );
-		Cvar_SetValue( "s_musicVolume", g_jkSavedVolume * 0.5f );
+		Cvar_SetValue( "s_musicVolume", g_jkMusicEnabled ? ( g_jkSavedVolume * 0.5f ) : 0.0f );
 	}
 	return g_jkSavedVolume;
 }

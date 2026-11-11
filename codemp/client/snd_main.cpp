@@ -32,6 +32,7 @@ sfxEntry_t	*sfxHash[SFX_HASH];
 int			sfxEntryCount;
 
 backgroundSound_t s_background;
+int				s_backgroundReloadSeq = 1;
 channelQueue_t	s_channelQueue[MAX_SNDQUEUE];
 int				s_channelQueueCount;
 entitySound_t	s_entitySounds[MAX_GENTITIES];
@@ -591,23 +592,6 @@ void S_Update( void ) {
 
 	s_channelQueueCount = 0;
 	s_loopQueueCount = 0;
-	if ( s_background.override || (s_musicVolume && s_musicVolume->value > 0.0f) ) {
-#ifdef __EMSCRIPTEN__
-		qboolean bgCached = qtrue;
-		if ( s_background.playing ) {
-			if ( s_background.startName[0] && !FS_WasmIsFileCached( s_background.startName ) ) {
-				bgCached = qfalse;
-			} else if ( !s_background.override && s_background.loopName[0] && !FS_WasmIsFileCached( s_background.loopName ) ) {
-				bgCached = qfalse;
-			}
-		}
-		if ( bgCached ) {
-			s_background.reload = qfalse;
-		}
-#else
-		s_background.reload = qfalse;
-#endif
-	}
 	s_underWater = qfalse;
 }
 
@@ -667,10 +651,6 @@ background music functions
 */
 void S_StartBackgroundTrack( const char *intro, const char *loop, int bCalledByCGameStart ) {
 	qboolean soundExists;
-#ifdef __EMSCRIPTEN__
-	if ( !s_musicVolume || s_musicVolume->value <= 0.0f )
-		return;
-#endif
 	if ( !intro || !intro[0] || s_background.override )
 		return;
 	if ( !loop || !loop[0] ) 
@@ -686,6 +666,7 @@ void S_StartBackgroundTrack( const char *intro, const char *loop, int bCalledByC
 	if (soundExists) {
 		s_background.playing = qtrue;
 		s_background.reload = qtrue;
+		s_backgroundReloadSeq++;
 	}
 }
 

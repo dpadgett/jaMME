@@ -110,7 +110,11 @@ static void CG_DemosUpdatePlayer( void ) {
 #define EFFECT_LENGTH 400.0f //msec
 
 static void VibrateView(const float range, const int eventTime, const int eventOldTime, const float fxTime, const float wc, float scale, vec3_t origin, vec3_t angles) {
-	float shadingTime;
+	static const vec3_t camMins = { -4.0f, -4.0f, -4.0f };
+	static const vec3_t camMaxs = { 4.0f, 4.0f, 4.0f };
+	float shadingTime, phaseTime;
+	vec3_t targetOrigin;
+	trace_t tr;
 	int sign;
 	if (range > 1 || range < 0) {
 		return;
@@ -125,9 +129,17 @@ static void VibrateView(const float range, const int eventTime, const int eventO
 		shadingTime = -(float)EFFECT_LENGTH / 1000.0f;
 	else if (shadingTime > 0)
 		shadingTime = 0;
+	phaseTime = Com_Clamp(0.0f, (float)EFFECT_LENGTH, fxTime) / 1000.0f;
 	sign = fxRandomSign(eventTime);
-	origin[2] += shadingTime * shadingTime * sinf(shadingTime * M_PI * 23.0f) * scale;
-	angles[ROLL] += shadingTime * shadingTime * sinf(shadingTime * M_PI * 1.642f) * scale * 0.7f * sign;
+	VectorCopy(origin, targetOrigin);
+	targetOrigin[2] += shadingTime * shadingTime * sinf(phaseTime * M_PI * 22.5f) * scale;
+	CG_Trace(&tr, origin, camMins, camMaxs, targetOrigin,
+		cg.playerCent ? cg.playerCent->currentState.number : ENTITYNUM_NONE,
+		(MASK_SOLID|CONTENTS_PLAYERCLIP));
+	if (!tr.startsolid) {
+		VectorCopy(tr.endpos, origin);
+	}
+	angles[ROLL] += shadingTime * shadingTime * sinf(phaseTime * M_PI * 2.5f) * scale * 0.7f * sign;
 }
 
 void FX_VibrateView(const float scale, vec3_t origin, vec3_t angles) {
@@ -140,14 +152,20 @@ void FX_VibrateView(const float scale, vec3_t origin, vec3_t angles) {
 		cg.eventRadius = cg.eventOldRadius;
 		cg.eventTime = cg.eventOldTime;
 		cg.eventCoeff = cg.eventOldCoeff;
+		VectorCopy(cg.eventOldOrigin, cg.eventOrigin);
 	}
 	if ((cg.time >= cg.eventTime) && (cg.time < (cg.eventTime + EFFECT_LENGTH))) {
-		float fxTime = (cg.time - cg.eventTime) + cg.timeFraction;
+		float fxTime;
+		if (CG_IsExplosionOccluded(origin, cg.eventOrigin)) {
+			return;
+		}
+		fxTime = (cg.time - cg.eventTime) + cg.timeFraction;
 		range = 1.0f - (cg.eventRadius / RADIUS_LIMIT);
 		VibrateView(range, cg.eventTime, cg.eventOldTime, fxTime, cg.eventCoeff, scale, origin, angles);
 		cg.eventOldRadius = cg.eventRadius;
 		cg.eventOldTime = cg.eventTime;
 		cg.eventOldCoeff = cg.eventCoeff;
+		VectorCopy(cg.eventOrigin, cg.eventOldOrigin);
 	}
 }
 
@@ -358,10 +376,7 @@ int demoSetupView( void) {
 
 extern snapshot_t *CG_ReadNextSnapshot( void );
 extern void CG_SetNextSnap( snapshot_t *snap );
-extern void CG_SetNextNextSnap( snapshot_t *snap );
 extern void CG_TransitionSnapshot( void );
-extern void CG_AddToHistory( int serverTime, entityState_t *state, centity_t *cent );
-extern void CG_UpdateTps( snapshot_t *snap, qboolean isTeleport );
 
 void demoProcessSnapShots( qboolean hadSkip ) {
 	int i;
@@ -370,14 +385,14 @@ void demoProcessSnapShots( qboolean hadSkip ) {
 	// see what the latest snapshot the client system has is
 	trap_GetCurrentSnapshotNumber( &cg.latestSnapshotNum, &cg.latestSnapshotTime );
 	if (hadSkip || !cg.snap) {
-		cgs.processedSnapshotNum = Q_max(cg.latestSnapshotNum - 3, -1);
+		cgs.processedSnapshotNum = Q_max(cg.latestSnapshotNum - 24, -1);
 		if (cg.nextSnap)
 			cgs.serverCommandSequence = cg.nextSnap->serverCommandSequence;
 		else if (cg.snap)
 			cgs.serverCommandSequence = cg.snap->serverCommandSequence;
 		cg.snap = 0;
 		cg.nextSnap = 0;
-		cg.nextNextSnap = 0;
+		CG_ResetCommandSmoothHistory();
 
 		for (i=-1;i<MAX_GENTITIES;i++) {
 			centity_t *cent = i < 0 ? &cg_entities[cg.predictedPlayerState.clientNum] : &cg_entities[i];
@@ -398,7 +413,6 @@ void demoProcessSnapShots( qboolean hadSkip ) {
 
 	/* Check if we have some transition between snapsnots */
 	if (!cg.snap) {
-		entityState_t pes;
 		snap = CG_ReadNextSnapshot();
 		if (!snap)
 			return;
@@ -416,16 +430,13 @@ void demoProcessSnapShots( qboolean hadSkip ) {
 		BG_PlayerStateToEntityState( &snap->ps, &cg_entities[ snap->ps.clientNum ].currentState, qfalse );
 		CG_BuildSolidList();
 		CG_ExecuteNewServerCommands( snap->serverCommandSequence );
-		CG_UpdateTps( snap, qtrue );
-		BG_PlayerStateToEntityStateExtraPolate( &snap->ps, &pes, snap->ps.commandTime, qfalse );
-		CG_AddToHistory( snap->serverTime, &pes, &cg_entities[snap->ps.clientNum] );
+		CG_RecordSnapshotHistory( NULL, snap );
 		for ( i = 0; i < cg.snap->numEntities; i++ ) {
 			entityState_t *state = &cg.snap->entities[ i ];
 			centity_t *cent = &cg_entities[ state->number ];
 			memcpy(&cent->currentState, state, sizeof(entityState_t));
 			cent->interpolate = qfalse;
 			cent->currentValid = qtrue;
-			CG_AddToHistory( snap->serverTime, state, cent );
 			if ( ( cent->currentState.eType == ET_NPC )
 				&& !(cent->currentState.NPC_class == CLASS_VEHICLE
 				&& cent->m_pVehicle && cent->m_pVehicle->m_pVehicleInfo->type == VH_FIGHTER
@@ -463,13 +474,13 @@ skipNPC:
 				break;
 			CG_SetNextSnap( snap );
 		}
-		if ( !cg.nextNextSnap ) {
+		while ( cg.numFutureSnaps < MAX_SMOOTH_LOOKAHEAD_SNAPS ) {
 			snap = CG_ReadNextSnapshot();
 			if ( !snap )
 				break;
-			CG_SetNextNextSnap( snap );
+			CG_PushFutureSnap( snap );
 		}
-		if ( cg.timeFraction >= cg.snap->serverTime - cg.time && cg.timeFraction < cg.nextSnap->serverTime - cg.time )
+		if ( (double)( cg.time - cg.nextSnap->serverTime ) + (double)cg.timeFraction < 0.0 )
 			break;
 		//Todo our own transition checking if we wanna hear certain sounds
 		CG_TransitionSnapshot();
@@ -716,6 +727,12 @@ void CG_DemosDrawActiveFrame( int serverTime, stereoFrame_t stereoView ) {
 		cg.eventRadius = cg.eventOldRadius = 0;
 		cg.eventTime = cg.eventOldTime = 0;
 		cg.eventCoeff = cg.eventOldCoeff = 0;
+		VectorClear(cg.eventOrigin);
+		VectorClear(cg.eventOldOrigin);
+		{
+			extern int cameraLastFrame;
+			cameraLastFrame = 0;
+		}
 
 		cg.centerPrintTime = 0;
         cg.damageTime = 0;
@@ -762,7 +779,9 @@ void CG_DemosDrawActiveFrame( int serverTime, stereoFrame_t stereoView ) {
 		}
 		CG_LoadDeferredPlayers();
 	} else if (cg.frametime > 100) {
+		extern int cameraLastFrame;
 		hadSkip = qtrue;
+		cameraLastFrame = 0;
 		CG_LoadDeferredPlayers();
 	} else {
 		hadSkip = qfalse;

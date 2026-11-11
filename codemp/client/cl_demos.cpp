@@ -1085,9 +1085,9 @@ static void demoPlayForwardFrame( demoPlay_t *play ) {
 		return;
 	}
 	if (play->filePos + 4 > play->fileSize) {
-		if (demo.commandSmoothing && play->frameNumber == -1) {
+		if (demo.commandSmoothing && play->frameNumber == play->earliestFrame - 1) {
 			play->frame = play->nextFrame;
-			play->frameNumber = 0;
+			play->frameNumber = play->earliestFrame;
 		}
 		if (mme_demoAutoNext->integer && demo.nextNum && !demo.precaching) {
 			CL_Disconnect_f();
@@ -1203,8 +1203,11 @@ static void demoPlaySetIndex( demoPlay_t *play, int index ) {
 #endif
 #endif
 
-	if (demo.commandSmoothing)
+	if (demo.commandSmoothing) {
+		play->earliestFrame = play->fileIndex[index].frame;
+		play->baseFrame = play->fileIndex[index].frame;
 		play->frameNumber = play->fileIndex[index].frame - 2;
+	}
 
 	demoPlayForwardFrame( play );
 	demoPlayForwardFrame( play );
@@ -1214,17 +1217,54 @@ static void demoPlaySetIndex( demoPlay_t *play, int index ) {
 }
 static int demoPlaySeek(demoPlay_t *play, int seekTime) {
 	int i;
-	int curFrameTime;
 	if (!play || play->fileIndexCount <= 0 || !play->frame || !play->nextFrame)
 		return 0;
 	play->seekTime = seekTime;
 	seekTime += play->startTime;
 	if (seekTime < 0)
 		seekTime = 0;
-	curFrameTime = (demo.commandSmoothing && play->frameNumber > 0)
-		? play->storageFrame[(play->frameNumber - 1 + FRAME_BUF_SIZE) % FRAME_BUF_SIZE].serverTime
-		: play->frame->serverTime;
-	if (seekTime < curFrameTime || (seekTime > curFrameTime + 1000)) {
+	if (demo.commandSmoothing) {
+		int maxValidFrame = play->frameNumber + (play->lastFrame ? 0 : 1);
+		int minValidFrame = Q_max(play->earliestFrame, maxValidFrame - FRAME_BUF_SIZE + 2);
+		int minValidTime = play->storageFrame[((minValidFrame % FRAME_BUF_SIZE) + FRAME_BUF_SIZE) % FRAME_BUF_SIZE].serverTime;
+		int maxValidTime = play->storageFrame[((maxValidFrame % FRAME_BUF_SIZE) + FRAME_BUF_SIZE) % FRAME_BUF_SIZE].serverTime;
+		if (seekTime < minValidTime || seekTime > maxValidTime + 1000) {
+			for (i=0;i<(play->fileIndexCount-1);i++) {
+				if (play->fileIndex[i].time <= seekTime && 
+					play->fileIndex[i+1].time > seekTime)
+					goto foundit_smooth;
+			}
+			i = play->fileIndexCount-1;
+foundit_smooth:
+			demoPlaySetIndex(play, i);
+			maxValidFrame = play->frameNumber + (play->lastFrame ? 0 : 1);
+			minValidFrame = Q_max(play->earliestFrame, maxValidFrame - FRAME_BUF_SIZE + 2);
+		}
+		if (play->baseFrame < minValidFrame)
+			play->baseFrame = minValidFrame;
+		if (play->baseFrame > maxValidFrame)
+			play->baseFrame = maxValidFrame;
+		while (play->baseFrame > minValidFrame &&
+			play->storageFrame[((play->baseFrame % FRAME_BUF_SIZE) + FRAME_BUF_SIZE) % FRAME_BUF_SIZE].serverTime > seekTime) {
+			play->baseFrame--;
+		}
+		while (!play->lastFrame && play->nextFrame->serverTime <= seekTime) {
+			demoPlayForwardFrame(play);
+		}
+		maxValidFrame = play->frameNumber + (play->lastFrame ? 0 : 1);
+		while (play->baseFrame < maxValidFrame &&
+			play->storageFrame[(((play->baseFrame + 1) % FRAME_BUF_SIZE) + FRAME_BUF_SIZE) % FRAME_BUF_SIZE].serverTime <= seekTime) {
+			play->baseFrame++;
+		}
+		while (!play->lastFrame &&
+			play->nextFrame->serverTime <= seekTime + DEMO_SMOOTH_LOOKAHEAD_MS &&
+			(play->frameNumber + 1 - play->baseFrame) < DEMO_SMOOTH_MAX_AHEAD_FRAMES) {
+			demoPlayForwardFrame(play);
+		}
+		play->lastSeekTime = seekTime;
+		return seekTime;
+	}
+	if (seekTime < play->frame->serverTime || (seekTime > play->frame->serverTime + 1000)) {
 		for (i=0;i<(play->fileIndexCount-1);i++) {
 			if (play->fileIndex[i].time <= seekTime && 
 				play->fileIndex[i+1].time > seekTime)
@@ -1234,9 +1274,10 @@ static int demoPlaySeek(demoPlay_t *play, int seekTime) {
 foundit:
 		demoPlaySetIndex(play, i);
 	}
-	while (!play->lastFrame && (demo.commandSmoothing ? (seekTime >= play->frame->serverTime) : (seekTime > play->nextFrame->serverTime))) {
+	while (!play->lastFrame && seekTime > play->nextFrame->serverTime) {
 		demoPlayForwardFrame(play);
 	}
+	play->lastSeekTime = seekTime;
 	return seekTime;
 }
 int demoLength(void) {
@@ -1364,7 +1405,7 @@ static demoPlay_t *demoPlayOpen( const char* fileName ) {
 	play->commandFree = DEMO_PLAY_CMDS;
 
 	if ( s_cachedMmeIndex.valid
-		&& ( s_mmeStreamActive || !Q_stricmp( s_cachedMmeIndex.fileName, fileName ) )
+		&& ( demoIsMmeStreamActive() || !Q_stricmp( s_cachedMmeIndex.fileName, fileName ) )
 		&& s_cachedMmeIndex.fileSize == fileSize
 		&& s_cachedMmeIndex.totalFrames > 0 ) {
 		play->startTime = s_cachedMmeIndex.startTime;
@@ -1538,8 +1579,11 @@ qboolean demoGetSnapshot( int snapNumber, snapshot_t *snap ) {
 
 	if ( !play || !snap )
 		return qfalse;
-	if (demo.commandSmoothing && snapNumber < play->frameNumber - FRAME_BUF_SIZE + 2)
-		return qfalse;
+	if (demo.commandSmoothing) {
+		int minSnap = Q_max(play->earliestFrame, Q_max(play->baseFrame - 1, play->frameNumber - FRAME_BUF_SIZE + 2));
+		if (snapNumber < minSnap)
+			return qfalse;
+	}
 	if (!demo.commandSmoothing && snapNumber < play->frameNumber)
 		return qfalse;
 	if (snapNumber > play->frameNumber + 1)

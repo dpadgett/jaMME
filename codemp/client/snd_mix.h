@@ -43,7 +43,10 @@ typedef struct {
 	int				length;
 	int				done;
 	short			last[2];
+	int				reloadSeq;
 } mixBackground_t;
+
+extern	int				s_backgroundReloadSeq;
 
 typedef struct {
 	int				statel, stater;

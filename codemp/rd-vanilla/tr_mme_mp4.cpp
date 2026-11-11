@@ -1607,6 +1607,15 @@ void mp4Close(mmeMp4File_t *mp4File) {
 	if (!mp4File || !mp4File->session)
 		return;
 	Mp4Session *s = (Mp4Session *)mp4File->session;
+#ifdef __EMSCRIPTEN__
+	if (s->audioEnabled && s->aacReady && ri.S_MMEAviImport) {
+		byte tailSound[MME_SAMPLERATE] = {0};
+		int tailSize = 0;
+		if (ri.S_MMEAviImport(tailSound, &tailSize) && tailSize > 0) {
+			mmeMp4Sound(mp4File, tailSound, tailSize);
+		}
+	}
+#endif
 	mp4File->session = NULL;
 	mp4File->f = 0;
 	mp4File->pipe = qfalse;

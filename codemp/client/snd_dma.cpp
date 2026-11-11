@@ -9,6 +9,9 @@ dma_t		dma;
 
 extern "C" {
 long long g_jkAudioSamplesMixed = 0;
+#ifdef __EMSCRIPTEN__
+int wasm_js_is_headless_audio( void );
+#endif
 }
 
 static mixBackground_t	dmaBackground;
@@ -174,7 +177,15 @@ void S_DMA_Update( float scale ) {
 	/* Mix sound or fill with silence depending on speed */
 	if (speed > 0) {
 		/* mix the background track or init the buffer with silence */
-		S_MixBackground(&dmaBackground, speed, count, buf);
+#ifdef __EMSCRIPTEN__
+		if (wasm_js_is_headless_audio()) {
+			Com_Memset(buf, 0, sizeof(buf[0]) * count * 2);
+		} else {
+			S_MixBackground(&dmaBackground, (MIX_SPEED << MIX_SHIFT) / (dma.speed > 0 ? dma.speed : MIX_SPEED), count, buf);
+		}
+#else
+		S_MixBackground(&dmaBackground, (MIX_SPEED << MIX_SHIFT) / (dma.speed > 0 ? dma.speed : MIX_SPEED), count, buf);
+#endif
 		S_MixChannels(dmaChannels, DMA_SNDCHANNELS, speed, count, buf);
 		S_MixLoops(dmaLoops, DMA_LOOPCHANNELS, speed, count, buf);
 		S_MixEffects(&dmaEffect, speed, count, buf);

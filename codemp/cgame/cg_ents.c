@@ -3142,13 +3142,16 @@ void CG_AdjustPositionForMover( const vec3_t in, int moverNum, int fromTime, int
 		return;
 	}
 
-	BG_EvaluateTrajectory( &cent->currentState.pos, fromTime, oldOrigin );
-	BG_EvaluateTrajectory( &cent->currentState.apos, fromTime, oldAngles );
-
-	if (toTime == cg.time && cg.demoPlayback == 2) {
-		demoNowTrajectory( &cent->currentState.pos, origin );
-		demoNowTrajectory( &cent->currentState.apos, angles );
+	if ( cg.demoPlayback == 2 ) {
+		CG_EvaluateMoverPosition( cent, fromTime, 0.0f, oldOrigin, oldAngles );
+		if ( toTime == cg.time ) {
+			CG_EvaluateMoverPosition( cent, cg.time, cg.timeFraction, origin, angles );
+		} else {
+			CG_EvaluateMoverPosition( cent, toTime, 0.0f, origin, angles );
+		}
 	} else {
+		BG_EvaluateTrajectory( &cent->currentState.pos, fromTime, oldOrigin );
+		BG_EvaluateTrajectory( &cent->currentState.apos, fromTime, oldAngles );
 		BG_EvaluateTrajectory( &cent->currentState.pos, toTime, origin );
 		BG_EvaluateTrajectory( &cent->currentState.apos, toTime, angles );
 	}
@@ -3161,56 +3164,445 @@ void CG_AdjustPositionForMover( const vec3_t in, int moverNum, int fromTime, int
 	// FIXME: origin change when on a rotating object
 }
 
-// Version of the above that can work with arbitrary times and timeFractions
-void CG_AdjustInterpolatedPositionForMover( const vec3_t in, int moverNum, int fromTime, float fromTimeFraction, int toTime, float toTimeFraction, vec3_t out ) {
-	centity_t	*cent;
-	vec3_t	oldOrigin, origin, deltaOrigin;
-	vec3_t	oldAngles, angles, deltaAngles;
-	timedEntityState_t *tes;
-	int i;
+static void CG_ApplyMoverDelta(
+	const vec3_t inOrigin,
+	const vec3_t oldMoverOrigin, const vec3_t oldMoverAngles,
+	const vec3_t newMoverOrigin, const vec3_t newMoverAngles,
+	vec3_t outOrigin, float *outDeltaYaw )
+{
+	vec3_t deltaOrigin, deltaAngles;
+	VectorSubtract( newMoverOrigin, oldMoverOrigin, deltaOrigin );
+	VectorSubtract( newMoverAngles, oldMoverAngles, deltaAngles );
+	if ( outDeltaYaw ) {
+		*outDeltaYaw = deltaAngles[YAW];
+	}
+	if ( deltaAngles[0] == 0.0f && deltaAngles[1] == 0.0f && deltaAngles[2] == 0.0f ) {
+		VectorAdd( inOrigin, deltaOrigin, outOrigin );
+	} else {
+		vec3_t matrix[3], transpose[3], rel, rotated;
+		int i, j;
+		AngleVectors( deltaAngles, transpose[0], transpose[1], transpose[2] );
+		VectorInverse( transpose[1] );
+		for ( i = 0; i < 3; i++ ) {
+			for ( j = 0; j < 3; j++ ) {
+				matrix[i][j] = transpose[j][i];
+			}
+		}
+		VectorSubtract( inOrigin, oldMoverOrigin, rel );
+		rotated[0] = DotProduct( rel, matrix[0] );
+		rotated[1] = DotProduct( rel, matrix[1] );
+		rotated[2] = DotProduct( rel, matrix[2] );
+		VectorAdd( newMoverOrigin, rotated, outOrigin );
+	}
+}
 
+static const entityState_t *CG_FindMoverHistoryState( centity_t *cent, int time, float timeFraction, qboolean allowNextStart ) {
+	int startSlot, i;
+	const entityState_t *firstMoverEs = NULL;
+	const entityState_t *matchedEs = NULL;
+	double queryTime = (double)time + (double)timeFraction;
+
+	startSlot = cent->stateHistory.nextSlot - MAX_STATE_HISTORY;
+	if ( startSlot < 0 ) {
+		startSlot = 0;
+	}
+	for ( i = startSlot; i < cent->stateHistory.nextSlot; i++ ) {
+		timedEntityState_t *tes = &cent->stateHistory.states[i % MAX_STATE_HISTORY];
+		timedEntityState_t *next = ( i + 1 < cent->stateHistory.nextSlot )
+			? &cent->stateHistory.states[( i + 1 ) % MAX_STATE_HISTORY]
+			: NULL;
+		if ( tes->es.eType != ET_MOVER ) {
+			continue;
+		}
+		if ( !firstMoverEs ) {
+			firstMoverEs = &tes->es;
+		}
+		if ( (double)tes->serverTime <= queryTime && ( next == NULL || (double)next->serverTime > queryTime ) ) {
+			matchedEs = &tes->es;
+			if ( allowNextStart && next != NULL && next->es.eType == ET_MOVER &&
+				tes->es.pos.trType == TR_STATIONARY && next->es.pos.trType != TR_STATIONARY &&
+				VectorCompare( tes->es.pos.trBase, next->es.pos.trBase ) &&
+				queryTime >= (double)next->es.pos.trTime ) {
+				matchedEs = &next->es;
+			}
+		}
+	}
+	if ( matchedEs ) {
+		return matchedEs;
+	}
+	if ( firstMoverEs ) {
+		return firstMoverEs;
+	}
+	if ( cent->currentValid && cent->currentState.eType == ET_MOVER ) {
+		return &cent->currentState;
+	}
+	return NULL;
+}
+
+static qboolean CG_AnglesClose( const vec3_t a, const vec3_t b, float maxDiff ) {
+	return ( fabs( AngleSubtract( a[0], b[0] ) ) <= maxDiff &&
+		fabs( AngleSubtract( a[1], b[1] ) ) <= maxDiff &&
+		fabs( AngleSubtract( a[2], b[2] ) ) <= maxDiff ) ? qtrue : qfalse;
+}
+
+static void CG_GetMoverHistorySlotPose( centity_t *cent, int startSlot, int slot, vec3_t outOrigin, vec3_t outAngles ) {
+	timedEntityState_t *tes = &cent->stateHistory.states[slot % MAX_STATE_HISTORY];
+	demoTrajectory( &tes->es.pos, tes->serverTime, 0.0f, outOrigin );
+	demoTrajectory( &tes->es.apos, tes->serverTime, 0.0f, outAngles );
+
+	// Detect 1-snapshot Use_BinaryMover_Go blocked-reversal spike:
+	// When a blocked mover reverses before G_RunMover increments trTime, SetMoverState
+	// computes partial = level.time - trTime (one tick too large) and shifts currentOrigin
+	// into the obstacle without G_MoverPush, returning to prevPos on the next tick.
+	if ( slot >= startSlot + 2 ) {
+		timedEntityState_t *prev = &cent->stateHistory.states[( slot - 1 ) % MAX_STATE_HISTORY];
+		timedEntityState_t *prevPrev = &cent->stateHistory.states[( slot - 2 ) % MAX_STATE_HISTORY];
+		if ( tes->es.eType == ET_MOVER && prev->es.eType == ET_MOVER && prevPrev->es.eType == ET_MOVER &&
+			prev->snapSeq + 1 == tes->snapSeq && prevPrev->snapSeq + 1 == prev->snapSeq &&
+			prev->es.pos.trType != TR_STATIONARY && prev->es.pos.trType != TR_INTERPOLATE &&
+			tes->es.pos.trType != TR_STATIONARY && tes->es.pos.trType != TR_INTERPOLATE &&
+			DotProduct( prev->es.pos.trDelta, tes->es.pos.trDelta ) < -0.01f ) {
+			vec3_t prevPos, prevPrevPos, step;
+			demoTrajectory( &prev->es.pos, prev->serverTime, 0.0f, prevPos );
+			demoTrajectory( &prevPrev->es.pos, prevPrev->serverTime, 0.0f, prevPrevPos );
+			VectorSubtract( outOrigin, prevPos, step );
+			if ( DistanceSquared( prevPos, prevPrevPos ) < 1.0f &&
+				DotProduct( step, tes->es.pos.trDelta ) < -1.0f ) {
+				VectorCopy( prevPos, outOrigin );
+			}
+		}
+	}
+}
+
+static qboolean CG_EvaluateMoverAtTime( centity_t *cent, int time, float timeFraction, vec3_t outOrigin, vec3_t outAngles ) {
+	int startSlot, nextSlot, i;
+	int firstMoverSlot = -1;
+	int lastMoverSlot = -1;
+	int bracketSlot = -1;
+	double queryTime = (double)time + (double)timeFraction;
+
+	nextSlot = cent->stateHistory.nextSlot;
+	if ( cg.demoPlayback == 2 && nextSlot > 0 ) {
+		startSlot = nextSlot - MAX_STATE_HISTORY;
+		if ( startSlot < 0 ) {
+			startSlot = 0;
+		}
+		for ( i = startSlot; i < nextSlot; i++ ) {
+			timedEntityState_t *tes = &cent->stateHistory.states[i % MAX_STATE_HISTORY];
+			if ( tes->es.eType != ET_MOVER ) {
+				continue;
+			}
+			if ( firstMoverSlot < 0 ) {
+				firstMoverSlot = i;
+			}
+			lastMoverSlot = i;
+			if ( (double)tes->serverTime <= queryTime ) {
+				bracketSlot = i;
+			}
+		}
+
+		if ( firstMoverSlot >= 0 ) {
+			if ( bracketSlot < 0 ) {
+				CG_GetMoverHistorySlotPose( cent, startSlot, firstMoverSlot, outOrigin, outAngles );
+				return qtrue;
+			}
+
+			if ( bracketSlot + 1 < nextSlot ) {
+				timedEntityState_t *tes = &cent->stateHistory.states[bracketSlot % MAX_STATE_HISTORY];
+				timedEntityState_t *next = &cent->stateHistory.states[( bracketSlot + 1 ) % MAX_STATE_HISTORY];
+				if ( next->es.eType == ET_MOVER && (double)next->serverTime > queryTime ) {
+					if ( next->snapSeq - tes->snapSeq > 1 || next->serverTime <= tes->serverTime ) {
+						demoTrajectory( &tes->es.pos, time, timeFraction, outOrigin );
+						demoTrajectory( &tes->es.apos, time, timeFraction, outAngles );
+						return qtrue;
+					}
+
+					{
+						vec3_t p0, a0, p1, a1, pred0, pred1;
+						float f = (float)( ( (double)( time - tes->serverTime ) + (double)timeFraction ) /
+							(double)( next->serverTime - tes->serverTime ) );
+						if ( f < 0.0f ) {
+							f = 0.0f;
+						} else if ( f > 1.0f ) {
+							f = 1.0f;
+						}
+
+						CG_GetMoverHistorySlotPose( cent, startSlot, bracketSlot, p0, a0 );
+						CG_GetMoverHistorySlotPose( cent, startSlot, bracketSlot + 1, p1, a1 );
+
+						demoTrajectory( &tes->es.pos, tes->serverTime, 0.0f, pred0 );
+						demoTrajectory( &tes->es.pos, next->serverTime, 0.0f, pred1 );
+						if ( tes->es.pos.trType != TR_INTERPOLATE &&
+							!( tes->es.pos.trType == TR_STATIONARY && DistanceSquared( p0, p1 ) > 0.01f ) &&
+							DistanceSquared( pred0, p0 ) < 0.01f &&
+							DistanceSquared( pred1, p1 ) < 0.01f ) {
+							demoTrajectory( &tes->es.pos, time, timeFraction, outOrigin );
+						} else {
+							demoTrajectory( &next->es.pos, tes->serverTime, 0.0f, pred0 );
+							demoTrajectory( &next->es.pos, next->serverTime, 0.0f, pred1 );
+							if ( next->es.pos.trType != TR_STATIONARY &&
+								next->es.pos.trType != TR_INTERPOLATE &&
+								DistanceSquared( pred0, p0 ) < 0.01f &&
+								DistanceSquared( pred1, p1 ) < 0.01f ) {
+								demoTrajectory( &next->es.pos, time, timeFraction, outOrigin );
+							} else {
+								outOrigin[0] = p0[0] + f * ( p1[0] - p0[0] );
+								outOrigin[1] = p0[1] + f * ( p1[1] - p0[1] );
+								outOrigin[2] = p0[2] + f * ( p1[2] - p0[2] );
+							}
+						}
+
+						demoTrajectory( &tes->es.apos, tes->serverTime, 0.0f, pred0 );
+						demoTrajectory( &tes->es.apos, next->serverTime, 0.0f, pred1 );
+						if ( tes->es.apos.trType != TR_INTERPOLATE &&
+							!( tes->es.apos.trType == TR_STATIONARY && !CG_AnglesClose( a0, a1, 0.1f ) ) &&
+							CG_AnglesClose( pred0, a0, 0.1f ) &&
+							CG_AnglesClose( pred1, a1, 0.1f ) ) {
+							demoTrajectory( &tes->es.apos, time, timeFraction, outAngles );
+						} else {
+							demoTrajectory( &next->es.apos, tes->serverTime, 0.0f, pred0 );
+							demoTrajectory( &next->es.apos, next->serverTime, 0.0f, pred1 );
+							if ( next->es.apos.trType != TR_STATIONARY &&
+								next->es.apos.trType != TR_INTERPOLATE &&
+								CG_AnglesClose( pred0, a0, 0.1f ) &&
+								CG_AnglesClose( pred1, a1, 0.1f ) ) {
+								demoTrajectory( &next->es.apos, time, timeFraction, outAngles );
+							} else {
+								outAngles[0] = LerpAngle( a0[0], a1[0], f );
+								outAngles[1] = LerpAngle( a0[1], a1[1], f );
+								outAngles[2] = LerpAngle( a0[2], a1[2], f );
+							}
+						}
+						return qtrue;
+					}
+				}
+			}
+
+			{
+				timedEntityState_t *lastTes = &cent->stateHistory.states[lastMoverSlot % MAX_STATE_HISTORY];
+				vec3_t lastPos, lastAng;
+				CG_GetMoverHistorySlotPose( cent, startSlot, lastMoverSlot, lastPos, lastAng );
+				if ( queryTime <= (double)lastTes->serverTime + 1e-4 ) {
+					VectorCopy( lastPos, outOrigin );
+					VectorCopy( lastAng, outAngles );
+					return qtrue;
+				}
+				if ( lastMoverSlot > startSlot ) {
+					timedEntityState_t *prevTes = &cent->stateHistory.states[( lastMoverSlot - 1 ) % MAX_STATE_HISTORY];
+					if ( prevTes->es.eType == ET_MOVER && prevTes->snapSeq + 1 == lastTes->snapSeq ) {
+						vec3_t prevPos, prevAng;
+						CG_GetMoverHistorySlotPose( cent, startSlot, lastMoverSlot - 1, prevPos, prevAng );
+						if ( lastTes->es.pos.trType != TR_STATIONARY && DistanceSquared( lastPos, prevPos ) < 0.01f ) {
+							VectorCopy( lastPos, outOrigin );
+							VectorCopy( lastAng, outAngles );
+							return qtrue;
+						}
+					}
+				}
+				demoTrajectory( &lastTes->es.pos, time, timeFraction, outOrigin );
+				demoTrajectory( &lastTes->es.apos, time, timeFraction, outAngles );
+				return qtrue;
+			}
+		}
+	}
+
+	if ( cent->currentValid && cent->currentState.eType == ET_MOVER ) {
+		if ( cent->interpolate && cent->currentState.pos.trType == TR_INTERPOLATE && cg.nextSnap ) {
+			vec3_t curPos, nxtPos, curAng, nxtAng;
+			float f = cg.frameInterpolation;
+			BG_EvaluateTrajectory( &cent->currentState.pos, cg.snap->serverTime, curPos );
+			BG_EvaluateTrajectory( &cent->nextState.pos, cg.nextSnap->serverTime, nxtPos );
+			outOrigin[0] = curPos[0] + f * ( nxtPos[0] - curPos[0] );
+			outOrigin[1] = curPos[1] + f * ( nxtPos[1] - curPos[1] );
+			outOrigin[2] = curPos[2] + f * ( nxtPos[2] - curPos[2] );
+			BG_EvaluateTrajectory( &cent->currentState.apos, cg.snap->serverTime, curAng );
+			BG_EvaluateTrajectory( &cent->nextState.apos, cg.nextSnap->serverTime, nxtAng );
+			outAngles[0] = LerpAngle( curAng[0], nxtAng[0], f );
+			outAngles[1] = LerpAngle( curAng[1], nxtAng[1], f );
+			outAngles[2] = LerpAngle( curAng[2], nxtAng[2], f );
+			return qtrue;
+		}
+		demoTrajectory( &cent->currentState.pos, time, timeFraction, outOrigin );
+		demoTrajectory( &cent->currentState.apos, time, timeFraction, outAngles );
+		return qtrue;
+	}
+
+	VectorClear( outOrigin );
+	VectorClear( outAngles );
+	return qfalse;
+}
+
+void CG_EvaluateMoverPosition( centity_t *cent, int time, float timeFraction, vec3_t outOrigin, vec3_t outAngles ) {
+	CG_EvaluateMoverAtTime( cent, time, timeFraction, outOrigin, outAngles );
+}
+
+static int CG_FindPushingMover(
+	const vec3_t inOrigin, const vec3_t inVelocity,
+	int snapServerTime, vec3_t outContactOrigin, qboolean *outCaughtFalling )
+{
+	static const vec3_t playerMins = { -15.0f, -15.0f, DEFAULT_MINS_2 };
+	static const vec3_t playerMaxs = { 15.0f, 15.0f, CROUCH_MAXS_2 };
+	int i;
+	int bestMover = ENTITYNUM_NONE;
+	float bestFrac = 1.0f;
+	vec3_t bestContactOrigin;
+	qboolean bestCaughtFalling = qfalse;
+
+	VectorCopy( inOrigin, bestContactOrigin );
+
+	for ( i = MAX_CLIENTS; i < ENTITYNUM_MAX_NORMAL; i++ ) {
+		centity_t *cent = &cg_entities[i];
+		const entityState_t *snapEs;
+		clipHandle_t cmodel;
+		vec3_t moverOrigin, moverAngles, prevMoverOrigin, prevMoverAngles;
+		vec3_t backOrigin, step, startOrigin, endOrigin;
+		float stepLen;
+		trace_t trace;
+
+		if ( cent->stateHistory.nextSlot <= 0 ) {
+			continue;
+		}
+		snapEs = CG_FindMoverHistoryState( cent, snapServerTime, 0.0f, qfalse );
+		if ( !snapEs || snapEs->solid != SOLID_BMODEL || snapEs->eType != ET_MOVER ) {
+			continue;
+		}
+		if ( !CG_EvaluateMoverAtTime( cent, snapServerTime, 0.0f, moverOrigin, moverAngles ) ) {
+			continue;
+		}
+		if ( !CG_EvaluateMoverAtTime( cent, snapServerTime - 50, 0.0f, prevMoverOrigin, prevMoverAngles ) ) {
+			continue;
+		}
+
+		CG_ApplyMoverDelta( inOrigin, moverOrigin, moverAngles, prevMoverOrigin, prevMoverAngles, backOrigin, NULL );
+		VectorSubtract( inOrigin, backOrigin, step );
+		stepLen = VectorLength( step );
+		if ( stepLen < 0.1f ) {
+			continue;
+		}
+
+		cmodel = trap_CM_InlineModel( snapEs->modelindex );
+		if ( !cmodel ) {
+			continue;
+		}
+
+		// G_MoverPush pushes airborne players whose bbox enters the mover's new position
+		// while PM_GroundTrace keeps groundEntityNum == ENTITYNUM_NONE when velocity[2] > 10
+		// or before the next Pmove runs after a rising mover catches a falling player.
+		VectorMA( inOrigin, 1.0f / stepLen, step, startOrigin );
+		VectorMA( backOrigin, -1.0f / stepLen, step, endOrigin );
+		trap_CM_TransformedBoxTrace( &trace, startOrigin, endOrigin,
+			playerMins, playerMaxs, cmodel, MASK_PLAYERSOLID, moverOrigin, moverAngles );
+		if ( !trace.startsolid && trace.fraction < bestFrac ) {
+			bestFrac = trace.fraction;
+			bestMover = i;
+			if ( inVelocity && inVelocity[2] < 0.0f && step[2] > 0.0f &&
+				trace.plane.normal[2] >= 0.7f &&
+				trace.endpos[2] < inOrigin[2] && trace.endpos[2] >= backOrigin[2] - 0.1f ) {
+				VectorCopy( trace.endpos, bestContactOrigin );
+				bestCaughtFalling = qtrue;
+			} else {
+				VectorCopy( inOrigin, bestContactOrigin );
+				bestCaughtFalling = qfalse;
+			}
+		}
+	}
+
+	if ( bestMover != ENTITYNUM_NONE ) {
+		if ( outContactOrigin ) {
+			VectorCopy( bestContactOrigin, outContactOrigin );
+		}
+		if ( outCaughtFalling ) {
+			*outCaughtFalling = bestCaughtFalling;
+		}
+	}
+	return bestMover;
+}
+
+int CG_ResolveEndpointMover(
+	const vec3_t inOrigin, const vec3_t inVelocity, int groundEntityNum,
+	int snapServerTime, vec3_t outSnapOrigin, qboolean *outCaughtFalling )
+{
+	if ( outSnapOrigin ) {
+		VectorCopy( inOrigin, outSnapOrigin );
+	}
+	if ( outCaughtFalling ) {
+		*outCaughtFalling = qfalse;
+	}
+	if ( groundEntityNum != ENTITYNUM_NONE ) {
+		if ( groundEntityNum > 0 && groundEntityNum < ENTITYNUM_MAX_NORMAL ) {
+			return groundEntityNum;
+		}
+		return ENTITYNUM_NONE;
+	}
+	return CG_FindPushingMover( inOrigin, inVelocity, snapServerTime, outSnapOrigin, outCaughtFalling );
+}
+
+void CG_AdjustEndpointForMover(
+	const vec3_t inSnapOrigin, int moverNum,
+	int snapServerTime,
+	int renderTime, float renderTimeFraction,
+	vec3_t outOrigin, float *outDeltaYaw )
+{
+	centity_t *cent;
+	vec3_t oldOrigin, oldAngles, newOrigin, newAngles;
+
+	VectorCopy( inSnapOrigin, outOrigin );
+	if ( outDeltaYaw ) {
+		*outDeltaYaw = 0.0f;
+	}
 	if ( moverNum <= 0 || moverNum >= ENTITYNUM_MAX_NORMAL ) {
-		VectorCopy( in, out );
 		return;
 	}
 
 	cent = &cg_entities[moverNum];
-	if ( cent->currentState.eType != ET_MOVER ) {
-		VectorCopy( in, out );
+	if ( !CG_EvaluateMoverAtTime( cent, snapServerTime, 0.0f, oldOrigin, oldAngles ) ) {
+		return;
+	}
+	if ( !CG_EvaluateMoverAtTime( cent, renderTime, renderTimeFraction, newOrigin, newAngles ) ) {
 		return;
 	}
 
-	for ( i = cent->currentStateHistory; i < cent->stateHistory.nextSlot; i++ ) {
-		timedEntityState_t *next = NULL;
-		if ( i + 1 < cent->stateHistory.nextSlot ) {
-			next = &cent->stateHistory.states[( i + 1 ) % MAX_STATE_HISTORY];
+	CG_ApplyMoverDelta( inSnapOrigin, oldOrigin, oldAngles, newOrigin, newAngles, outOrigin, outDeltaYaw );
+}
+
+static const entityState_t *CG_FindLandedEntityStateOnMover(
+	const centity_t *cent, int startIdx, int moverNum, int refServerTime )
+{
+	const playerHistory_t *hist = &cent->stateHistory;
+	int idx;
+	if ( moverNum <= 0 || moverNum >= ENTITYNUM_MAX_NORMAL ) {
+		return NULL;
+	}
+	for ( idx = startIdx; idx < hist->nextSlot; idx++ ) {
+		const timedEntityState_t *cand = &hist->states[idx % MAX_STATE_HISTORY];
+		if ( cand->serverTime < refServerTime ) {
+			continue;
 		}
-		tes = &cent->stateHistory.states[i % MAX_STATE_HISTORY];
-		// use next es over cur es if mover started moving in next frame, since player interpolation will use both
-		if ( tes->serverTime - fromTime <= fromTimeFraction && ( next == NULL || next->serverTime - fromTime > fromTimeFraction ) ) {
-			entityState_t *es = &tes->es;
-			if ( next != NULL && tes->es.pos.trType == TR_STATIONARY && next->es.pos.trType != TR_STATIONARY ) {
-				es = &next->es;
-			}
-			demoTrajectory( &es->pos, fromTime, fromTimeFraction, oldOrigin );
-			demoTrajectory( &es->apos, fromTime, fromTimeFraction, oldAngles );
+		if ( idx > startIdx && cand->isTeleport ) {
+			break;
 		}
-		if ( tes->serverTime - toTime <= toTimeFraction && ( next == NULL || next->serverTime - toTime > toTimeFraction ) ) {
-			entityState_t *es = &tes->es;
-			if ( next != NULL && tes->es.pos.trType == TR_STATIONARY && next->es.pos.trType != TR_STATIONARY ) {
-				es = &next->es;
-			}
-			demoTrajectory( &es->pos, toTime, toTimeFraction, origin );
-			demoTrajectory( &es->apos, toTime, toTimeFraction, angles );
+		if ( cand->serverTime > refServerTime + 200 ) {
+			break;
+		}
+		if ( cand->es.groundEntityNum == moverNum ) {
+			return &cand->es;
 		}
 	}
+	return NULL;
+}
 
-	VectorSubtract( origin, oldOrigin, deltaOrigin );
-	VectorSubtract( angles, oldAngles, deltaAngles );
-
-	VectorAdd( in, deltaOrigin, out );
-
-	// FIXME: origin change when on a rotating object
+static void CG_ApplyLandedAnimToEntityState(
+	entityState_t *dst, const entityState_t *srcAir,
+	const entityState_t *landedEs, int moverNum )
+{
+	dst->groundEntityNum = moverNum;
+	dst->legsAnim = landedEs->legsAnim;
+	dst->legsFlip = landedEs->legsFlip;
+	dst->angles2[YAW] = landedEs->angles2[YAW];
+	if ( dst->torsoAnim == srcAir->legsAnim ) {
+		dst->torsoAnim = landedEs->torsoAnim;
+		dst->torsoFlip = landedEs->torsoFlip;
+	}
 }
 
 void CG_AdvanceStateHistory( centity_t *cent ) {
@@ -3260,7 +3652,141 @@ static void CG_InterpolateEntityPosition( centity_t *cent ) {
 	float		f;
 	entityState_t *currentState, *nextState;
 	timedEntityState_t *curEsh = NULL, *nextEsh = NULL;
-	int currentStateTime, nextStateTime;
+	int currentStateTime = 0, nextStateTime = 0;
+	qboolean useCommandSmooth = ( cg_commandSmooth.integer > 1
+		&& cg.demoPlayback == 2
+		&& cent->currentState.number < MAX_CLIENTS
+		&& cent != &cg_entities[cg.snap->ps.clientNum] ) ? qtrue : qfalse;
+
+	if ( useCommandSmooth ) {
+		float curDeltaYaw = 0.0f, nextDeltaYaw = 0.0f;
+		vec3_t curAng, nextAng;
+		vec3_t rawCur, rawNext, curSnapOrigin, nextSnapOrigin;
+		qboolean curCaughtFalling = qfalse, nextCaughtFalling = qfalse;
+		const entityState_t *curLandedEs = NULL, *nextLandedEs = NULL;
+		int curMover, nextMover;
+
+		if ( cent->stateHistory.nextSlot <= 0 ) {
+			demoNowTrajectory( &cent->currentState.pos, cent->lerpOrigin );
+			demoNowTrajectory( &cent->currentState.apos, cent->lerpAngles );
+			return;
+		}
+
+		CG_ComputeCommandSmoothStates( cent, &curEsh, &nextEsh );
+		currentState = &curEsh->es;
+		currentStateTime = curEsh->time;
+		if ( currentState->eType == ET_PLAYER && currentState->pos.trType == TR_LINEAR_STOP ) {
+			VectorCopy( currentState->pos.trBase, rawCur );
+		} else {
+			BG_EvaluateTrajectory( &currentState->pos, currentStateTime, rawCur );
+		}
+		curMover = CG_ResolveEndpointMover( rawCur, currentState->pos.trDelta,
+			currentState->groundEntityNum, curEsh->serverTime, curSnapOrigin, &curCaughtFalling );
+		if ( curCaughtFalling ) {
+			curLandedEs = CG_FindLandedEntityStateOnMover( cent, cent->currentStateHistory, curMover, curEsh->serverTime );
+			if ( !curLandedEs ) {
+				VectorCopy( rawCur, curSnapOrigin );
+				curCaughtFalling = qfalse;
+			} else {
+				CG_ApplyLandedAnimToEntityState( &cent->currentState, currentState, curLandedEs, curMover );
+			}
+		}
+
+		if ( nextEsh == NULL ) {
+			demoNowTrajectory( &currentState->apos, cent->lerpAngles );
+			CG_AdjustEndpointForMover( curSnapOrigin, curMover,
+				curEsh->serverTime, cg.time, cg.timeFraction, cent->lerpOrigin, &curDeltaYaw );
+			cent->lerpAngles[YAW] = AngleNormalize360( cent->lerpAngles[YAW] + curDeltaYaw );
+			return;
+		}
+		nextState = &nextEsh->es;
+		nextStateTime = nextEsh->time;
+		f = ( cg.timeFraction + ( cg.time - curEsh->time ) ) / ( nextEsh->time - curEsh->time );
+
+		if ( nextState->eType == ET_PLAYER && nextState->pos.trType == TR_LINEAR_STOP ) {
+			VectorCopy( nextState->pos.trBase, rawNext );
+		} else {
+			BG_EvaluateTrajectory( &nextState->pos, nextStateTime, rawNext );
+		}
+		nextMover = CG_ResolveEndpointMover( rawNext, nextState->pos.trDelta,
+			nextState->groundEntityNum, nextEsh->serverTime, nextSnapOrigin, &nextCaughtFalling );
+		if ( nextCaughtFalling ) {
+			nextLandedEs = CG_FindLandedEntityStateOnMover( cent, cent->currentStateHistory + 1, nextMover, nextEsh->serverTime );
+			if ( !nextLandedEs ) {
+				VectorCopy( rawNext, nextSnapOrigin );
+				nextCaughtFalling = qfalse;
+			}
+		}
+
+		if ( curMover == nextMover ) {
+			CG_AdjustEndpointForMover( curSnapOrigin, curMover,
+				curEsh->serverTime, cg.time, cg.timeFraction, current, &curDeltaYaw );
+			CG_AdjustEndpointForMover( nextSnapOrigin, nextMover,
+				nextEsh->serverTime, cg.time, cg.timeFraction, next, &nextDeltaYaw );
+			cent->lerpOrigin[0] = current[0] + f * ( next[0] - current[0] );
+			cent->lerpOrigin[1] = current[1] + f * ( next[1] - current[1] );
+			cent->lerpOrigin[2] = current[2] + f * ( next[2] - current[2] );
+		} else if ( curMover == ENTITYNUM_NONE && nextMover != ENTITYNUM_NONE ) {
+			vec3_t nextNow, nextEnd, nextStart;
+			float dtTotal = ( nextStateTime - currentStateTime ) * 0.001f;
+			float zAirEnd = rawCur[2] + currentState->pos.trDelta[2] * dtTotal - 0.5f * (float)DEFAULT_GRAVITY * dtTotal * dtTotal;
+			VectorCopy( curSnapOrigin, current );
+			CG_AdjustEndpointForMover( nextSnapOrigin, nextMover,
+				nextEsh->serverTime, cg.time, cg.timeFraction, nextNow, NULL );
+			CG_AdjustEndpointForMover( nextSnapOrigin, nextMover,
+				nextEsh->serverTime, nextStateTime, 0.0f, nextEnd, &nextDeltaYaw );
+			CG_AdjustEndpointForMover( nextSnapOrigin, nextMover,
+				nextEsh->serverTime, currentStateTime, 0.0f, nextStart, NULL );
+			cent->lerpOrigin[0] = current[0] + f * ( nextEnd[0] - current[0] );
+			cent->lerpOrigin[1] = current[1] + f * ( nextEnd[1] - current[1] );
+			if ( dtTotal > 0.0f && current[2] > nextStart[2] && zAirEnd <= nextEnd[2] ) {
+				float dt = (float)( ( (double)( cg.time - currentStateTime ) + (double)cg.timeFraction ) * 0.001 );
+				float zAir = current[2] + currentState->pos.trDelta[2] * dt - 0.5f * (float)DEFAULT_GRAVITY * dt * dt;
+				const entityState_t *landedEs = ( nextState->groundEntityNum == nextMover ) ? nextState : nextLandedEs;
+				if ( zAir <= nextNow[2] ) {
+					cent->lerpOrigin[2] = nextNow[2];
+					if ( landedEs ) {
+						CG_ApplyLandedAnimToEntityState( &cent->currentState, currentState, landedEs, nextMover );
+					}
+				} else {
+					float vMoverZ = ( nextEnd[2] - nextStart[2] ) / dtTotal;
+					float closingSpeed = vMoverZ - ( currentState->pos.trDelta[2] - (float)DEFAULT_GRAVITY * dt );
+					float leadDist = Com_Clamp( 6.0f, 48.0f, closingSpeed * 0.045f );
+					cent->lerpOrigin[2] = zAir;
+					if ( landedEs && ( zAir - nextNow[2] ) <= leadDist ) {
+						CG_ApplyLandedAnimToEntityState( &cent->currentState, currentState, landedEs, nextMover );
+					}
+				}
+			} else {
+				cent->lerpOrigin[2] = current[2] + f * ( nextEnd[2] - current[2] );
+			}
+		} else if ( curMover != ENTITYNUM_NONE && nextMover == ENTITYNUM_NONE ) {
+			CG_AdjustEndpointForMover( curSnapOrigin, curMover,
+				curEsh->serverTime, currentStateTime, 0.0f, current, &curDeltaYaw );
+			VectorCopy( nextSnapOrigin, next );
+			cent->lerpOrigin[0] = current[0] + f * ( next[0] - current[0] );
+			cent->lerpOrigin[1] = current[1] + f * ( next[1] - current[1] );
+			cent->lerpOrigin[2] = current[2] + f * ( next[2] - current[2] );
+		} else {
+			CG_AdjustEndpointForMover( curSnapOrigin, curMover,
+				curEsh->serverTime, currentStateTime, 0.0f, current, &curDeltaYaw );
+			CG_AdjustEndpointForMover( nextSnapOrigin, nextMover,
+				nextEsh->serverTime, nextStateTime, 0.0f, next, &nextDeltaYaw );
+			cent->lerpOrigin[0] = current[0] + f * ( next[0] - current[0] );
+			cent->lerpOrigin[1] = current[1] + f * ( next[1] - current[1] );
+			cent->lerpOrigin[2] = current[2] + f * ( next[2] - current[2] );
+		}
+
+		BG_EvaluateTrajectory( &currentState->apos, currentStateTime, curAng );
+		BG_EvaluateTrajectory( &nextState->apos, nextStateTime, nextAng );
+		curAng[YAW] = AngleNormalize360( curAng[YAW] + curDeltaYaw );
+		nextAng[YAW] = AngleNormalize360( nextAng[YAW] + nextDeltaYaw );
+		cent->lerpAngles[0] = LerpAngle( curAng[0], nextAng[0], f );
+		cent->lerpAngles[1] = LerpAngle( curAng[1], nextAng[1], f );
+		cent->lerpAngles[2] = LerpAngle( curAng[2], nextAng[2], f );
+		return;
+	}
+
 	if ( cg.snap ) {
 		currentStateTime = cg.snap->serverTime;
 	}
@@ -3278,44 +3804,8 @@ static void CG_InterpolateEntityPosition( centity_t *cent ) {
 	} else {
 		f = cg.frameInterpolation;
 	}
-	if ( cg_commandSmooth.integer > 1
-			&& cg.demoPlayback == 2
-			&& cent->currentState.number < MAX_CLIENTS
-			&& cent != &cg_entities[cg.snap->ps.clientNum] ) {
-		CG_ComputeCommandSmoothStates( cent, &curEsh, &nextEsh );
-		currentState = &curEsh->es;
-		currentStateTime = curEsh->time;
-		if ( nextEsh == NULL ) {
-#ifdef _DEBUG
-			Com_Printf( "Missing nextEsh for client %d\n", currentState->number );
-#endif
-			demoNowTrajectory( &currentState->pos, cent->lerpOrigin );
-			demoNowTrajectory( &currentState->apos, cent->lerpAngles );
-			return;
-		}
-		nextState = &nextEsh->es;
-		nextStateTime = nextEsh->time;
-		f = ( cg.timeFraction + ( cg.time - curEsh->time ) ) / ( nextEsh->time - curEsh->time );
-#ifdef _DEBUG
-		if ( currentState->number == cg.predictedPlayerState.clientNum ) {
-			static float prevf = -1.0f;
-			static int prevtime = -1;
-			if ( prevf != -1.0f && f < prevf && currentStateTime == prevtime ) {
-				Com_Printf( "%d %f %f %d\n", currentStateTime, prevf, f, nextStateTime );
-			}
-			prevf = f;
-			prevtime = currentStateTime;
-		}
-		if ( f > 1 ) {
-			Com_Printf( "Extrapolating forwards for client %d\n", currentState->number );
-		} else if ( f < 0 ) {
-			Com_Printf( "Extrapolating backwards for client %d\n", currentState->number );
-		}
-#endif
-	} else {
-		currentState = &cent->currentState;
-		nextState = &cent->nextState;
-	}
+	currentState = &cent->currentState;
+	nextState = &cent->nextState;
 	// this will linearize a sine or parabolic curve, but it is important
 	// to not extrapolate player positions if more recent data is available
 	BG_EvaluateTrajectory(&currentState->pos, currentStateTime, current);
@@ -3328,21 +3818,6 @@ static void CG_InterpolateEntityPosition( centity_t *cent ) {
 	cent->lerpAngles[0] = LerpAngle(current[0], next[0], f);
 	cent->lerpAngles[1] = LerpAngle(current[1], next[1], f);
 	cent->lerpAngles[2] = LerpAngle(current[2], next[2], f);
-	if ( cg_commandSmooth.integer > 1
-			&& cg.demoPlayback == 2
-			&& cent->currentState.number < MAX_CLIENTS
-			&& cent != &cg_entities[cg.snap->ps.clientNum] ) {
-		// adjust for the movement of the groundentity
-		// step 1: remove the delta introduced by cur->next origin interpolation
-		int curTime = curEsh->serverTime + (int) ( f * ( nextEsh->serverTime - curEsh->serverTime ) );
-		float curTimeFraction = ( f * ( nextEsh->serverTime - curEsh->serverTime ) );
-		curTimeFraction -= (long) curTimeFraction;
-		CG_AdjustInterpolatedPositionForMover( cent->lerpOrigin,
-			currentState->groundEntityNum, curTime, curTimeFraction, curEsh->serverTime, 0, cent->lerpOrigin );
-		// step 2: mover state should now be what it was at currentServerTime, now redo calculation of mover effect to cg.time
-		CG_AdjustInterpolatedPositionForMover( cent->lerpOrigin,
-			currentState->groundEntityNum, curEsh->serverTime, 0, cg.time, cg.timeFraction, cent->lerpOrigin );
-	}
 }
 
 /*
@@ -3358,14 +3833,15 @@ void CG_CalcEntityLerpPositions( centity_t *cent ) {
 			&& cg.demoPlayback == 2
 			&& cent->currentState.number < MAX_CLIENTS
 			&& cent != &cg_entities[cg.snap->ps.clientNum] ) {
-		timedEntityState_t *curEsh, *nextEsh;
-		CG_ComputeCommandSmoothStates( cent, &curEsh, &nextEsh );
-		currentState = &curEsh->es;
-		nextState = nextEsh == NULL ? NULL : &nextEsh->es;
-	} else {
-		currentState = &cent->currentState;
-		nextState = &cent->nextState;
+		CG_InterpolateEntityPosition( cent );
+		return;
 	}
+	if ( cg.demoPlayback == 2 && cent->currentState.eType == ET_MOVER ) {
+		CG_EvaluateMoverPosition( cent, cg.time, cg.timeFraction, cent->lerpOrigin, cent->lerpAngles );
+		return;
+	}
+	currentState = &cent->currentState;
+	nextState = &cent->nextState;
 	// if this player does not want to see extrapolated players
 	if ( !cg_smoothClients.integer ) {
 		// make sure the clients use TR_INTERPOLATE

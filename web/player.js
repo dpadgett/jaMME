@@ -18,8 +18,8 @@
   const MAX_OVERBRIGHT = 3;
 
   const BOOT_START_MS = typeof performance !== 'undefined' ? performance.now() : Date.now();
-  const DEFAULT_ENGINE_VERSION = '20261108a';
-  const DEFAULT_PLAYER_VERSION = '20261108a';
+  const DEFAULT_ENGINE_VERSION = '20261111a';
+  const DEFAULT_PLAYER_VERSION = '20261111a';
 
   function installDocumentTitleGuard() {
     if (typeof document === 'undefined' || document.__jkTitleGuardInstalled) return;
@@ -78,6 +78,7 @@
     overbright: 0,
     speed: 1.0,
     muted: false,
+    musicEnabled: true,
     volume: 0.8,
     savedVolume: 0.8,
     demoName: '1.51ef9.dm_26',
@@ -151,6 +152,11 @@
         if (typeof prefs.muted === 'boolean') {
           state.muted = prefs.muted;
         }
+        if (typeof prefs.musicEnabled === 'boolean') {
+          state.musicEnabled = prefs.musicEnabled;
+        } else if (typeof prefs.music === 'boolean') {
+          state.musicEnabled = prefs.music;
+        }
         if (typeof prefs.volume === 'number' && Number.isFinite(prefs.volume)) {
           state.volume = Math.min(1.0, Math.max(0.0, prefs.volume));
         }
@@ -178,6 +184,7 @@
         JSON.stringify({
           speed: state.speed,
           muted: state.muted,
+          musicEnabled: state.musicEnabled,
           volume: state.volume,
           loop: state.loop,
           thirdPerson: state.thirdPerson,
@@ -249,6 +256,19 @@
     } else if (typeof cfg.muted === 'boolean') {
       muted = cfg.muted;
     }
+    let musicEnabled = state.musicEnabled;
+    let hasExplicitMusic = false;
+    if (params.has('music')) {
+      const mu = String(params.get('music') || '').toLowerCase();
+      musicEnabled = !(mu === '0' || mu === 'false' || mu === 'off' || mu === 'no');
+      hasExplicitMusic = true;
+    } else if (typeof cfg.musicEnabled === 'boolean') {
+      musicEnabled = cfg.musicEnabled;
+      hasExplicitMusic = true;
+    } else if (typeof cfg.music === 'boolean') {
+      musicEnabled = cfg.music;
+      hasExplicitMusic = true;
+    }
     let volume = state.volume;
     if (params.has('volume')) {
       const v = parseFloat(params.get('volume'));
@@ -315,6 +335,8 @@
       demo,
       speed,
       muted,
+      musicEnabled,
+      hasExplicitMusic,
       volume,
       thirdPerson,
       hasExplicitThirdPerson,
@@ -352,6 +374,7 @@
   state.demoName = normalizeDemoFileName(initialCfg.demo) || '1.51ef9.dm_26';
   state.speed = initialCfg.speed;
   state.muted = initialCfg.muted;
+  state.musicEnabled = Boolean(initialCfg.musicEnabled);
   state.volume = initialCfg.volume;
   state.thirdPerson = Boolean(initialCfg.thirdPerson);
   state.gamma = clampGammaValue(initialCfg.gamma);
@@ -3509,6 +3532,7 @@
     const cFrameCount = callWasm('JK_DemoGetFrameCount', 'number', [], []);
     const cSpeed = callWasm('JK_DemoGetSpeed', 'number', [], []);
     const cMuted = callWasm('JK_DemoIsMuted', 'number', [], []);
+    const cMusicEnabled = callWasm('JK_DemoIsMusicEnabled', 'number', [], []);
     const cVolume = callWasm('JK_DemoGetVolume', 'number', [], []);
     const cDemoName = callWasm('JK_DemoGetCurrentName', 'string', [], []);
     const cAudioActive = callWasm('JK_DemoIsAudioActive', 'number', [], []);
@@ -3564,6 +3588,8 @@
         ? Math.round(cSpeed * 1000) / 1000
         : state.speed;
     const muted = typeof cMuted === 'number' ? cMuted === 1 : state.muted;
+    const musicEnabled =
+      typeof cMusicEnabled === 'number' ? cMusicEnabled === 1 : Boolean(state.musicEnabled);
     const volume =
       typeof cVolume === 'number' && Number.isFinite(cVolume)
         ? Math.round(Math.min(1.0, Math.max(0.0, cVolume)) * 1000) / 1000
@@ -3623,6 +3649,7 @@
       timescale: Number(speed),
       speed: Number(speed),
       muted: Boolean(muted),
+      musicEnabled: Boolean(musicEnabled),
       volume: Number(volume),
       audioContextState: String(audioContextState),
       audioActive: Boolean(audioActive),
@@ -3809,6 +3836,39 @@
       state.muted = cMuted === 1;
     }
     return Boolean(state.muted);
+  }
+
+  function syncMusicToEngine() {
+    callWasm('JK_DemoSetMusicEnabled', 'number', ['number'], [state.musicEnabled ? 1 : 0]);
+  }
+
+  function setMusicEnabled(enabled) {
+    state.musicEnabled = Boolean(enabled);
+    syncMusicToEngine();
+    persistPrefField('musicEnabled', state.musicEnabled);
+    savePlayerPrefs();
+    updateUIControls();
+    try {
+      window.dispatchEvent(
+        new CustomEvent('jkdemo:musicstate', {
+          detail: { musicEnabled: Boolean(state.musicEnabled) },
+        })
+      );
+      window.dispatchEvent(new CustomEvent('jkdemo:audiostate'));
+    } catch (_) {}
+    return state.musicEnabled;
+  }
+
+  function isMusicEnabled() {
+    const cMusic = callWasm('JK_DemoIsMusicEnabled', 'number', [], []);
+    if (typeof cMusic === 'number') {
+      state.musicEnabled = cMusic === 1;
+    }
+    return Boolean(state.musicEnabled);
+  }
+
+  function toggleMusic() {
+    return setMusicEnabled(!isMusicEnabled());
   }
 
   function setVolume(level) {
@@ -4834,6 +4894,7 @@
         state.autoPausedByVisibility = false;
 
         callWasm('JK_DemoSetLoop', 'number', ['number'], [state.loop ? 1 : 0]);
+        syncMusicToEngine();
         syncCameraModeToEngine();
         syncLightingToEngine();
         applyCanvasGammaFilter();
@@ -5605,6 +5666,9 @@
     if (typeof cfg.speed === 'number') setSpeed(cfg.speed);
     if (typeof cfg.volume === 'number') setVolume(cfg.volume);
     if (typeof cfg.muted === 'boolean') setMuted(cfg.muted);
+    if (cfg.hasExplicitMusic && typeof cfg.musicEnabled === 'boolean') {
+      setMusicEnabled(cfg.musicEnabled);
+    }
     if (cfg.hasExplicitThirdPerson && typeof cfg.thirdPerson === 'boolean') {
       setThirdPerson(cfg.thirdPerson);
     }
@@ -5848,6 +5912,7 @@
       thirdPerson: getThirdPerson(),
       speed: getSpeed(),
       muted: isMuted(),
+      musicEnabled: isMusicEnabled(),
       gamma: getGamma(),
       overbright: getOverbright(),
       pk3Manifest: window.__jkPk3Manifest || null,
@@ -5875,6 +5940,10 @@
     toggleMute,
     setMuted,
     isMuted,
+    setMusicEnabled,
+    getMusicEnabled: isMusicEnabled,
+    isMusicEnabled,
+    toggleMusic,
     unlockAudio,
     setVolume,
     getVolume,
@@ -5951,6 +6020,14 @@
     const selectSpeed = document.getElementById('select-speed');
     if (selectSpeed) {
       selectSpeed.value = String(state.speed);
+    }
+    const btnMusic = document.getElementById('btn-music');
+    if (btnMusic) {
+      const musicOn = isMusicEnabled();
+      btnMusic.setAttribute('aria-pressed', musicOn ? 'true' : 'false');
+      btnMusic.title = musicOn
+        ? 'Background music on (click to mute music only)'
+        : 'Background music off (sound effects still play)';
     }
     const btnMute = document.getElementById('btn-mute');
     if (btnMute) {
@@ -6090,6 +6167,12 @@
     if (selectSpeed) {
       selectSpeed.addEventListener('change', (e) => {
         setSpeed(parseFloat(e.target.value));
+      });
+    }
+    const btnMusic = document.getElementById('btn-music');
+    if (btnMusic) {
+      btnMusic.addEventListener('click', () => {
+        toggleMusic();
       });
     }
     const btnMute = document.getElementById('btn-mute');
@@ -6422,6 +6505,7 @@
         '+set', 'timescale', String(state.speed),
         '+set', 's_khz', '22',
         '+set', 's_volume', String(state.muted ? 0.0 : state.volume),
+        '+set', 's_musicvolume', String(state.muted || !state.musicEnabled ? 0.0 : state.volume * 0.5),
       ];
 
       if (willUseSoftwareWebGL) {
@@ -6509,6 +6593,7 @@
                 '_JK_DemoIsReady',
                 '_JK_DemoIsPaused',
                 '_JK_DemoIsMuted',
+                '_JK_DemoIsMusicEnabled',
                 '_JK_DemoIsCompleted',
                 '_JK_DemoHasEnded',
                 '_JK_DemoGetCompletedCount',
@@ -6571,6 +6656,7 @@
             syncCameraModeToEngine();
             syncLightingToEngine();
             applyCanvasGammaFilter();
+            syncMusicToEngine();
             if (state.muted) mute();
             else setVolume(state.volume);
             flushPendingCommands();
@@ -6583,6 +6669,7 @@
             setTimeout(() => {
               resize();
               if (state.speed !== 1.0) setSpeed(state.speed);
+              syncMusicToEngine();
               if (state.muted) mute();
               else setVolume(state.volume);
             }, 100);

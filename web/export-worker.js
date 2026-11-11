@@ -3129,6 +3129,7 @@ async function runExportJob(msg) {
     const endMs = Math.max(startMs + 500, Math.round(Number(settings.endMs) || startMs + 5000));
     const blurFrames = Math.max(0, Math.min(64, Math.round(Number(settings.blurFrames) || 0)));
     const audioEnabled = settings.audio !== false;
+    const musicEnabled = audioEnabled && settings.music !== false;
     const thirdPerson = Boolean(settings.thirdPerson);
     const gamma = Math.max(0.5, Math.min(3.0, Number(settings.gamma) || 1.0));
     const overbright = Math.max(0, Math.min(3, Math.round(Number(settings.overbright) || 0)));
@@ -3213,6 +3214,7 @@ async function runExportJob(msg) {
       `set mme_dofFrames "0"`,
       `set mme_saveWav "${audioEnabled ? '2' : '0'}"`,
       `set s_volume "0.85"`,
+      `set s_musicVolume "${musicEnabled ? '0.425' : '0'}"`,
       `set s_khz "44"`,
       `set mme_mp4Bitrate "${targetVideoBitrate}"`,
       `set mme_mp4MaxMegs "${maxMegs}"`,
@@ -3222,6 +3224,7 @@ async function runExportJob(msg) {
     for (const line of cfgLines) {
       execCommand(line);
     }
+    callWasm('JK_DemoSetMusicEnabled', 'number', ['number'], [musicEnabled ? 1 : 0]);
 
     emitLoading('Seeking to clip start...', 99);
     const started = callWasm(

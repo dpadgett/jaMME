@@ -78,8 +78,92 @@ static void CG_TransitionEntity( centity_t *cent ) {
 	CG_CheckEvents( cent );
 }
 
-void CG_AddToHistory( int serverTime, entityState_t *state, centity_t *cent ) {
+#define CMD_SMOOTH_W_PAST	150
+#define CMD_SMOOTH_W_FUTURE	150
+
+static int CG_MapCommandSmoothTime(
+	int serverTime, int prevServerTime,
+	int cmdTime, int prevCmdTime,
+	int prevTime, qboolean isTeleport,
+	double *clockOffset, qboolean *hasClockOffset )
+{
+	int dcmd, newTime, minTime, maxTime;
+
+	if ( !*hasClockOffset || isTeleport || prevServerTime <= 0 || serverTime < prevServerTime ) {
+		int t = serverTime;
+		if ( isTeleport && prevServerTime > 0 && serverTime >= prevServerTime && t < prevTime ) {
+			t = prevTime;
+		}
+		*clockOffset = (double)t - (double)cmdTime;
+		*hasClockOffset = qtrue;
+		return t;
+	}
+
+	dcmd = cmdTime - prevCmdTime;
+	if ( dcmd < 0 ) {
+		int t = Q_max( prevTime, serverTime );
+		*clockOffset = (double)t - (double)cmdTime;
+		return t;
+	}
+
+	if ( dcmd > 0 ) {
+		double rawPred = (double)cmdTime + *clockOffset;
+		double err = (double)serverTime - rawPred;
+		double maxStep = 0.025 * (double)dcmd;
+		double step = 0.04 * err;
+		if ( maxStep < 0.5 ) {
+			maxStep = 0.5;
+		}
+		if ( step > maxStep ) {
+			step = maxStep;
+		} else if ( step < -maxStep ) {
+			step = -maxStep;
+		}
+		*clockOffset += step;
+		newTime = (int)floor( (double)cmdTime + *clockOffset + 0.5 );
+		if ( newTime <= prevTime ) {
+			newTime = prevTime + 1;
+			*clockOffset = (double)newTime - (double)cmdTime;
+		}
+	} else {
+		newTime = prevTime;
+	}
+
+	minTime = serverTime - CMD_SMOOTH_W_PAST;
+	maxTime = serverTime + CMD_SMOOTH_W_FUTURE;
+	if ( newTime < minTime ) {
+		newTime = Q_max( prevTime, minTime );
+		*clockOffset = (double)newTime - (double)cmdTime;
+	} else if ( newTime > maxTime ) {
+		newTime = Q_max( prevTime, maxTime );
+		*clockOffset = (double)newTime - (double)cmdTime;
+	}
+
+	return newTime;
+}
+
+void CG_ResetCommandSmoothHistory( void ) {
+	int i;
+	cg.psHistory.nextSlot = 0;
+	cg.psHistory.clockOffset = 0.0;
+	cg.psHistory.hasClockOffset = qfalse;
+	cg.currentPsHistory = 0;
+	cg.numFutureSnaps = 0;
+	cg.historySnapSeq = 0;
+	for ( i = 0; i < MAX_SMOOTH_LOOKAHEAD_SNAPS; i++ ) {
+		cg.futureSnaps[i] = NULL;
+	}
+	for ( i = 0; i < MAX_GENTITIES; i++ ) {
+		cg_entities[i].stateHistory.nextSlot = 0;
+		cg_entities[i].stateHistory.clockOffset = 0.0;
+		cg_entities[i].stateHistory.hasClockOffset = qfalse;
+		cg_entities[i].currentStateHistory = 0;
+	}
+}
+
+void CG_AddToHistory( int serverTime, int snapSeq, entityState_t *state, centity_t *cent ) {
 	timedEntityState_t *tstate = &cent->stateHistory.states[cent->stateHistory.nextSlot % MAX_STATE_HISTORY], *prev = NULL;
+	qboolean pvsGap = qfalse;
 	if ( cg.demoPlayback != 2 ) {
 		return;
 	}
@@ -95,58 +179,46 @@ void CG_AddToHistory( int serverTime, entityState_t *state, centity_t *cent ) {
 		if ( prev->serverTime > serverTime ) {
 			// jumped back in time
 			cent->currentStateHistory = cent->stateHistory.nextSlot;
+			cent->stateHistory.hasClockOffset = qfalse;
+		} else if ( snapSeq - prev->snapSeq > 1 ) {
+			pvsGap = qtrue;
+			if ( state->number < MAX_CLIENTS && cent->currentStateHistory < cent->stateHistory.nextSlot ) {
+				int activeTime = cg.snap ? cg.snap->serverTime : serverTime;
+				if ( cent->stateHistory.states[cent->currentStateHistory % MAX_STATE_HISTORY].serverTime < activeTime ) {
+					cent->currentStateHistory = cent->stateHistory.nextSlot;
+				}
+			}
 		}
 	}
 	tstate->es = *state;
 	tstate->serverTime = serverTime;
-	tstate->isTeleport = cent->stateHistory.nextSlot <= 0 ||
+	tstate->snapSeq = snapSeq;
+	tstate->isTeleport = ( cent->stateHistory.nextSlot <= 0 ||
 		( prev && prev->serverTime > serverTime ) ||
-		( ( cent->stateHistory.states[(cent->stateHistory.nextSlot - 1) % MAX_STATE_HISTORY].es.eFlags ^ state->eFlags ) & EF_TELEPORT_BIT ) ? qtrue : qfalse;
-	if ( prev && state->pos.trType == TR_LINEAR_STOP ) {
-		if ( cent->stateHistory.nextSlot == 0 ) {
-			// base case
-			tstate->time = serverTime;
-		} else {
-			// determine correct lerp time for new snap
-			if (tstate->isTeleport) {
-				// if frame is a teleport, reset as best we can
-				tstate->time = Q_max(prev->time, tstate->serverTime);
-				if ( prev->serverTime > tstate->serverTime ) {
-					tstate->time = tstate->serverTime;
-				}
-			} else {
-				// so for smoothest experience, time should be cg.nextSnap->ps.commandTime
-				// but, we shouldn't drift time too far off or else player will move weird (will appear to be further ahead depending on ping)
-				// so, prevent to drift further than 1 frame away in future, or 2 in past
-				int bestNewTime = state->pos.trTime - prev->es.pos.trTime + prev->time;
-				int deltaTime = tstate->serverTime - prev->serverTime;
-				// allow  to drift ahead or behind by 1 frame only
-				int newTime = Q_min(tstate->serverTime + deltaTime, Q_max(prev->serverTime, bestNewTime ) );
-				tstate->time = newTime;
-		
-#ifdef _DEBUG
-				if ( tstate->time < prev->time ) {
-					Com_Printf( "WARNING: Drifted backwards\n" );
-				}
-#endif
+		pvsGap ||
+		( prev && prev->es.eType != state->eType ) ||
+		( prev && ( ( prev->es.eFlags ^ state->eFlags ) & EF_TELEPORT_BIT ) ) ) ? qtrue : qfalse;
 
-				//Com_Printf("Corrected time %d ms (commandDiff %d, framedelta %d)\n", tps->time - tps->serverTime, tps->ps.commandTime - lasttps->ps.commandTime, deltaTime);
-			}
-		}
+	if ( state->number < MAX_CLIENTS && state->eType == ET_PLAYER && state->pos.trType == TR_LINEAR_STOP ) {
+		tstate->time = CG_MapCommandSmoothTime(
+			serverTime,
+			prev ? prev->serverTime : 0,
+			state->pos.trTime,
+			prev ? prev->es.pos.trTime : 0,
+			prev ? prev->time : 0,
+			tstate->isTeleport,
+			&cent->stateHistory.clockOffset,
+			&cent->stateHistory.hasClockOffset );
 	} else {
-		// command time unknown
-#ifdef _DEBUG
-		if (cg_commandSmooth.integer)
-			Com_Printf( "commandTime unknown for client %d\n", state->number );
+		cent->stateHistory.hasClockOffset = qfalse;
 		tstate->time = serverTime;
-#endif
+		if ( prev && prev->serverTime <= serverTime && tstate->time < prev->time ) {
+			tstate->time = prev->time;
+		}
 	}
+
 	if ( ( cent->stateHistory.nextSlot % MAX_STATE_HISTORY ) == ( cent->currentStateHistory % MAX_STATE_HISTORY ) && cent->currentStateHistory < cent->stateHistory.nextSlot ) {
 		// buffer overflowed, force advance
-#ifdef _DEBUG
-		if (cg_commandSmooth.integer)
-			Com_Printf( "centity buffer overflow for client %d\n", state->number );
-#endif
 		cent->currentStateHistory = cent->stateHistory.nextSlot - MAX_STATE_HISTORY + 1;
 	}
 	cent->stateHistory.nextSlot++;
@@ -165,47 +237,23 @@ void CG_UpdateTps( snapshot_t *snap, qboolean isTeleport ) {
 		if ( lasttps->serverTime > snap->serverTime ) {
 			// jumped back in time
 			cg.currentPsHistory = cg.psHistory.nextSlot;
+			cg.psHistory.hasClockOffset = qfalse;
 		}
 	}
 	
 	tps->ps = snap->ps;
 	tps->serverTime = snap->serverTime;
 	tps->isTeleport = isTeleport;
-	if ( lasttps ) {
-		// determine correct lerp time for new snap
-		if ( isTeleport ) {
-			// if frame is a teleport, reset as best we can
-			tps->time = Q_max(lasttps->time, tps->serverTime );
-			if ( lasttps->serverTime > tps->serverTime ) {
-				tps->time = tps->serverTime;
-			}
-		}
-		else {
-			// so for smoothest experience, time should be cg.nextSnap->ps.commandTime
-			// but, we shouldn't drift time too far off or else player will move weird (will appear to be further ahead depending on ping)
-			// so, prevent to drift further than 1 frame away in future, or 2 in past
-			int bestNewTime = tps->ps.commandTime - lasttps->ps.commandTime + lasttps->time;
-			int deltaTime = tps->serverTime - lasttps->serverTime;
-			// allow  to drift ahead or behind by 1 frame only
-			int newTime = Q_min(tps->serverTime + deltaTime, Q_max(lasttps->serverTime, bestNewTime ) );
-			if ( lasttps->serverTime != 0 ) {
-				tps->time = newTime;
-			}
-			else {
-				tps->time = tps->serverTime;
-			}
+	tps->time = CG_MapCommandSmoothTime(
+		snap->serverTime,
+		lasttps ? lasttps->serverTime : 0,
+		snap->ps.commandTime,
+		lasttps ? lasttps->ps.commandTime : 0,
+		lasttps ? lasttps->time : 0,
+		isTeleport,
+		&cg.psHistory.clockOffset,
+		&cg.psHistory.hasClockOffset );
 
-#ifdef _DEBUG
-			if ( tps->time < lasttps->time ) {
-				Com_Printf( "WARNING: Drifted backwards\n" );
-			}
-#endif
-
-			//Com_Printf("Corrected time %d ms (commandDiff %d, framedelta %d)\n", tps->time - tps->serverTime, tps->ps.commandTime - lasttps->ps.commandTime, deltaTime);
-		}
-	} else {
-		tps->time = tps->serverTime;
-	}
 	if ( ( cg.psHistory.nextSlot % MAX_STATE_HISTORY ) == ( cg.currentPsHistory % MAX_STATE_HISTORY ) && cg.currentPsHistory < cg.psHistory.nextSlot ) {
 		// buffer overflowed, force advance
 #ifdef _DEBUG
@@ -231,7 +279,7 @@ FIXME: Also called by map_restart?
 void CG_SetInitialSnapshot( snapshot_t *snap ) {
 	int				i;
 	centity_t		*cent;
-	entityState_t	*state, pes;
+	entityState_t	*state;
 
 	cg.snap = snap; 
 
@@ -257,9 +305,7 @@ void CG_SetInitialSnapshot( snapshot_t *snap ) {
 	CG_Respawn();
 
 	if (cg.demoPlayback == 2) {
-		CG_UpdateTps(snap, qtrue);
-		BG_PlayerStateToEntityStateExtraPolate(&snap->ps, &pes, snap->ps.commandTime, qfalse);
-		CG_AddToHistory(snap->serverTime, &pes, &cg_entities[snap->ps.clientNum]);
+		CG_RecordSnapshotHistory(NULL, snap);
 	} else if (!cg.demoPlayback) {
 		// init force selection to SPEED
 		cg.forceSelect = cg.snap->ps.fd.forcePowerSelected = FP_SPEED;
@@ -275,9 +321,6 @@ void CG_SetInitialSnapshot( snapshot_t *snap ) {
 		cent->interpolate = qfalse;
 		cent->currentValid = qtrue;
 
-		if (cg.demoPlayback == 2)
-			CG_AddToHistory( snap->serverTime, state, cent );
-
 		CG_ResetEntity( cent );
 
 		// check for events
@@ -286,9 +329,13 @@ void CG_SetInitialSnapshot( snapshot_t *snap ) {
 }
 
 static qboolean CG_IsTeleport( snapshot_t *lastSnap, snapshot_t *snap ) {
+	if ( !lastSnap ) {
+		return qtrue;
+	}
+
 	// if the next frame is a teleport for the playerstate, we
 	// can't interpolate during demos
-	if ( lastSnap && ( ( snap->ps.eFlags ^ lastSnap->ps.eFlags ) & EF_TELEPORT_BIT ) ) {
+	if ( ( snap->ps.eFlags ^ lastSnap->ps.eFlags ) & EF_TELEPORT_BIT ) {
 		return qtrue;
 	}
 
@@ -302,7 +349,48 @@ static qboolean CG_IsTeleport( snapshot_t *lastSnap, snapshot_t *snap ) {
 		return qtrue;
 	}
 
+	// intermission or spectator transitions do not always toggle EF_TELEPORT_BIT
+	if ( ( snap->ps.pm_type == PM_INTERMISSION ) != ( lastSnap->ps.pm_type == PM_INTERMISSION ) ) {
+		return qtrue;
+	}
+	if ( ( snap->ps.pm_type == PM_SPECTATOR ) != ( lastSnap->ps.pm_type == PM_SPECTATOR ) ) {
+		return qtrue;
+	}
+
+	if ( snap->ps.commandTime < lastSnap->ps.commandTime ) {
+		return qtrue;
+	}
+
+	// POV-rewritten demos (e.g. DemoChanger) can freeze ps while target is out of PVS, then jump without EF_TELEPORT_BIT
+	if ( snap->ps.commandTime - lastSnap->ps.commandTime > 1500 ) {
+		vec3_t delta;
+		VectorSubtract( snap->ps.origin, lastSnap->ps.origin, delta );
+		if ( VectorLengthSquared( delta ) > ( 256.0f * 256.0f ) ) {
+			return qtrue;
+		}
+	}
+
 	return qfalse;
+}
+
+void CG_RecordSnapshotHistory( snapshot_t *prevSnap, snapshot_t *snap ) {
+	int num;
+	entityState_t pes;
+	if ( cg.demoPlayback != 2 || !snap ) {
+		return;
+	}
+	if ( cg.psHistory.nextSlot > 0 &&
+		cg.psHistory.states[( cg.psHistory.nextSlot - 1 ) % MAX_STATE_HISTORY].serverTime == snap->serverTime ) {
+		return;
+	}
+	cg.historySnapSeq++;
+	CG_UpdateTps( snap, CG_IsTeleport( prevSnap, snap ) );
+	BG_PlayerStateToEntityStateExtraPolate( &snap->ps, &pes, snap->ps.commandTime, qfalse );
+	CG_AddToHistory( snap->serverTime, cg.historySnapSeq, &pes, &cg_entities[snap->ps.clientNum] );
+	for ( num = 0; num < snap->numEntities; num++ ) {
+		entityState_t *es = &snap->entities[num];
+		CG_AddToHistory( snap->serverTime, cg.historySnapSeq, es, &cg_entities[es->number] );
+	}
 }
 
 /*
@@ -312,22 +400,14 @@ CG_SetNextSnap
 A new snapshot has just been read in from the client system.
 ===================
 */
-void CG_SetNextSnap( snapshot_t *snap ) {
+static void CG_SetNextSnapInternal( snapshot_t *snap, qboolean recordHistory ) {
 	int					num;
-	entityState_t		*es, pes;
+	entityState_t		*es;
 	centity_t			*cent;
 
 	cg.nextSnap = snap;
 
-	//CG_CheckPlayerG2Weapons(&cg.snap->ps, &cg_entities[cg.snap->ps.clientNum]);
 	BG_PlayerStateToEntityState( &snap->ps, &cg_entities[ snap->ps.clientNum ].nextState, qfalse );
-	//cg_entities[ cg.snap->ps.clientNum ].interpolate = qtrue;
-	//No longer want to do this, as the cg_entities[clnum] and cg.predictedPlayerEntity are one in the same.
-	if (cg.demoPlayback == 2) {
-		BG_PlayerStateToEntityStateExtraPolate(&snap->ps, &pes, snap->ps.commandTime, qfalse);
-		CG_AddToHistory(snap->serverTime, &pes, &cg_entities[snap->ps.clientNum]);
-	}
-	//cg_entities[snap->ps.clientNum].interpolate = qtrue;
 
 	// check for extrapolation errors
 	for ( num = 0 ; num < snap->numEntities ; num++ ) 
@@ -336,7 +416,6 @@ void CG_SetNextSnap( snapshot_t *snap ) {
 		cent = &cg_entities[ es->number ];
 
 		memcpy(&cent->nextState, es, sizeof(entityState_t));
-		//cent->nextState = *es;
 
 		// if this frame is a teleport, or the entity wasn't in the
 		// previous frame, don't interpolate
@@ -345,46 +424,30 @@ void CG_SetNextSnap( snapshot_t *snap ) {
 		} else {
 			cent->interpolate = qtrue;
 		}
-
-		if (cg.demoPlayback == 2)
-			CG_AddToHistory( snap->serverTime, es, cent );
 	}
 
 	cg.nextFrameTeleport = CG_IsTeleport( cg.snap, snap );
 
-	if ( cg.nextNextSnap == NULL && cg.demoPlayback == 2 ) {
-		CG_UpdateTps( snap, cg.nextFrameTeleport );
+	if ( recordHistory && cg.demoPlayback == 2 ) {
+		CG_RecordSnapshotHistory( cg.snap, snap );
 	}
 
 	// sort out solid entities
 	CG_BuildSolidList();
 }
 
-/*
-===================
-CG_SetNextNextSnap
+void CG_SetNextSnap( snapshot_t *snap ) {
+	CG_SetNextSnapInternal( snap, qtrue );
+}
 
-A new snapshot has just been read in from the client system.
-===================
-*/
-void CG_SetNextNextSnap( snapshot_t *snap ) {
-	int num;
-	entityState_t *es, pes;
-	centity_t *cent;
-	cg.nextNextSnap = snap;
-	CG_UpdateTps( snap, CG_IsTeleport( cg.nextSnap, snap ) );
-	BG_PlayerStateToEntityStateExtraPolate( &snap->ps, &pes, snap->ps.commandTime, qfalse );
-	//cg_entities[ cg.snap->ps.clientNum ].interpolate = qtrue;
-	//No longer want to do this, as the cg_entities[clnum] and cg.predictedPlayerEntity are one in the same.
-	CG_AddToHistory( snap->serverTime, &pes, &cg_entities[ snap->ps.clientNum ] );
-
-	for ( num = 0 ; num < snap->numEntities ; num++ ) 
-	{
-		es = &snap->entities[num];
-		cent = &cg_entities[ es->number ];
-
-		CG_AddToHistory( snap->serverTime, es, cent );
+void CG_PushFutureSnap( snapshot_t *snap ) {
+	snapshot_t *prevSnap;
+	if ( !snap || cg.numFutureSnaps >= MAX_SMOOTH_LOOKAHEAD_SNAPS ) {
+		return;
 	}
+	prevSnap = ( cg.numFutureSnaps > 0 ) ? cg.futureSnaps[cg.numFutureSnaps - 1] : cg.nextSnap;
+	cg.futureSnaps[cg.numFutureSnaps++] = snap;
+	CG_RecordSnapshotHistory( prevSnap, snap );
 }
 
 /*
@@ -437,11 +500,17 @@ void CG_TransitionSnapshot( void ) {
 		cent->snapShotTime = cg.snap->serverTime;
 	}
 
-	if ( !cg.nextNextSnap ) {
-		cg.nextSnap = NULL;	
+	if ( cg.numFutureSnaps <= 0 ) {
+		cg.nextSnap = NULL;
 	} else {
-		CG_SetNextSnap( cg.nextNextSnap );
-		cg.nextNextSnap = NULL;
+		snapshot_t *promoted = cg.futureSnaps[0];
+		int fIdx;
+		for ( fIdx = 1; fIdx < cg.numFutureSnaps; fIdx++ ) {
+			cg.futureSnaps[fIdx - 1] = cg.futureSnaps[fIdx];
+		}
+		cg.futureSnaps[cg.numFutureSnaps - 1] = NULL;
+		cg.numFutureSnaps--;
+		CG_SetNextSnapInternal( promoted, qfalse );
 	}
 
 	// check for playerstate transition events
@@ -494,17 +563,25 @@ snapshot_t *CG_ReadNextSnapshot( void ) {
 			dest = &cg.activeSnapshots[0];
 		} else {
 			// pick slot not already used
-			int curOffset;
-			for ( curOffset = 0; curOffset < 3; curOffset++ ) {
-				if ( ( !cg.snap || cg.snap != &cg.activeSnapshots[curOffset] ) &&
-						( !cg.nextSnap || cg.nextSnap != &cg.activeSnapshots[curOffset] ) ) {
+			int curOffset, fIdx;
+			dest = NULL;
+			for ( curOffset = 0; curOffset < MAX_ACTIVE_SNAPSHOTS; curOffset++ ) {
+				snapshot_t *cand = &cg.activeSnapshots[curOffset];
+				qboolean inUse = ( cg.snap == cand ) || ( cg.nextSnap == cand );
+				for ( fIdx = 0; !inUse && fIdx < cg.numFutureSnaps; fIdx++ ) {
+					if ( cg.futureSnaps[fIdx] == cand ) {
+						inUse = qtrue;
+					}
+				}
+				if ( !inUse ) {
+					dest = cand;
 					break;
 				}
 			}
-			if ( curOffset == 3 ) {
+			if ( !dest ) {
 				Com_Printf( "WARNING: Couldn't find unused activeSnapshot\n" );
+				return NULL;
 			}
-			dest = &cg.activeSnapshots[curOffset % 3];
 		}
 
 		// try to read the snapshot from the client system
@@ -512,15 +589,13 @@ snapshot_t *CG_ReadNextSnapshot( void ) {
 		r = trap_GetSnapshot( cgs.processedSnapshotNum, dest );
 
 		// FIXME: why would trap_GetSnapshot return a snapshot with the same server time
-		if ( cg.snap && r && dest->serverTime == cg.snap->serverTime ) {
-			//[BugFix30]
-			//According to dumbledore, this situation occurs when you're playing back a demo that was record when
-			//the game was running in local mode.  As such, we need to skip those snaps or the demo looks laggy.
-			if ( cg.demoPlayback ) 
-			{
+		if ( r && cg.demoPlayback ) {
+			snapshot_t *lastRead = ( cg.numFutureSnaps > 0 )
+				? cg.futureSnaps[cg.numFutureSnaps - 1]
+				: ( cg.nextSnap ? cg.nextSnap : cg.snap );
+			if ( lastRead && dest->serverTime == lastRead->serverTime ) {
 				continue;
 			}
-			//[/BugFix30]
 		}
 
 		// if it succeeded, return
@@ -577,7 +652,7 @@ void CG_ResetForDemoSeek( int serverCommandSeq, int processedSnapNum ) {
 	cg.clientFrame = 0;
 	cg.snap = NULL;
 	cg.nextSnap = NULL;
-	cg.nextNextSnap = NULL;
+	CG_ResetCommandSmoothHistory();
 	cg.latestSnapshotNum = 0;
 	cg.latestSnapshotTime = 0;
 	cg.validPPS = qfalse;
@@ -760,24 +835,20 @@ void CG_ProcessSnapshots( void ) {
 				CG_Error( "CG_ProcessSnapshots: Server time went backwards" );
 			}
 		}
-		if ( cg.demoPlayback == 2 && !cg.nextNextSnap ) {
+		while ( cg.demoPlayback == 2 && cg.numFutureSnaps < MAX_SMOOTH_LOOKAHEAD_SNAPS ) {
+			snapshot_t *prevFuture = ( cg.numFutureSnaps > 0 ) ? cg.futureSnaps[cg.numFutureSnaps - 1] : cg.nextSnap;
 			snap = CG_ReadNextSnapshot();
-
-			// if we still don't have a nextframe, we will just have to
-			// extrapolate
-			if ( snap ) {
-				CG_SetNextNextSnap( snap );
-
-
-				// if time went backwards, we have a level restart
-				if ( cg.nextNextSnap->serverTime < cg.nextSnap->serverTime ) {
-					CG_Error( "CG_ProcessSnapshots: Server time went backwards" );
-				}
+			if ( !snap ) {
+				break;
 			}
+			if ( prevFuture && snap->serverTime < prevFuture->serverTime ) {
+				CG_Error( "CG_ProcessSnapshots: Server time went backwards" );
+			}
+			CG_PushFutureSnap( snap );
 		}
 
 		// if our time is < nextFrame's, we have a nice interpolating state
-		if ( cg.time >= cg.snap->serverTime && cg.time < cg.nextSnap->serverTime ) {
+		if ( cg.time < cg.nextSnap->serverTime ) {
 			break;
 		}
 

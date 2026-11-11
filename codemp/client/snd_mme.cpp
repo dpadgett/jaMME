@@ -19,11 +19,20 @@ typedef struct {
 	float			deltaSamples, sampleRate;
 	mixLoop_t		loops[MME_LOOPCHANNELS];
 	mixChannel_t	channels[MME_SNDCHANNELS];
+	mixBackground_t	background;
 	mixEffect_t		effect;
 	qboolean		gotFrame;
 } mmeWav_t;
 
 static mmeWav_t mmeSound;
+
+static void S_MMECloseBackground(void) {
+	if (mmeSound.background.sound) {
+		openSound_t *oldBg = mmeSound.background.sound;
+		mmeSound.background.sound = 0;
+		S_SoundClose(oldBg);
+	}
+}
 
 /*
 =================================================================================
@@ -62,13 +71,16 @@ static void S_MMEFillWavHeader(void* buffer, int32_t fileSize, int sampleRate) {
 void S_MMEWavClose(void) {
 	byte header[WAV_HEADERSIZE];
 
-	if (!mmeSound.fileHandle)
+	if (!mmeSound.fileHandle) {
+		S_MMECloseBackground();
 		return;
+	}
 
 	S_MMEFillWavHeader( header, mmeSound.fileSize, MME_SAMPLERATE );
 	FS_Seek( mmeSound.fileHandle, 0, FS_SEEK_SET );
 	FS_Write( header, sizeof(header), mmeSound.fileHandle );
 	FS_FCloseFile( mmeSound.fileHandle );
+	S_MMECloseBackground();
 	Com_Memset( &mmeSound, 0, sizeof(mmeSound) );
 }
 
@@ -76,10 +88,13 @@ static byte wavExportBuf[MME_SAMPLERATE * 4] = {0};
 static int bytesInBuf = 0;
 
 void S_MMEResetExport(void) {
-	mmeSound.baseName[0] = '\0';
-	mmeSound.deltaSamples = 0;
-	mmeSound.fileSize = 0;
-	mmeSound.gotFrame = qfalse;
+	if (mmeSound.fileHandle) {
+		S_MMEWavClose();
+	} else {
+		S_MMECloseBackground();
+	}
+	Com_Memset( &mmeSound, 0, sizeof(mmeSound) );
+	Com_Memset( wavExportBuf, 0, sizeof(wavExportBuf) );
 	bytesInBuf = 0;
 }
 
@@ -137,6 +152,7 @@ void S_MMEUpdate( float scale ) {
 
 	Com_Memset( mixTemp, 0, sizeof(int) * count * 2);
 	if ( speed > 0 ) {
+		S_MixBackground( &mmeSound.background, (MIX_SPEED << MIX_SHIFT) / MME_SAMPLERATE, count, mixTemp );
 		S_MixChannels( mmeSound.channels, MME_SNDCHANNELS, speed, count, mixTemp );
 		S_MixLoops( mmeSound.loops, MME_LOOPCHANNELS, speed, count, mixTemp );
 		S_MixEffects( &mmeSound.effect, speed, count, mixTemp );
@@ -192,6 +208,8 @@ void S_MMERecord( const char *baseName, float deltaTime ) {
 			mmeSound.fileSize = WAV_HEADERSIZE;
 		}
 	} else if (Q_stricmp(baseName, mmeSound.baseName) && MME_AVIIMPORT) {
+		S_MMECloseBackground();
+		Com_Memset( &mmeSound, 0, sizeof(mmeSound) );
 		Q_strncpyz( mmeSound.baseName, baseName, sizeof( mmeSound.baseName ));
 		mmeSound.deltaSamples = 0;
 		mmeSound.sampleRate = MME_SAMPLERATE;
@@ -205,8 +223,10 @@ void S_MMERecord( const char *baseName, float deltaTime ) {
 /* This is a seriously crappy hack, but it'll work for now */
 void S_MMEMusic( const char *musicName, float time, float length ) {
 	if ( !musicName || !musicName[0] ) {
-		s_background.playing = qfalse;
-		s_background.override = qfalse;
+		if ( s_background.override ) {
+			s_background.playing = qfalse;
+			s_background.override = qfalse;
+		}
 		return;
 	}
 	Q_strncpyz( s_background.startName, musicName, sizeof( s_background.startName ));
@@ -220,6 +240,7 @@ void S_MMEMusic( const char *musicName, float time, float length ) {
 		s_background.length = length;
 		s_background.playing = qtrue;
 		s_background.reload = qtrue;
+		s_backgroundReloadSeq++;
 	}
 }
 

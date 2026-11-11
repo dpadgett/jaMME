@@ -71,6 +71,34 @@
     } catch (_) {}
   }
 
+  function readPersistedMusicPref() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY_PLAYER_PREFS);
+      if (!raw) return true;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.musicEnabled === 'boolean') {
+        return parsed.musicEnabled;
+      }
+      if (parsed && typeof parsed.music === 'boolean') {
+        return parsed.music;
+      }
+    } catch (_) {}
+    return true;
+  }
+
+  function writePersistedMusicPref(enabled) {
+    try {
+      let existing = {};
+      const raw = localStorage.getItem(STORAGE_KEY_PLAYER_PREFS);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') existing = parsed;
+      }
+      existing.musicEnabled = Boolean(enabled);
+      localStorage.setItem(STORAGE_KEY_PLAYER_PREFS, JSON.stringify(existing));
+    } catch (_) {}
+  }
+
   function clampGammaPref(val) {
     const num = Number(val);
     if (!Number.isFinite(num)) return 1.0;
@@ -143,6 +171,10 @@
     '<svg class="jk-icon-svg" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="8" r="2.7"/><path d="M8 1.5v1.8M8 12.7v1.8M1.5 8h1.8M12.7 8h1.8M3.4 3.4l1.3 1.3M11.3 11.3l1.3 1.3M12.6 3.4l-1.3 1.3M4.7 11.3l-1.3 1.3"/></svg>';
   const ICON_CLIP =
     '<svg class="jk-icon-svg" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.8" y="3" width="9.4" height="10" rx="1.6"/><path d="M11.2 6.4L14.5 4.5v7l-3.3-1.9"/></svg>';
+  const ICON_MUSIC_ON =
+    '<svg class="jk-icon-svg" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 12.2V3.8l7-1.6v8.4"/><circle cx="4.2" cy="12.2" r="1.8"/><circle cx="11.2" cy="10.6" r="1.8"/></svg>';
+  const ICON_MUSIC_OFF =
+    '<svg class="jk-icon-svg" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 12.2V4.5m0-1.7v1l7-1.6v6.2"/><circle cx="4.2" cy="12.2" r="1.8"/><circle cx="11.2" cy="10.6" r="1.8"/><path d="M2 2l12 12"/></svg>';
   const ICON_PLAY_OVERLAY =
     '<svg class="jk-icon-svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor" aria-hidden="true"><path d="M7 5.5v13l11-6.5-11-6.5z"/></svg>';
   const ICON_PAUSE_OVERLAY =
@@ -156,6 +188,7 @@
     hasSavedLayout: false,
     preset: 'default',
     thirdPerson: readPersistedThirdPersonPref(),
+    musicEnabled: readPersistedMusicPref(),
     gamma: initialLightingPrefs.gamma,
     overbright: initialLightingPrefs.overbright,
     lightingOpen: false,
@@ -859,8 +892,13 @@
         color: #79c0ff;
       }
       #jk-pip-lighting-btn,
-      #jk-pip-export-btn {
+      #jk-pip-export-btn,
+      #jk-pip-music {
         gap: calc(4px * var(--jk-ui-scale, 1));
+      }
+      .jk-pip-music-icon {
+        display: inline-flex;
+        align-items: center;
       }
       .jk-pip-timeline-row[hidden] {
         display: none !important;
@@ -1193,7 +1231,8 @@
         font-size: calc(10px * var(--jk-ui-scale, 1));
       }
       #jk-pip-card.jk-pip-xs .jk-pip-light-label,
-      #jk-pip-card.jk-pip-xs .jk-pip-clip-label {
+      #jk-pip-card.jk-pip-xs .jk-pip-clip-label,
+      #jk-pip-card.jk-pip-xs .jk-pip-music-label {
         display: none;
       }
       #jk-pip-card.jk-pip-xs #jk-pip-lighting-panel {
@@ -1208,7 +1247,8 @@
       }
       @container jk-card (max-width: 380px) {
         .jk-pip-light-label,
-        .jk-pip-clip-label {
+        .jk-pip-clip-label,
+        .jk-pip-music-label {
           display: none;
         }
       }
@@ -1890,6 +1930,7 @@
             <button type="button" id="jk-pip-export-btn" class="jk-pip-ctrl-btn" title="Export video clip (.mp4)" aria-label="Export video clip" aria-pressed="false">${ICON_CLIP}<span class="jk-pip-clip-label">Clip</span></button>
           </div>
           <div class="jk-pip-btn-group jk-pip-audio-group">
+            <button type="button" id="jk-pip-music" class="jk-pip-ctrl-btn${pipState.musicEnabled ? ' active' : ''}" data-music-icon="${pipState.musicEnabled ? '1' : '0'}" title="${pipState.musicEnabled ? 'Background music on (click to mute music only)' : 'Background music off (sound effects still play)'}" aria-label="Music" aria-pressed="${pipState.musicEnabled ? 'true' : 'false'}"><span class="jk-pip-music-icon" aria-hidden="true">${pipState.musicEnabled ? ICON_MUSIC_ON : ICON_MUSIC_OFF}</span><span class="jk-pip-music-label">Music</span></button>
             <button type="button" id="jk-pip-mute" class="jk-pip-ctrl-btn" title="Mute / Unmute">Mute</button>
             <input type="range" id="jk-pip-volume" min="0" max="1" step="0.01" value="0.8" aria-label="Volume" />
             <button type="button" id="jk-pip-fullscreen" class="jk-pip-ctrl-btn" title="Fullscreen" aria-label="Fullscreen" aria-pressed="false">${ICON_FULLSCREEN_ENTER}</button>
@@ -1950,6 +1991,7 @@
     const cameraBtn = card.querySelector('#jk-pip-camera');
     const seekInput = card.querySelector('#jk-pip-seek');
     const speedSelect = card.querySelector('#jk-pip-speed');
+    const musicBtn = card.querySelector('#jk-pip-music');
     const muteBtn = card.querySelector('#jk-pip-mute');
     const volumeInput = card.querySelector('#jk-pip-volume');
     const fullscreenBtn = card.querySelector('#jk-pip-fullscreen');
@@ -2477,6 +2519,15 @@
       }
     });
 
+    if (musicBtn) {
+      musicBtn.addEventListener('click', (e) => {
+        if (e && e.isTrusted && !isMuted()) {
+          primeSharedAudioOnUserGesture();
+        }
+        toggleMusic();
+      });
+    }
+
     const handleVolumeEvent = (e) => {
       if (e && e.isTrusted) primeSharedAudioOnUserGesture();
       const rawVal = parseFloat(volumeInput.value);
@@ -2576,6 +2627,12 @@
     window.addEventListener('jkdemo:audiostate', () => {
       updateControlState();
     });
+    window.addEventListener('jkdemo:musicstate', (e) => {
+      if (e && e.detail && typeof e.detail.musicEnabled === 'boolean') {
+        pipState.musicEnabled = e.detail.musicEnabled;
+      }
+      syncMusicButtonUI(pipState.musicEnabled);
+    });
     window.addEventListener('jkdemo:cameramode', (e) => {
       if (e && e.detail && typeof e.detail.thirdPerson === 'boolean') {
         pipState.thirdPerson = e.detail.thirdPerson;
@@ -2664,6 +2721,25 @@
         : 'View: 1st — Switch to third-person camera'
     );
     cameraBtn.classList.toggle('active', !is3p);
+  }
+
+  function syncMusicButtonUI(isEnabled) {
+    const musicBtn = document.getElementById('jk-pip-music');
+    if (!musicBtn) return;
+    const on = Boolean(isEnabled);
+    musicBtn.classList.toggle('active', on);
+    musicBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    musicBtn.title = on
+      ? 'Background music on (click to mute music only)'
+      : 'Background music off (sound effects still play)';
+    const iconState = on ? '1' : '0';
+    if (musicBtn.dataset.musicIcon !== iconState) {
+      musicBtn.dataset.musicIcon = iconState;
+      const iconEl = musicBtn.querySelector('.jk-pip-music-icon');
+      if (iconEl) {
+        iconEl.innerHTML = on ? ICON_MUSIC_ON : ICON_MUSIC_OFF;
+      }
+    }
   }
 
   function applyCanvasGammaFilterLocal(gammaVal) {
@@ -2899,6 +2975,17 @@
       speedSelect.value = String(closest);
     }
 
+    const musicEnabled =
+      mod && typeof mod._JK_DemoIsMusicEnabled === 'function'
+        ? mod._JK_DemoIsMusicEnabled() === 1
+        : typeof player.isMusicEnabled === 'function'
+        ? player.isMusicEnabled()
+        : typeof status.musicEnabled === 'boolean'
+        ? status.musicEnabled
+        : pipState.musicEnabled;
+    pipState.musicEnabled = Boolean(musicEnabled);
+    syncMusicButtonUI(pipState.musicEnabled);
+
     const isMuted =
       mod && typeof mod._JK_DemoIsMuted === 'function'
         ? mod._JK_DemoIsMuted() === 1
@@ -2955,7 +3042,7 @@
       return Promise.resolve(window.JKVideoExport);
     }
     if (videoExportScriptPromise) return videoExportScriptPromise;
-    const PLAYER_ASSET_VERSION = '20261108a';
+    const PLAYER_ASSET_VERSION = '20261111a';
     videoExportScriptPromise = new Promise((resolve, reject) => {
       const existing = document.querySelector('script[src*="/jkplayer/jk-video-export.js"]');
       if (existing) {
@@ -3000,8 +3087,8 @@
     }
 
     // Separate engine vs wrapper versions so UI/JS updates do not invalidate cached openjk.wasm
-    const ENGINE_ASSET_VERSION = '20261108a';
-    const PLAYER_ASSET_VERSION = '20261108a';
+    const ENGINE_ASSET_VERSION = '20261111a';
+    const PLAYER_ASSET_VERSION = '20261111a';
     ensureVideoExportScriptLoaded().catch(() => {});
     window.JKDemoConfig = Object.assign(
       {
@@ -3913,6 +4000,30 @@
     return setMuted(!isMuted());
   }
 
+  function setMusicEnabled(enabled) {
+    const next = Boolean(enabled);
+    pipState.musicEnabled = next;
+    writePersistedMusicPref(next);
+    const player = getPlayer();
+    if (player && typeof player.setMusicEnabled === 'function') {
+      player.setMusicEnabled(next);
+    }
+    syncMusicButtonUI(next);
+    return next;
+  }
+
+  function isMusicEnabled() {
+    const player = getPlayer();
+    if (player && typeof player.isMusicEnabled === 'function') {
+      return player.isMusicEnabled();
+    }
+    return Boolean(pipState.musicEnabled);
+  }
+
+  function toggleMusic() {
+    return setMusicEnabled(!isMusicEnabled());
+  }
+
   function toggleFullscreen() {
     const card = document.getElementById('jk-pip-card');
     if (!card) return;
@@ -4039,6 +4150,10 @@
     setMuted,
     isMuted,
     toggleMute,
+    setMusicEnabled,
+    getMusicEnabled: isMusicEnabled,
+    isMusicEnabled,
+    toggleMusic,
     setSizePreset,
     toggleFullscreen,
     isOpen: () => pipState.open,

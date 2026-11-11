@@ -346,6 +346,7 @@ typedef struct cgLoopSound_s {
 typedef struct timedEntityState_s {
 	int time;
 	int serverTime;
+	int snapSeq;
 	qboolean isTeleport;
 	entityState_t es;
 } timedEntityState_t;
@@ -357,19 +358,31 @@ typedef struct timedPlayerState_s {
 	playerState_t ps;
 } timedPlayerState_t;
 
-#define MAX_STATE_HISTORY 8
+#define MAX_STATE_HISTORY 16
+#define MAX_SMOOTH_LOOKAHEAD_SNAPS 8
+#define MAX_ACTIVE_SNAPSHOTS (2 + MAX_SMOOTH_LOOKAHEAD_SNAPS)
 typedef struct playerHistory_s {
 	int		nextSlot;
+	double	clockOffset;
+	qboolean hasClockOffset;
 	timedEntityState_t	states[MAX_STATE_HISTORY];
 } playerHistory_t;
 
 typedef struct psHistory_s {
 	int		nextSlot;
+	double	clockOffset;
+	qboolean hasClockOffset;
 	timedPlayerState_t	states[MAX_STATE_HISTORY];
 } psHistory_t;
 
 void demoTrajectory( const trajectory_t *tr, int time, float timeFraction, vec3_t result );
 void demoNowTrajectory( const trajectory_t *tr, vec3_t result );
+void CG_ResetCommandSmoothHistory( void );
+void CG_RecordSnapshotHistory( snapshot_t *prevSnap, snapshot_t *snap );
+void CG_PushFutureSnap( snapshot_t *snap );
+int CG_ResolveEndpointMover( const vec3_t inOrigin, const vec3_t inVelocity, int groundEntityNum, int snapServerTime, vec3_t outSnapOrigin, qboolean *outCaughtFalling );
+void CG_AdjustEndpointForMover( const vec3_t inSnapOrigin, int moverNum, int snapServerTime, int renderTime, float renderTimeFraction, vec3_t outOrigin, float *outDeltaYaw );
+qboolean CG_IsExplosionOccluded( const vec3_t camOrigin, const vec3_t eventPos );
 // centity_t have a direct corespondence with gentity_t in the game, but
 // only the entityState_t is directly communicated to the cgame
 typedef struct centity_s {
@@ -508,6 +521,8 @@ typedef struct centity_s {
 
 	int				vChatTime;
 } centity_t;
+
+void CG_EvaluateMoverPosition( centity_t *cent, int time, float timeFraction, vec3_t outOrigin, vec3_t outAngles );
 
 
 //======================================================================
@@ -832,7 +847,9 @@ typedef struct {
 
 	snapshot_t	*snap;				// cg.snap->serverTime <= cg.time
 	snapshot_t	*nextSnap;			// cg.nextSnap->serverTime > cg.time, or NULL
-	snapshot_t	*nextNextSnap;		// cg.nextNextSnap->serverTime > cg.nextSnap->serverTime, or NULL
+	snapshot_t	*futureSnaps[MAX_SMOOTH_LOOKAHEAD_SNAPS];
+	int			numFutureSnaps;
+	int			historySnapSeq;
 //	snapshot_t	activeSnapshots[2];
 
 	float		frameInterpolation;	// (float)( cg.time - cg.frame->serverTime ) / (cg.nextFrame->serverTime - cg.frame->serverTime)
@@ -1063,7 +1080,7 @@ Ghoul2 Insert Start
 */
 	int				testModel;
 	// had to be moved so we wouldn't wipe these out with the memset - these have STL in them and shouldn't be cleared that way
-	snapshot_t	activeSnapshots[3];
+	snapshot_t	activeSnapshots[MAX_ACTIVE_SNAPSHOTS];
 	int				currentPsHistory;
 	psHistory_t		psHistory;
 /*
@@ -1100,6 +1117,8 @@ Ghoul2 Insert End
 	float				eventOldRadius;
 	float				eventCoeff;
 	float				eventOldCoeff;
+	vec3_t				eventOrigin;
+	vec3_t				eventOldOrigin;
 	
 	struct {
 		qboolean		detected;

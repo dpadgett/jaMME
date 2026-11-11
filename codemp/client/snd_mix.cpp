@@ -15,7 +15,12 @@ static	mixSound_t		*mixSounds[SFX_SOUNDS];
 #define DEF_COMSOUNDMEGS "32"
 #endif
 static  mixSound_t		*mixAllocSounds = 0;
-static  mixSound_t		mixEmptySound;
+typedef struct {
+	mixSound_t	sound;
+	short		data[4];
+} mixEmptySoundStorage_t;
+static  mixEmptySoundStorage_t	mixEmptySoundStorage;
+#define mixEmptySound (mixEmptySoundStorage.sound)
 
 static cvar_t	*s_mixSame;
 static cvar_t	*s_mixSameTime;
@@ -108,11 +113,17 @@ takeNext:
 }
 
 #ifdef __EMSCRIPTEN__
+#include <emscripten.h>
 extern "C" int JK_DemoIsPlaying( void );
+extern "C" int JK_ExportIsCapturing( void );
 extern "C" qboolean FS_WasmIsFileCached( const char *qpath );
 extern "C" void FS_WasmPrefetchFileAsync( const char *qpath );
 extern int sfxEntryCount;
 static int s_prewarmSoundCursor = 1;
+
+EM_JS(int, wasm_js_is_worker_env, (), {
+	return (typeof WorkerGlobalScope !== 'undefined') ? 1 : 0;
+});
 #endif
 
 const mixSound_t *S_MixGetSound( sfxHandle_t sfxHandle ) {
@@ -129,7 +140,7 @@ const mixSound_t *S_MixGetSound( sfxHandle_t sfxHandle ) {
 
 	entry = sfxEntries + sfxHandle;
 #ifdef __EMSCRIPTEN__
-	if ( JK_DemoIsPlaying() && entry->name[0] && !FS_WasmIsFileCached( entry->name ) ) {
+	if ( JK_DemoIsPlaying() && !JK_ExportIsCapturing() && !wasm_js_is_worker_env() && entry->name[0] && !FS_WasmIsFileCached( entry->name ) ) {
 		FS_WasmPrefetchFileAsync( entry->name );
 		return &mixEmptySound;
 	}
@@ -290,12 +301,16 @@ static void S_MixChannel( mixChannel_t *ch, int speed, int count, int *output ) 
 
 	S_MixSpatialize( origin, volume , &leftVol, &rightVol );
 #ifdef __EMSCRIPTEN__
-	if (s_soundMuted && !mixSounds[ch->handle]) {
+	if (s_soundMuted && !JK_ExportIsCapturing() && !mixSounds[ch->handle]) {
 		ch->handle = 0;
 		return;
 	}
 #endif
 	sound = S_MixGetSound( ch->handle );
+	if ( !sound || sound == &mixEmptySound || sound->samples <= 0 ) {
+		ch->handle = 0;
+		return;
+	}
 
 	index = ch->index;
 	indexAdd = (sound->speed * speed) >> MIX_SHIFT;
@@ -458,11 +473,15 @@ static void S_MixLoop( mixLoop_t *loop, const loopQueue_t *lq, int speed, int co
 	volume = s_volume->value * lq->volume;
 	S_MixSpatialize( lq->origin, volume, &leftVol, &rightVol );
 #ifdef __EMSCRIPTEN__
-	if (s_soundMuted && !mixSounds[loop->handle]) {
+	if (s_soundMuted && !JK_ExportIsCapturing() && !mixSounds[loop->handle]) {
 		return;
 	}
 #endif
 	sound = S_MixGetSound( loop->handle );
+	if ( !sound || sound == &mixEmptySound || sound->samples <= 0 ) {
+		loop->index = 0;
+		return;
+	}
 
 	index = loop->index;
 	indexAdd = (sound->speed * speed) >> MIX_SHIFT;
@@ -544,7 +563,9 @@ void S_MixBackground( mixBackground_t *background, int speed, int count, int *ou
 	int		volumeMul;
 	short	buf[MIX_SIZE*2][2];
 
-	speed = (MIX_SPEED << MIX_SHIFT) / dma.speed;
+	if ( speed <= 0 ) {
+		speed = (MIX_SPEED << MIX_SHIFT) / (dma.speed > 0 ? dma.speed : MIX_SPEED);
+	}
 	if ( s_background.playing ) {
 		if ( !s_background.override && (!s_musicVolume || s_musicVolume->value <= 0.0f) ) {
 			if ( count > 0 ) {
@@ -553,24 +574,26 @@ void S_MixBackground( mixBackground_t *background, int speed, int count, int *ou
 			return;
 		}
 		/* Do we need a reload */
-		if ( s_background.reload ) {
+		if ( background->reloadSeq != s_backgroundReloadSeq ) {
 #ifdef __EMSCRIPTEN__
-			if ( s_background.startName[0] && !FS_WasmIsFileCached( s_background.startName ) ) {
-				FS_WasmPrefetchFileAsync( s_background.startName );
-				if ( !s_background.override && s_background.loopName[0] && Q_stricmp( s_background.loopName, s_background.startName ) ) {
+			if ( !JK_ExportIsCapturing() && !wasm_js_is_worker_env() ) {
+				if ( s_background.startName[0] && !FS_WasmIsFileCached( s_background.startName ) ) {
+					FS_WasmPrefetchFileAsync( s_background.startName );
+					if ( !s_background.override && s_background.loopName[0] && Q_stricmp( s_background.loopName, s_background.startName ) ) {
+						FS_WasmPrefetchFileAsync( s_background.loopName );
+					}
+					if ( count > 0 ) {
+						Com_Memset( output, 0, count * sizeof(int) * 2 );
+					}
+					return;
+				}
+				if ( !s_background.override && s_background.loopName[0] && !FS_WasmIsFileCached( s_background.loopName ) ) {
 					FS_WasmPrefetchFileAsync( s_background.loopName );
+					if ( count > 0 ) {
+						Com_Memset( output, 0, count * sizeof(int) * 2 );
+					}
+					return;
 				}
-				if ( count > 0 ) {
-					Com_Memset( output, 0, count * sizeof(int) * 2 );
-				}
-				return;
-			}
-			if ( !s_background.override && s_background.loopName[0] && !FS_WasmIsFileCached( s_background.loopName ) ) {
-				FS_WasmPrefetchFileAsync( s_background.loopName );
-				if ( count > 0 ) {
-					Com_Memset( output, 0, count * sizeof(int) * 2 );
-				}
-				return;
 			}
 #endif
 			/* Already playing, check if we already have the right one open */
@@ -606,6 +629,8 @@ void S_MixBackground( mixBackground_t *background, int speed, int count, int *ou
 				}
 			}
 			background->index = 1 << MIX_SHIFT;
+			background->reloadSeq = s_backgroundReloadSeq;
+			s_background.reload = qfalse;
 		}
 		if (!count)
 			return;
@@ -659,6 +684,14 @@ void S_MixBackground( mixBackground_t *background, int speed, int count, int *ou
 						background->sound = 0;
 						Q_strncpyz( background->soundName, s_background.loopName, sizeof( background->soundName));
 						S_SoundClose( oldSound );
+#ifdef __EMSCRIPTEN__
+						if ( !JK_ExportIsCapturing() && !wasm_js_is_worker_env() && s_background.loopName[0] && !FS_WasmIsFileCached( s_background.loopName ) ) {
+							background->reloadSeq = 0;
+							FS_WasmPrefetchFileAsync( s_background.loopName );
+							Com_Memset( output, 0, count * sizeof(int) * 2 );
+							return;
+						}
+#endif
 						background->sound = S_SoundOpen( s_background.loopName );
 					}
 					background->index = 1 << MIX_SHIFT;
@@ -710,7 +743,8 @@ void S_MixInit( void ) {
 		free( mixAllocSounds );
 		mixAllocSounds = 0;
 	}
-	mixEmptySound.speed = (MIX_SPEED << MIX_SHIFT) / MIX_SPEED;;
+	Com_Memset( &mixEmptySoundStorage, 0, sizeof( mixEmptySoundStorage ) );
+	mixEmptySound.speed = (MIX_SPEED << MIX_SHIFT) / MIX_SPEED;
 	mixEmptySound.samples = 1 << MIX_SHIFT;
 
 	cv = Cvar_Get( "com_soundMegs", DEF_COMSOUNDMEGS, CVAR_LATCH | CVAR_ARCHIVE );

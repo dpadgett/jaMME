@@ -456,14 +456,19 @@ static void CG_UpdateThirdPersonTargetDamp(void)
 		// Now we calculate how much of the difference we cover in the time allotted.
 		// The equation is (Damp)^(time)
 		dampfactor = 1.0-cg_thirdPersonTargetDamp.value;	// We must exponent the amount LEFT rather than the amount bled off
-		dtime = (float)(cg.time-cameraLastFrame) * (1.0/(float)CAMERA_DAMP_INTERVAL);	// Our dampfactor is geared towards a time interval equal to "1".
+		if ( cg.demoPlayback == 2 ) {
+			dtime = ( cg.frametime > 0.0f ? cg.frametime : 0.0f ) * ( 1.0f / (float)CAMERA_DAMP_INTERVAL );
+			ratio = powf( dampfactor, dtime );
+		} else {
+			dtime = (float)(cg.time-cameraLastFrame) * (1.0/(float)CAMERA_DAMP_INTERVAL);	// Our dampfactor is geared towards a time interval equal to "1".
 
-		// Note that since there are a finite number of "practical" delta millisecond values possible, 
-		// the ratio should be initialized into a chart ultimately.
-		if ( cg_smoothCamera.integer )
-			ratio = powf(dampfactor, dtime);
-		else
-			ratio = Q_powf( dampfactor, dtime );
+			// Note that since there are a finite number of "practical" delta millisecond values possible, 
+			// the ratio should be initialized into a chart ultimately.
+			if ( cg_smoothCamera.integer )
+				ratio = powf(dampfactor, dtime);
+			else
+				ratio = Q_powf( dampfactor, dtime );
+		}
 		
 		// This value is how much distance is "left" from the ideal.
 		VectorMA(cameraIdealTarget, -ratio, targetdiff, cameraCurTarget);
@@ -546,14 +551,19 @@ static void CG_UpdateThirdPersonCameraDamp(void)
 		// Now we calculate how much of the difference we cover in the time allotted.
 		// The equation is (Damp)^(time)
 		dampfactor = 1.0-dampfactor;	// We must exponent the amount LEFT rather than the amount bled off
-		dtime = (float)(cg.time-cameraLastFrame) * (1.0/(float)CAMERA_DAMP_INTERVAL);	// Our dampfactor is geared towards a time interval equal to "1".
+		if ( cg.demoPlayback == 2 ) {
+			dtime = ( cg.frametime > 0.0f ? cg.frametime : 0.0f ) * ( 1.0f / (float)CAMERA_DAMP_INTERVAL );
+			ratio = powf( dampfactor, dtime );
+		} else {
+			dtime = (float)(cg.time-cameraLastFrame) * (1.0/(float)CAMERA_DAMP_INTERVAL);	// Our dampfactor is geared towards a time interval equal to "1".
 
-		// Note that since there are a finite number of "practical" delta millisecond values possible, 
-		// the ratio should be initialized into a chart ultimately.
-		if ( cg_smoothCamera.integer )
-			ratio = powf(dampfactor, dtime);
-		else
-			ratio = Q_powf( dampfactor, dtime );
+			// Note that since there are a finite number of "practical" delta millisecond values possible, 
+			// the ratio should be initialized into a chart ultimately.
+			if ( cg_smoothCamera.integer )
+				ratio = powf(dampfactor, dtime);
+			else
+				ratio = Q_powf( dampfactor, dtime );
+		}
 		
 		// This value is how much distance is "left" from the ideal.
 		VectorMA(cameraIdealLoc, -ratio, locdiff, cameraCurLoc);
@@ -565,7 +575,8 @@ static void CG_UpdateThirdPersonCameraDamp(void)
 
 	if (trace.fraction < 1.0)
 	{
-		if (trace.entityNum < ENTITYNUM_WORLD &&
+		if (cg.demoPlayback != 2 &&
+			trace.entityNum < ENTITYNUM_WORLD &&
 			cg_entities[trace.entityNum].currentState.solid == SOLID_BMODEL &&
 			cg_entities[trace.entityNum].currentState.eType == ET_MOVER)
 		{ //get a different position for movers -rww
@@ -764,7 +775,11 @@ static void CG_OffsetThirdPersonView( void )
 		{ // Normalize this angle so that it is between 0 and 180.
 			deltayaw = fabs(deltayaw - 360.0f);
 		}
-		cameraStiffFactor = deltayaw / (float)(cg.time-cameraLastFrame);
+		if ( cg.demoPlayback == 2 ) {
+			cameraStiffFactor = ( cg.frametime > 0.0f ) ? ( deltayaw / cg.frametime ) : 0.0f;
+		} else {
+			cameraStiffFactor = (cg.time > cameraLastFrame) ? (deltayaw / (float)(cg.time-cameraLastFrame)) : 0.0f;
+		}
 		if (cameraStiffFactor < 1.0)
 		{
 			cameraStiffFactor = 0.0;
@@ -2361,6 +2376,9 @@ void CG_DoCameraShake( vec3_t origin, float intensity, int radius, int time ) {
 	//Use the dir to add kick to the explosion
 
 	if ( dist > radius )
+		return;
+
+	if ( CG_IsExplosionOccluded( cg.refdef.vieworg, origin ) )
 		return;
 
 	intensityScale = 1 - ( dist / (float) radius );
