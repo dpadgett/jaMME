@@ -3673,7 +3673,7 @@ extern "C" void R_WasmCollectShaderFiles( const char *shaderName, const char *ex
 	if ( !shaderName || !shaderName[0] || !addFileCb ) {
 		return;
 	}
-	char strippedName[MAX_QPATH];
+	char strippedName[MAX_OSPATH];
 	COM_StripExtension( shaderName, strippedName, sizeof( strippedName ) );
 	if ( !strippedName[0] ) {
 		return;
@@ -3727,7 +3727,7 @@ extern "C" void R_WasmCollectShaderFiles( const char *shaderName, const char *ex
 		if ( !Q_stricmp( token, "map" ) || !Q_stricmp( token, "clampmap" ) || !Q_stricmp( token, "specularmap" ) ) {
 			token = COM_ParseExt( &p, qfalse );
 			if ( token[0] && token[0] != '$' && token[0] != '*' ) {
-				char imgName[MAX_QPATH];
+				char imgName[MAX_OSPATH];
 				COM_StripExtension( token, imgName, sizeof( imgName ) );
 				if ( imgName[0] ) {
 					addFileCb( imgName );
@@ -3741,7 +3741,7 @@ extern "C" void R_WasmCollectShaderFiles( const char *shaderName, const char *ex
 					break;
 				}
 				if ( token[0] != '$' && token[0] != '*' ) {
-					char imgName[MAX_QPATH];
+					char imgName[MAX_OSPATH];
 					COM_StripExtension( token, imgName, sizeof( imgName ) );
 					if ( imgName[0] ) {
 						addFileCb( imgName );
@@ -3753,7 +3753,7 @@ extern "C" void R_WasmCollectShaderFiles( const char *shaderName, const char *ex
 			if ( token[0] && strcmp( token, "-" ) ) {
 				static const char *suf[6] = { "rt", "lf", "bk", "ft", "up", "dn" };
 				for ( int i = 0; i < 6; i++ ) {
-					char skyPath[MAX_QPATH];
+					char skyPath[MAX_OSPATH];
 					Com_sprintf( skyPath, sizeof( skyPath ), "%s_%s", token, suf[i] );
 					addFileCb( skyPath );
 				}

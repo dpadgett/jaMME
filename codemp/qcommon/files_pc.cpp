@@ -3910,12 +3910,12 @@ static void WasmPK3_MarkImageOrSoundOrFile( const char *qpath ) {
 	if ( WasmPK3_MarkExactFile( qpath, NULL, NULL ) ) {
 		return;
 	}
-	char base[MAX_QPATH];
+	char base[MAX_ZPATH];
 	COM_StripExtension( qpath, base, sizeof( base ) );
 	if ( !base[0] ) return;
 	static const char *exts[] = { ".jpg", ".tga", ".png", ".wav", ".mp3", ".md3", ".glm", ".efx", NULL };
 	for ( int i = 0; exts[i]; i++ ) {
-		char cand[MAX_QPATH];
+		char cand[MAX_ZPATH];
 		Com_sprintf( cand, sizeof( cand ), "%s%s", base, exts[i] );
 		if ( WasmPK3_MarkExactFile( cand, NULL, NULL ) ) {
 			return;
@@ -3971,8 +3971,8 @@ static void WasmPK3_CollectSkinFile( const char *skinPath, const char *extraShad
 				while ( rlen > 0 && (rhs[rlen - 1] == '\r' || rhs[rlen - 1] == ' ' || rhs[rlen - 1] == '\t') ) {
 					rlen--;
 				}
-				if ( rlen > 0 && rlen < MAX_QPATH && rhs[0] != '*' ) {
-					char shName[MAX_QPATH];
+				if ( rlen > 0 && rlen < MAX_ZPATH && rhs[0] != '*' ) {
+					char shName[MAX_ZPATH];
 					memcpy( shName, rhs, rlen );
 					shName[rlen] = '\0';
 					R_WasmCollectShaderFiles( shName, extraShaderText, WasmPK3_MarkImageOrSoundOrFile );
@@ -4018,6 +4018,8 @@ static void WasmPK3_CollectSoundCfg( const char *cfgPath, qboolean *outAllReady 
 	}
 }
 
+static void WasmPK3_CollectModelFiles( const char *modelName, const char *extraShaderText, qboolean *outAllReady );
+
 static void WasmPK3_CollectPlayerFiles( const char *modelVal, const char *extraShaderText, qboolean *outAllReady ) {
 	if ( !modelVal || !modelVal[0] ) return;
 	char charName[64];
@@ -4036,8 +4038,20 @@ static void WasmPK3_CollectPlayerFiles( const char *modelVal, const char *extraS
 	if ( !charName[0] ) return;
 	if ( !skinSpec[0] ) Q_strncpyz( skinSpec, "default", sizeof(skinSpec) );
 
-	WasmPK3_MarkExactFile( va( "models/players/%s/model.glm", charName ), NULL, NULL );
-	WasmPK3_MarkExactFile( va( "models/players/%s/animation.cfg", charName ), NULL, NULL );
+	char glmPath[MAX_ZPATH];
+	Com_sprintf( glmPath, sizeof( glmPath ), "models/players/%s/model.glm", charName );
+	if ( !WasmPK3_IsFileInMountedPacks( glmPath ) ) {
+		return;
+	}
+	WasmPK3_CollectModelFiles( glmPath, extraShaderText, outAllReady );
+
+	pack_t *animPak = NULL;
+	fileInPack_t *animPf = NULL;
+	if ( WasmPK3_MarkExactFile( va( "models/players/%s/animation.cfg", charName ), &animPak, &animPf ) ) {
+		if ( !animPak || !animPf || !WasmPK3_IsPakFileCached( animPak, animPf ) ) {
+			if ( outAllReady ) *outAllReady = qfalse;
+		}
+	}
 	WasmPK3_MarkExactFile( va( "models/players/%s/animevents.cfg", charName ), NULL, NULL );
 	WasmPK3_MarkExactFile( va( "models/players/%s/playerchoice.txt", charName ), NULL, NULL );
 
@@ -4079,9 +4093,17 @@ static void WasmPK3_CollectPlayerFiles( const char *modelVal, const char *extraS
 		}
 	} else {
 		WasmPK3_CollectSoundCfg( va( "models/players/%s/sounds_%s.cfg", charName, skinSpec ), outAllReady );
+		WasmPK3_CollectSoundCfg( va( "models/players/%s/sounds_%s_red.cfg", charName, skinSpec ), outAllReady );
+		WasmPK3_CollectSoundCfg( va( "models/players/%s/sounds_%s_blue.cfg", charName, skinSpec ), outAllReady );
 		WasmPK3_CollectSkinFile( va( "models/players/%s/model_%s.skin", charName, skinSpec ), extraShaderText, outAllReady );
+		WasmPK3_CollectSkinFile( va( "models/players/%s/model_%s_red.skin", charName, skinSpec ), extraShaderText, outAllReady );
+		WasmPK3_CollectSkinFile( va( "models/players/%s/model_%s_blue.skin", charName, skinSpec ), extraShaderText, outAllReady );
 		WasmPK3_MarkExactFile( va( "models/players/%s/model_%s.g2skin", charName, skinSpec ), NULL, NULL );
+		WasmPK3_MarkExactFile( va( "models/players/%s/model_%s_red.g2skin", charName, skinSpec ), NULL, NULL );
+		WasmPK3_MarkExactFile( va( "models/players/%s/model_%s_blue.g2skin", charName, skinSpec ), NULL, NULL );
 		WasmPK3_MarkImageOrSoundOrFile( va( "models/players/%s/icon_%s", charName, skinSpec ) );
+		WasmPK3_MarkImageOrSoundOrFile( va( "models/players/%s/icon_%s_red", charName, skinSpec ) );
+		WasmPK3_MarkImageOrSoundOrFile( va( "models/players/%s/icon_%s_blue", charName, skinSpec ) );
 	}
 }
 
@@ -4089,7 +4111,7 @@ static void WasmPK3_CollectModelFiles( const char *modelName, const char *extraS
 	if ( !modelName || !modelName[0] || modelName[0] == '*' || modelName[0] == '$' || modelName[0] == '@' ) {
 		return;
 	}
-	char cleanModel[MAX_QPATH];
+	char cleanModel[MAX_ZPATH];
 	Q_strncpyz( cleanModel, modelName, sizeof( cleanModel ) );
 	char * star = strchr( cleanModel, '*' );
 	if ( star ) *star = '\0';
@@ -4097,7 +4119,7 @@ static void WasmPK3_CollectModelFiles( const char *modelName, const char *extraS
 	fileInPack_t *modPf = NULL;
 	WasmPK3_MarkExactFile( cleanModel, &modPak, &modPf );
 	if ( !Q_stricmpn( cleanModel, "models/weapons2/", 16 ) ) {
-		char dirPrefix[MAX_QPATH];
+		char dirPrefix[MAX_ZPATH];
 		Q_strncpyz( dirPrefix, cleanModel, sizeof( dirPrefix ) );
 		char *lastSlash = strrchr( dirPrefix, '/' );
 		if ( lastSlash ) {
@@ -4141,7 +4163,7 @@ static void WasmPK3_CollectModelFiles( const char *modelName, const char *extraS
 	} else if ( modPak && modPf && Q_stristr( cleanModel, ".glm" ) ) {
 		// Skinless .glm entities (e.g. CG_General in cg_ents.c:1407) load <dir>/model_default.skin
 		{
-			char skinDir[MAX_QPATH];
+			char skinDir[MAX_ZPATH];
 			Q_strncpyz( skinDir, cleanModel, sizeof( skinDir ) );
 			char *lastSlash = strrchr( skinDir, '/' );
 			if ( lastSlash ) {
@@ -4291,6 +4313,396 @@ static void WasmPK3_CollectEfxFile( const char *fxName, const char *extraShaderT
 		}
 	}
 	free( efxCopy );
+}
+
+static qboolean WasmPK3_SiegeGetGroup( const char *buf, const char *group, char *out, size_t outSize ) {
+	if ( !buf || !group || !group[0] || !out || outSize == 0 ) return qfalse;
+	out[0] = '\0';
+	size_t i = 0;
+	while ( buf[i] ) {
+		char c = buf[i];
+		if ( c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '}' ) {
+			i++;
+			continue;
+		}
+		if ( c == '/' && buf[i + 1] == '/' ) {
+			while ( buf[i] && buf[i] != '\n' && buf[i] != '\r' ) i++;
+			continue;
+		}
+		if ( c == '{' ) {
+			int depth = 0;
+			while ( buf[i] ) {
+				if ( buf[i] == '{' ) depth++;
+				else if ( buf[i] == '}' && --depth <= 0 ) { i++; break; }
+				i++;
+			}
+			continue;
+		}
+		char checkGroup[256];
+		size_t j = 0;
+		while ( buf[i] && buf[i] != ' ' && buf[i] != '\t' && buf[i] != '\n' && buf[i] != '\r' && buf[i] != '{' ) {
+			if ( buf[i] == '/' && buf[i + 1] == '/' ) break;
+			if ( j + 1 < sizeof( checkGroup ) ) checkGroup[j++] = buf[i];
+			i++;
+		}
+		checkGroup[j] = '\0';
+		if ( buf[i] == '/' && buf[i + 1] == '/' ) {
+			while ( buf[i] && buf[i] != '\n' && buf[i] != '\r' ) i++;
+		}
+		while ( buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\n' || buf[i] == '\r' ) i++;
+		if ( buf[i] == '{' ) {
+			if ( !Q_stricmp( checkGroup, group ) ) {
+				i++;
+				int depth = 1;
+				size_t k = 0;
+				while ( buf[i] && depth > 0 ) {
+					if ( buf[i] == '{' ) depth++;
+					else if ( buf[i] == '}' ) {
+						depth--;
+						if ( depth == 0 ) { i++; break; }
+					}
+					if ( k + 1 < outSize ) {
+						out[k++] = ( buf[i] == '\t' ) ? ' ' : buf[i];
+					}
+					i++;
+				}
+				out[k] = '\0';
+				return qtrue;
+			} else {
+				int depth = 0;
+				while ( buf[i] ) {
+					if ( buf[i] == '{' ) depth++;
+					else if ( buf[i] == '}' && --depth <= 0 ) { i++; break; }
+					i++;
+				}
+			}
+		} else {
+			while ( buf[i] && buf[i] != '\n' && buf[i] != '\r' ) i++;
+		}
+	}
+	return qfalse;
+}
+
+static qboolean WasmPK3_SiegeGetVal( const char *buf, const char *key, char *out, size_t outSize ) {
+	if ( !buf || !key || !key[0] || !out || outSize == 0 ) return qfalse;
+	out[0] = '\0';
+	size_t i = 0;
+	while ( buf[i] ) {
+		char c = buf[i];
+		if ( c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '{' || c == '}' ) {
+			i++;
+			continue;
+		}
+		if ( c == '/' && buf[i + 1] == '/' ) {
+			while ( buf[i] && buf[i] != '\n' && buf[i] != '\r' ) i++;
+			continue;
+		}
+		char checkKey[256];
+		size_t j = 0;
+		while ( buf[i] && buf[i] != ' ' && buf[i] != '\t' && buf[i] != '\n' && buf[i] != '\r' ) {
+			if ( buf[i] == '/' && buf[i + 1] == '/' ) break;
+			if ( j + 1 < sizeof( checkKey ) ) checkKey[j++] = buf[i];
+			i++;
+		}
+		checkKey[j] = '\0';
+		size_t k = i;
+		while ( buf[k] == ' ' || buf[k] == '\t' || buf[k] == '\n' || buf[k] == '\r' ) k++;
+		if ( buf[k] == '{' ) {
+			i = k;
+			int depth = 0;
+			while ( buf[i] ) {
+				if ( buf[i] == '{' ) depth++;
+				else if ( buf[i] == '}' && --depth <= 0 ) { i++; break; }
+				i++;
+			}
+			continue;
+		}
+		if ( !Q_stricmp( checkKey, key ) ) {
+			while ( buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\n' || buf[i] == '\r' ) i++;
+			if ( !buf[i] ) return qfalse;
+			qboolean quoted = qfalse;
+			if ( buf[i] == '"' ) {
+				quoted = qtrue;
+				i++;
+			}
+			size_t m = 0;
+			while ( buf[i] ) {
+				if ( quoted ) {
+					if ( buf[i] == '"' ) break;
+				} else {
+					if ( buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\n' || buf[i] == '\r' ) break;
+					if ( buf[i] == '/' && buf[i + 1] == '/' ) break;
+				}
+				if ( m + 1 < outSize ) out[m++] = buf[i];
+				i++;
+			}
+			out[m] = '\0';
+			return qtrue;
+		} else {
+			while ( buf[i] && buf[i] != '\n' ) i++;
+		}
+	}
+	return qfalse;
+}
+
+static void WasmPK3_CollectSiegeMapAssets( const char *mapName, const char *extraShaderText, qboolean *outAllReady ) {
+	WasmPK3_MarkPrefixInMountedPaks( "ext_data/siege/" );
+	WasmPK3_MarkExactFile( "strings/english/siege.str", NULL, NULL );
+	for ( searchpath_t *sp = fs_searchpaths; sp; sp = sp->next ) {
+		if ( !sp->pack || !sp->pack->buildBuffer ) continue;
+		WasmPk3Archive *arch = WasmPK3_FindArchive( sp->pack->pakFilename );
+		if ( !arch || arch->base_init ) continue;
+		for ( int i = 0; i < sp->pack->numfiles; i++ ) {
+			fileInPack_t *pf = &sp->pack->buildBuffer[i];
+			if ( pf->name && !Q_stricmpn( pf->name, "strings/", 8 ) ) {
+				unsigned long cStart = 0, cEnd = 0;
+				WasmPk3Archive *a = NULL;
+				if ( WasmPK3_GetPakFileChunks( sp->pack, pf, &a, &cStart, &cEnd ) ) {
+					WasmPK3_MarkArchiveChunkRange( a, cStart, cEnd );
+				}
+			}
+		}
+	}
+	if ( !mapName || !mapName[0] ) return;
+
+	char siegePath[MAX_ZPATH];
+	Com_sprintf( siegePath, sizeof( siegePath ), "maps/%s.siege", mapName );
+	pack_t *sPak = NULL;
+	fileInPack_t *sPf = NULL;
+	if ( !WasmPK3_MarkExactFile( siegePath, &sPak, &sPf ) ) {
+		return;
+	}
+	if ( !sPak || !sPf || !WasmPK3_IsPakFileCached( sPak, sPf ) ) {
+		if ( outAllReady ) *outAllReady = qfalse;
+		return;
+	}
+	void *rawSiege = NULL;
+	int siegeLen = FS_ReadFile( siegePath, &rawSiege );
+	if ( !rawSiege || siegeLen <= 0 ) {
+		if ( rawSiege ) FS_FreeFile( rawSiege );
+		return;
+	}
+	char *siegeBuf = (char *)malloc( (size_t)siegeLen + 1 );
+	if ( !siegeBuf ) {
+		FS_FreeFile( rawSiege );
+		return;
+	}
+	memcpy( siegeBuf, rawSiege, (size_t)siegeLen );
+	siegeBuf[siegeLen] = '\0';
+	FS_FreeFile( rawSiege );
+
+	char val[MAX_ZPATH];
+	if ( WasmPK3_SiegeGetVal( siegeBuf, "mapgraphic", val, sizeof( val ) ) && val[0] ) {
+		R_WasmCollectShaderFiles( val, extraShaderText, WasmPK3_MarkImageOrSoundOrFile );
+	}
+
+	char teamsGrp[2048];
+	char teamNames[2][256] = { {0}, {0} };
+	char useTeams[2][128] = { {0}, {0} };
+	int numUseTeams = 0;
+	if ( WasmPK3_SiegeGetGroup( siegeBuf, "Teams", teamsGrp, sizeof( teamsGrp ) ) ) {
+		WasmPK3_SiegeGetVal( teamsGrp, "team1", teamNames[0], sizeof( teamNames[0] ) );
+		WasmPK3_SiegeGetVal( teamsGrp, "team2", teamNames[1], sizeof( teamNames[1] ) );
+	}
+	char *teamInfo = (char *)malloc( 16384 );
+	char *objInfo = (char *)malloc( 8192 );
+	if ( teamInfo && objInfo ) {
+		for ( int t = 0; t < 2; t++ ) {
+			if ( !teamNames[t][0] ) continue;
+			if ( !WasmPK3_SiegeGetGroup( siegeBuf, teamNames[t], teamInfo, 16384 ) ) continue;
+			if ( WasmPK3_SiegeGetVal( teamInfo, "UseTeam", val, sizeof( val ) ) && val[0] ) {
+				Q_strncpyz( useTeams[numUseTeams++], val, sizeof( useTeams[0] ) );
+			}
+			if ( WasmPK3_SiegeGetVal( teamInfo, "TeamIcon", val, sizeof( val ) ) && val[0] ) {
+				R_WasmCollectShaderFiles( val, extraShaderText, WasmPK3_MarkImageOrSoundOrFile );
+			}
+			if ( WasmPK3_SiegeGetVal( teamInfo, "FriendlyShader", val, sizeof( val ) ) && val[0] ) {
+				R_WasmCollectShaderFiles( val, extraShaderText, WasmPK3_MarkImageOrSoundOrFile );
+			}
+			if ( WasmPK3_SiegeGetVal( teamInfo, "roundover_sound_wewon", val, sizeof( val ) ) && val[0] ) {
+				WasmPK3_MarkImageOrSoundOrFile( val );
+			}
+			if ( WasmPK3_SiegeGetVal( teamInfo, "roundover_sound_welost", val, sizeof( val ) ) && val[0] ) {
+				WasmPK3_MarkImageOrSoundOrFile( val );
+			}
+			for ( int o = 1; o < 32; o++ ) {
+				char objKey[32];
+				Com_sprintf( objKey, sizeof( objKey ), "Objective%d", o );
+				if ( !WasmPK3_SiegeGetGroup( teamInfo, objKey, objInfo, 8192 ) ) break;
+				if ( WasmPK3_SiegeGetVal( objInfo, "sound_team1", val, sizeof( val ) ) && val[0] ) {
+					WasmPK3_MarkImageOrSoundOrFile( val );
+				}
+				if ( WasmPK3_SiegeGetVal( objInfo, "sound_team2", val, sizeof( val ) ) && val[0] ) {
+					WasmPK3_MarkImageOrSoundOrFile( val );
+				}
+				static const char * const objShaders[] = { "objgfx", "mapicon", "litmapicon", "donemapicon" };
+				for ( size_t s = 0; s < 4; s++ ) {
+					if ( WasmPK3_SiegeGetVal( objInfo, objShaders[s], val, sizeof( val ) ) && val[0] ) {
+						R_WasmCollectShaderFiles( val, extraShaderText, WasmPK3_MarkImageOrSoundOrFile );
+					}
+				}
+			}
+		}
+	}
+	if ( teamInfo ) free( teamInfo );
+	if ( objInfo ) free( objInfo );
+	free( siegeBuf );
+
+	// Collect classes from matching ext_data/siege/teams/*.team files
+	char usedClasses[64][128];
+	int numUsedClasses = 0;
+	for ( searchpath_t *sp = fs_searchpaths; sp; sp = sp->next ) {
+		if ( !sp->pack || !sp->pack->buildBuffer ) continue;
+		for ( int i = 0; i < sp->pack->numfiles; i++ ) {
+			fileInPack_t *pf = &sp->pack->buildBuffer[i];
+			if ( !pf->name || Q_stricmpn( pf->name, "ext_data/siege/teams/", 21 ) || !Q_stristr( pf->name, ".team" ) ) continue;
+			if ( !FS_WasmIsFileCached( pf->name ) ) {
+				if ( outAllReady ) *outAllReady = qfalse;
+				continue;
+			}
+			void *tRaw = NULL;
+			int tLen = FS_ReadFile( pf->name, &tRaw );
+			if ( !tRaw || tLen <= 0 ) {
+				if ( tRaw ) FS_FreeFile( tRaw );
+				continue;
+			}
+			char *tBuf = (char *)malloc( (size_t)tLen + 1 );
+			if ( tBuf ) {
+				memcpy( tBuf, tRaw, (size_t)tLen );
+				tBuf[tLen] = '\0';
+				char tName[128];
+				if ( WasmPK3_SiegeGetVal( tBuf, "name", tName, sizeof( tName ) ) && tName[0] ) {
+					qboolean matchTeam = ( numUseTeams == 0 ) ? qtrue : qfalse;
+					for ( int u = 0; u < numUseTeams; u++ ) {
+						if ( !Q_stricmp( tName, useTeams[u] ) ) matchTeam = qtrue;
+					}
+					if ( matchTeam ) {
+						if ( WasmPK3_SiegeGetVal( tBuf, "FriendlyShader", val, sizeof( val ) ) && val[0] ) {
+							R_WasmCollectShaderFiles( val, extraShaderText, WasmPK3_MarkImageOrSoundOrFile );
+						}
+						char clsGrp[2048];
+						if ( WasmPK3_SiegeGetGroup( tBuf, "Classes", clsGrp, sizeof( clsGrp ) ) ) {
+							for ( int c = 1; c <= 16; c++ ) {
+								char cKey[32];
+								Com_sprintf( cKey, sizeof( cKey ), "class%d", c );
+								if ( !WasmPK3_SiegeGetVal( clsGrp, cKey, val, sizeof( val ) ) || !val[0] ) break;
+								qboolean dup = qfalse;
+								for ( int e = 0; e < numUsedClasses; e++ ) {
+									if ( !Q_stricmp( usedClasses[e], val ) ) { dup = qtrue; break; }
+								}
+								if ( !dup && numUsedClasses < 64 ) {
+									Q_strncpyz( usedClasses[numUsedClasses++], val, sizeof( usedClasses[0] ) );
+								}
+							}
+						}
+					}
+				}
+				free( tBuf );
+			}
+			FS_FreeFile( tRaw );
+		}
+	}
+
+	// Collect player models, skins, sounds, and class icons from matching ext_data/siege/classes/*.scl files
+	for ( searchpath_t *sp = fs_searchpaths; sp; sp = sp->next ) {
+		if ( !sp->pack || !sp->pack->buildBuffer ) continue;
+		for ( int i = 0; i < sp->pack->numfiles; i++ ) {
+			fileInPack_t *pf = &sp->pack->buildBuffer[i];
+			if ( !pf->name || Q_stricmpn( pf->name, "ext_data/siege/classes/", 23 ) || !Q_stristr( pf->name, ".scl" ) ) continue;
+			if ( !FS_WasmIsFileCached( pf->name ) ) {
+				if ( outAllReady ) *outAllReady = qfalse;
+				continue;
+			}
+			void *cRaw = NULL;
+			int cLen = FS_ReadFile( pf->name, &cRaw );
+			if ( !cRaw || cLen <= 0 ) {
+				if ( cRaw ) FS_FreeFile( cRaw );
+				continue;
+			}
+			char *cBuf = (char *)malloc( (size_t)cLen + 1 );
+			if ( cBuf ) {
+				memcpy( cBuf, cRaw, (size_t)cLen );
+				cBuf[cLen] = '\0';
+				char cInfo[4096];
+				const char *src = WasmPK3_SiegeGetGroup( cBuf, "ClassInfo", cInfo, sizeof( cInfo ) ) ? cInfo : cBuf;
+				char cName[128];
+				if ( WasmPK3_SiegeGetVal( src, "name", cName, sizeof( cName ) ) && cName[0] ) {
+					qboolean matchCls = ( numUsedClasses == 0 ) ? qtrue : qfalse;
+					for ( int e = 0; e < numUsedClasses; e++ ) {
+						if ( !Q_stricmp( cName, usedClasses[e] ) ) { matchCls = qtrue; break; }
+					}
+					if ( matchCls ) {
+						if ( WasmPK3_SiegeGetVal( src, "uishader", val, sizeof( val ) ) && val[0] ) {
+							R_WasmCollectShaderFiles( val, extraShaderText, WasmPK3_MarkImageOrSoundOrFile );
+						}
+						if ( WasmPK3_SiegeGetVal( src, "class_shader", val, sizeof( val ) ) && val[0] ) {
+							R_WasmCollectShaderFiles( val, extraShaderText, WasmPK3_MarkImageOrSoundOrFile );
+						}
+						char modName[128] = {0};
+						char skinName[128] = {0};
+						WasmPK3_SiegeGetVal( src, "model", modName, sizeof( modName ) );
+						WasmPK3_SiegeGetVal( src, "skin", skinName, sizeof( skinName ) );
+						if ( modName[0] ) {
+							char modelSpec[256];
+							Com_sprintf( modelSpec, sizeof( modelSpec ), "%s/%s", modName, skinName[0] ? skinName : "default" );
+							WasmPK3_CollectPlayerFiles( modelSpec, extraShaderText, outAllReady );
+						}
+					}
+				}
+				free( cBuf );
+			}
+			FS_FreeFile( cRaw );
+		}
+	}
+}
+
+extern "C" int JK_ExportIsCapturing( void );
+EM_JS(int, wasm_js_files_is_worker_env, (), {
+	return (typeof WorkerGlobalScope !== 'undefined') ? 1 : 0;
+});
+
+extern "C" qboolean FS_WasmEnsurePlayerModelReadyAsync( const char *modelName, const char *skinName ) {
+	if ( !modelName || !modelName[0] ) {
+		return qtrue;
+	}
+	if ( JK_ExportIsCapturing() || wasm_js_files_is_worker_env() ) {
+		return qtrue;
+	}
+	char glmPath[MAX_ZPATH];
+	Com_sprintf( glmPath, sizeof( glmPath ), "models/players/%s/model.glm", modelName );
+	if ( !WasmPK3_IsFileInMountedPacks( glmPath ) ) {
+		return qtrue;
+	}
+
+	Com_Memset( s_planNeedChunks, 0, sizeof( s_planNeedChunks ) );
+	qboolean allReady = qtrue;
+	char spec[256];
+	Com_sprintf( spec, sizeof( spec ), "%s/%s", modelName, ( skinName && skinName[0] ) ? skinName : "default" );
+	WasmPK3_CollectPlayerFiles( spec, NULL, &allReady );
+
+	qboolean hasMissing = qfalse;
+	for ( int i = 0; i < g_numWasmPk3Archives; i++ ) {
+		if ( !s_planNeedChunks[i] ) continue;
+		WasmPk3Archive *arch = &g_wasmPk3Archives[i];
+		unsigned long c = 0;
+		while ( c < arch->num_chunks ) {
+			if ( !s_planNeedChunks[i][c] ) {
+				c++;
+				continue;
+			}
+			hasMissing = qtrue;
+			unsigned long spanStart = c;
+			unsigned long spanEnd = c;
+			while ( spanEnd + 1 < arch->num_chunks && s_planNeedChunks[i][spanEnd + 1] && (spanEnd - spanStart) < 15 ) {
+				spanEnd++;
+			}
+			wasm_js_prefetch_span_async( arch->name, (int)spanStart, (int)spanEnd, (int)arch->size );
+			c = spanEnd + 1;
+		}
+		free( s_planNeedChunks[i] );
+		s_planNeedChunks[i] = NULL;
+	}
+	return ( !hasMissing && allReady ) ? qtrue : qfalse;
 }
 
 extern "C" const char *FS_WasmPlanDemoChunks(
@@ -4475,6 +4887,8 @@ extern "C" const char *FS_WasmPlanDemoChunks(
 		"sound/chars/protocol/misc/",
 		"sound/chars/kyle/misc/",
 		"sound/chars/jaden_fmle/misc/",
+		"sound/chars/mp_generic_male/misc/",
+		"sound/chars/mp_generic_female/misc/",
 		"sound/chars/turret/"
 	};
 	for ( size_t i = 0; i < sizeof( s_mpCommonPrefixes ) / sizeof( s_mpCommonPrefixes[0] ); i++ ) {
@@ -4521,6 +4935,7 @@ extern "C" const char *FS_WasmPlanDemoChunks(
 	WasmPK3_CollectModelsInPrefix( "models/items/", extraShaderText, &bspReady );
 	WasmPK3_CollectModelsInPrefix( "models/map_objects/mp/", extraShaderText, &bspReady );
 	WasmPK3_CollectPlayerFiles( "kyle/default", extraShaderText, &bspReady );
+	WasmPK3_CollectPlayerFiles( "jan/default", extraShaderText, &bspReady );
 
 	static const char * const s_mpCommonEffects[] = {
 		"effects/mp/test_sparks.efx",
@@ -4609,6 +5024,9 @@ extern "C" const char *FS_WasmPlanDemoChunks(
 				gametype = atoi( gtStr );
 			}
 		}
+		if ( gametype == 7 ) {
+			WasmPK3_CollectSiegeMapAssets( mapName, extraShaderText, &bspReady );
+		}
 		for ( int i = 0; i < MAX_CLIENTS; i++ ) {
 			int ofs = gs->stringOffsets[1131 + i];
 			if ( ofs > 0 && gs->stringData[ofs] ) {
@@ -4621,16 +5039,13 @@ extern "C" const char *FS_WasmPlanDemoChunks(
 				if ( fxOverride && fxOverride[0] ) {
 					WasmPK3_CollectEfxFile( fxOverride, extraShaderText, &bspReady, 0 );
 				}
-				// In Emscripten builds, CG_NewClientInfo forces all non-Siege (g_gametype != 7) players to kyle
-				if ( gametype == 7 ) {
-					const char *model = Info_ValueForKey( pinfo, "model" );
-					if ( model && model[0] ) {
-						WasmPK3_CollectPlayerFiles( model, extraShaderText, &bspReady );
-					}
-					const char *hmodel = Info_ValueForKey( pinfo, "hmodel" );
-					if ( hmodel && hmodel[0] && ( !model || Q_stricmp( hmodel, model ) ) ) {
-						WasmPK3_CollectPlayerFiles( hmodel, extraShaderText, &bspReady );
-					}
+				const char *model = Info_ValueForKey( pinfo, "model" );
+				if ( model && model[0] ) {
+					WasmPK3_CollectPlayerFiles( model, extraShaderText, &bspReady );
+				}
+				const char *hmodel = Info_ValueForKey( pinfo, "hmodel" );
+				if ( hmodel && hmodel[0] && ( !model || Q_stricmp( hmodel, model ) ) ) {
+					WasmPK3_CollectPlayerFiles( hmodel, extraShaderText, &bspReady );
 				}
 			}
 		}

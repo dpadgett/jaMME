@@ -18,8 +18,8 @@
   const MAX_OVERBRIGHT = 3;
 
   const BOOT_START_MS = typeof performance !== 'undefined' ? performance.now() : Date.now();
-  const DEFAULT_ENGINE_VERSION = '20261111b';
-  const DEFAULT_PLAYER_VERSION = '20261111b';
+  const DEFAULT_ENGINE_VERSION = '20261111d';
+  const DEFAULT_PLAYER_VERSION = '20261111d';
 
   function installDocumentTitleGuard() {
     if (typeof document === 'undefined' || document.__jkTitleGuardInstalled) return;
@@ -4448,7 +4448,7 @@
     // Pass 1: Exact MP-common assets + custom PK3s + BSP header & lumps + configstring models/sounds/player skins
     // Pass 2: BSP textures/shaders & static models (once BSP chunks & player .skin/.cfg files are in cache)
     // Pass 3+: Any textures referenced by static .md3 models or custom PK3s mounted in earlier passes
-    for (let pass = 0; pass < 4; pass++) {
+    for (let pass = 0; pass < 5; pass++) {
       const label = pass === 0 ? 'Loading map & models' : 'Loading map textures & sounds';
       const basePct = pass === 0 ? 35 : 58;
       const spanPct = pass === 0 ? 23 : 20;

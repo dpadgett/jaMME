@@ -1497,6 +1497,44 @@ static void CG_SetDeferredClientInfo( clientInfo_t *ci ) {
 	CG_LoadClientInfo( ci );
 }
 
+#ifdef __EMSCRIPTEN__
+extern qboolean FS_WasmEnsurePlayerModelReadyAsync( const char *modelName, const char *skinName );
+
+static void CG_SetWasmDeferredClientInfo( clientInfo_t *ci ) {
+	char savedModel[MAX_QPATH];
+	char savedSkin[MAX_QPATH];
+	vec3_t savedColorOverride;
+	const char *fbModel = ( ci->gender == GENDER_FEMALE ) ? "jan" : "kyle";
+	const char *fbSkin = "default";
+	const char *fbTeam = "";
+
+	if ( cgs.gametype >= GT_TEAM && cgs.gametype != GT_SIEGE ) {
+		if ( ci->team == TEAM_BLUE ) {
+			fbSkin = "blue";
+			fbTeam = DEFAULT_BLUETEAM_NAME "/";
+		} else if ( ci->team == TEAM_RED ) {
+			fbSkin = "red";
+			fbTeam = DEFAULT_REDTEAM_NAME "/";
+		}
+	}
+
+	Q_strncpyz( savedModel, ci->modelName, sizeof( savedModel ) );
+	Q_strncpyz( savedSkin, ci->skinName, sizeof( savedSkin ) );
+	VectorCopy( ci->colorOverride, savedColorOverride );
+
+	Q_strncpyz( ci->modelName, fbModel, sizeof( ci->modelName ) );
+	Q_strncpyz( ci->skinName, fbSkin, sizeof( ci->skinName ) );
+	CG_RegisterClientModelname( ci, fbModel, fbSkin, fbTeam, -1 );
+	CG_LoadCISounds( ci, qfalse );
+
+	Q_strncpyz( ci->modelName, savedModel, sizeof( ci->modelName ) );
+	Q_strncpyz( ci->skinName, savedSkin, sizeof( ci->skinName ) );
+	VectorCopy( savedColorOverride, ci->colorOverride );
+	ci->deferred = qtrue;
+	cgQueueLoad = qtrue;
+}
+#endif
+
 
 char *ConfigValue( const char *configs[4], const char *value ) {
 	int i;
@@ -1752,20 +1790,7 @@ void CG_NewClientInfo( int clientNum, qboolean entitiesInitialized ) {
 	// model
 //	v = Info_ValueForKey( configstring, "model" );
 	v = ConfigValue( strings, "model");
-#ifdef __EMSCRIPTEN__
-	Q_strncpyz( newInfo.modelName, "kyle", sizeof( newInfo.modelName ) );
-	if ( cgs.gametype >= GT_TEAM ) {
-		if ( newInfo.team == TEAM_BLUE ) {
-			Q_strncpyz( newInfo.skinName, "blue", sizeof( newInfo.skinName ) );
-		} else if ( newInfo.team == TEAM_RED ) {
-			Q_strncpyz( newInfo.skinName, "red", sizeof( newInfo.skinName ) );
-		} else {
-			Q_strncpyz( newInfo.skinName, "default", sizeof( newInfo.skinName ) );
-		}
-	} else {
-		Q_strncpyz( newInfo.skinName, "default", sizeof( newInfo.skinName ) );
-	}
-#elif 0
+#if 0
 	if ( cg_forceModel.integer ) {
 		// forcemodel makes everyone use a single model
 		// to prevent load hitches
@@ -1834,6 +1859,9 @@ void CG_NewClientInfo( int clientNum, qboolean entitiesInitialized ) {
 			*slash = 0;
 		}
 	}
+	if ( !newInfo.modelName[0] ) {
+		Q_strncpyz( newInfo.modelName, DEFAULT_MODEL, sizeof( newInfo.modelName ) );
+	}
 #endif
 
 	if (cgs.gametype == GT_SIEGE)
@@ -1892,9 +1920,9 @@ void CG_NewClientInfo( int clientNum, qboolean entitiesInitialized ) {
 
 	//saber being used
 	v = ConfigValue( strings, "st");
-#ifdef __EMSCRIPTEN__
-	v = DEFAULT_SABER;
-#endif
+	if ( !v || !v[0] ) {
+		v = DEFAULT_SABER;
+	}
 	if (v && Q_stricmp(v, ci->saberName))
 	{
 		Q_strncpyz( newInfo.saberName, v, 64 );
@@ -1909,13 +1937,9 @@ void CG_NewClientInfo( int clientNum, qboolean entitiesInitialized ) {
 	}
 
 	v = ConfigValue( strings, "st2");
-#ifdef __EMSCRIPTEN__
-	if (v && v[0] && Q_stricmp(v, "none")) {
-		v = DEFAULT_SABER;
-	} else {
+	if ( !v || !v[0] ) {
 		v = "none";
 	}
-#endif
 	if (v && Q_stricmp(v, ci->saber2Name))
 	{
 		Q_strncpyz( newInfo.saber2Name, v, 64 );
@@ -2010,6 +2034,13 @@ void CG_NewClientInfo( int clientNum, qboolean entitiesInitialized ) {
 	// scan for an existing clientinfo that matches this modelname
 	// so we can avoid loading checks if possible
 	if ( !CG_ScanForExistingClientInfo( &newInfo, clientNum ) ) {
+#ifdef __EMSCRIPTEN__
+		if ( !cg.loading && !FS_WasmEnsurePlayerModelReadyAsync( newInfo.modelName, newInfo.skinName ) ) {
+			CG_SetWasmDeferredClientInfo( &newInfo );
+		} else {
+			CG_LoadClientInfo( &newInfo );
+		}
+#else
 		// if we are defering loads, just have it pick the first valid
 		if (cg.snap && cg.snap->ps.clientNum == clientNum)
 		{ //rww - don't defer your own client info ever
@@ -2021,6 +2052,7 @@ void CG_NewClientInfo( int clientNum, qboolean entitiesInitialized ) {
 		} else {
 			CG_LoadClientInfo( &newInfo );
 		}
+#endif
 	}
 //	if ( clientNum == cg.clientNum )
 //		trap_Cvar_Set("sex", newInfo.gender == GENDER_FEMALE ? "female" : "male");
@@ -2321,6 +2353,12 @@ void CG_ActualLoadDeferredPlayers( void )
 	// scan for a deferred player to load
 	for ( i = 0, ci = cgs.clientinfo ; i < cgs.maxclients ; i++, ci++ ) {
 		if ( ci->infoValid && ci->deferred ) {
+#ifdef __EMSCRIPTEN__
+			if ( !FS_WasmEnsurePlayerModelReadyAsync( ci->modelName, ci->skinName ) ) {
+				cgQueueLoad = qtrue;
+				continue;
+			}
+#endif
 			CG_LoadClientInfo( ci );
 //			break;
 		}

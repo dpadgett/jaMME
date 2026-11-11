@@ -4665,8 +4665,18 @@ static void CG_DrawLagometer( void ) {
 	CG_DrawDisconnect();
 }
 
+void CG_DrawSiegeMessageNonMenu( const char *str );
+
 void CG_DrawSiegeMessage( const char *str, int objectiveScreen )
 {
+	if ( cg.demoPlayback )
+	{
+		if ( !objectiveScreen && str && str[0] )
+		{
+			CG_DrawSiegeMessageNonMenu( str );
+		}
+		return;
+	}
 //	if (!( trap_Key_GetCatcher() & KEYCATCH_UI ))
 	{
 		trap_OpenUIMenu(UIMENU_CLOSEALL);

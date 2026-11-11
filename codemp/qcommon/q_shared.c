@@ -1645,6 +1645,22 @@ int Q_vsnprintf(char *str, size_t size, const char *format, va_list ap) {
 int QDECL Com_sprintf( char *dest, int size, const char *fmt, ...) {
 	int		len;
 	va_list		argptr;
+	char	tmpbuf[32000];
+
+	if ( size <= 0 || !dest ) {
+		return 0;
+	}
+
+	if ( size <= (int)sizeof( tmpbuf ) ) {
+		va_start( argptr, fmt );
+		len = Q_vsnprintf( tmpbuf, sizeof( tmpbuf ), fmt, argptr );
+		va_end( argptr );
+		if ( len >= size ) {
+			Com_Printf( "Com_sprintf: Output length %d too short, require %d bytes.\n", size, len + 1 );
+		}
+		Q_strncpyz( dest, tmpbuf, size );
+		return len;
+	}
 
 	va_start (argptr,fmt);
 	len = Q_vsnprintf(dest, size, fmt, argptr);

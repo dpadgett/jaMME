@@ -46,6 +46,10 @@ void CG_PrecacheSiegeObjectiveAssetsForTeam(int myTeam)
 
 	if (!siege_valid)
 	{
+		if (cg.demoPlayback)
+		{
+			return;
+		}
 		CG_Error("Siege data does not exist on client!\n");
 		return;
 	}
@@ -181,21 +185,26 @@ void CG_InitSiegeMode(void)
 
 	levelname[i] = '\0'; //kill the ".bsp"
 
-	Com_sprintf(levelname, sizeof(levelname), "%s.siege\0", levelname); 
+	Q_strcat(levelname, sizeof(levelname), ".siege");
 
-	if (!levelname || !levelname[0])
+	if (!levelname[0])
 	{
 		goto failure;
 	}
 
 	len = trap_FS_FOpenFile(levelname, &f, FS_READ);
 
-	if (!f || len >= MAX_SIEGE_INFO_SIZE)
+	if (!f || len <= 0 || len >= MAX_SIEGE_INFO_SIZE)
 	{
+		if (f)
+		{
+			trap_FS_FCloseFile(f);
+		}
 		goto failure;
 	}
 
 	trap_FS_Read(siege_info, len, f);
+	siege_info[len] = '\0';
 
 	trap_FS_FCloseFile(f);
 
@@ -582,6 +591,10 @@ void CG_SiegeRoundOver(centity_t *ent, int won)
 
 	if (!siege_valid)
 	{
+		if (cg.demoPlayback)
+		{
+			return;
+		}
 		CG_Error("ERROR: Siege data does not exist on client!\n");
 		return;
 	}
@@ -894,6 +907,10 @@ void CG_SiegeObjectiveCompleted(centity_t *ent, int won, int objectivenum)
 
 	if (!siege_valid)
 	{
+		if (cg.demoPlayback)
+		{
+			return;
+		}
 		CG_Error("Siege data does not exist on client!\n");
 		return;
 	}

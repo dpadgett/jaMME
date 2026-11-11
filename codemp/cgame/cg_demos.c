@@ -539,8 +539,8 @@ void CG_DemosDrawActiveFrame( int serverTime, stereoFrame_t stereoView ) {
 
 	if (cgQueueLoad)
 	{ //do this before you start messing around with adding ghoul2 refents and crap
-		CG_ActualLoadDeferredPlayers();
 		cgQueueLoad = qfalse;
+		CG_ActualLoadDeferredPlayers();
 	}
 
 	cg.demoPlayback = 2;
