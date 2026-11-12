@@ -5,7 +5,7 @@
     return;
   }
 
-  const ASSET_VERSION = '20261111f';
+  const ASSET_VERSION = '20261112a';
   const MIN_CLIP_MS = 500;
   const MIN_VIEW_SPAN_MS = 5000;
   const DEFAULT_PRE_MS = 10000;

@@ -1,8 +1,7 @@
 diff --git a/src/lib/libglemu.js b/src/lib/libglemu.js
-index 626d91c..fda2d26 100644
 --- a/src/lib/libglemu.js
 +++ b/src/lib/libglemu.js
-@@ -32,7 +32,7 @@ var LibraryGLEmulation = {
+@@ -32,7 +32,7 @@
      'glLinkProgram', 'glBindBuffer', 'glGetFloatv', 'glHint',
      'glEnableVertexAttribArray', 'glDisableVertexAttribArray',
      'glVertexAttribPointer', 'glActiveTexture', '$stringToNewUTF8',
@@ -11,7 +10,7 @@ index 626d91c..fda2d26 100644
    ],
    $GLEmulation__force: true,
    $GLEmulation__postset: `
-@@ -1637,6 +1637,7 @@ var LibraryGLEmulation = {
+@@ -1637,6 +1637,7 @@
          },
  
          hook_enable: (cap) => {
@@ -19,7 +18,7 @@ index 626d91c..fda2d26 100644
            var cur = getCurTexUnit();
            switch (cap) {
              case GL_TEXTURE_1D:
-@@ -1671,6 +1672,7 @@ var LibraryGLEmulation = {
+@@ -1671,6 +1672,7 @@
          },
  
          hook_disable: (cap) => {
@@ -27,7 +26,7 @@ index 626d91c..fda2d26 100644
            var cur = getCurTexUnit();
            switch (cap) {
              case GL_TEXTURE_1D:
-@@ -1710,6 +1712,13 @@ var LibraryGLEmulation = {
+@@ -1710,6 +1712,13 @@
  
            var env = getCurTexUnit().env;
            switch (pname) {
@@ -41,7 +40,7 @@ index 626d91c..fda2d26 100644
              case GL_RGB_SCALE:
                if (env.colorScale != param) {
                  env.invalidateKey(); // We changed FFP emulation renderer state.
-@@ -2026,6 +2035,7 @@ var LibraryGLEmulation = {
+@@ -2026,6 +2035,7 @@
            };
          }
        } else {
@@ -49,7 +48,7 @@ index 626d91c..fda2d26 100644
          attrib.name = name;
          attrib.size = size;
          attrib.type = type;
-@@ -2572,7 +2582,7 @@ var LibraryGLEmulation = {
+@@ -2572,7 +2582,7 @@
              GLctx.uniformMatrix4fv(this.modelViewLocation, false, GLImmediate.matrix[0/*m*/]);
  
              // set normal matrix to the upper 3x3 of the inverse transposed current modelview matrix
@@ -58,7 +57,7 @@ index 626d91c..fda2d26 100644
                var tmpMVinv = GLImmediate.matrixLib.mat4.create(GLImmediate.matrix[0]);
                GLImmediate.matrixLib.mat4.inverse(tmpMVinv);
                GLImmediate.matrixLib.mat4.transpose(tmpMVinv);
-@@ -2614,7 +2624,7 @@ var LibraryGLEmulation = {
+@@ -2614,7 +2624,7 @@
            if (this.hasTextures) {
              for (var i = 0; i < GLImmediate.MAX_TEXTURES; i++) {
  #if GL_FFP_ONLY
@@ -67,7 +66,7 @@ index 626d91c..fda2d26 100644
                  var attribLoc = GLImmediate.TEXTURE0+i;
                  var texAttr = clientAttributes[attribLoc];
                  if (texAttr.size) {
-@@ -2697,7 +2707,10 @@ var LibraryGLEmulation = {
+@@ -2697,7 +2707,10 @@
            }
  
            if (this.hasAlphaTest) {
@@ -79,7 +78,7 @@ index 626d91c..fda2d26 100644
            }
  
            if (GLImmediate.mode == GLctx.POINTS) {
-@@ -2845,7 +2858,7 @@ var LibraryGLEmulation = {
+@@ -2845,7 +2858,7 @@
        // slightly, so it is advantageous to choose as small value as needed.
        // Limit to a maximum of 28 to not overflow the state bits used for renderer caching (31 bits = 3 attributes + 28 texture units).
        var maxTextureUnits = {{{ makeModuleReceiveExpr('GL_MAX_TEXTURE_IMAGE_UNITS', 'GLctx.getParameter(GLctx.MAX_TEXTURE_IMAGE_UNITS)') }}};
@@ -88,7 +87,306 @@ index 626d91c..fda2d26 100644
  
        GLImmediate.TexEnvJIT.init(GLctx, GLImmediate.MAX_TEXTURES);
  
-@@ -3080,7 +3093,7 @@ var LibraryGLEmulation = {
+@@ -2881,131 +2894,153 @@
+       GL.generateTempBuffers(true, GL.currentContext);
+ 
+       GLImmediate.clientColor = new Float32Array([1, 1, 1, 1]);
++      GLImmediate.clientColorU8 = new Uint8Array([255, 255, 255, 255]);
++      GLImmediate.currentNormal = new Float32Array([0, 0, 1]);
++      GLImmediate.currentTexCoords = new Float32Array(GLImmediate.MAX_TEXTURES * 2);
++      GLImmediate.needsRestride = false;
++    },
++
++    emitImmediateVertex(x, y, z, w) {
++#if ASSERTIONS
++      assert(GLImmediate.mode >= 0); // must be in begin/end
++#endif
++      if (GLImmediate.beginVertexCount === 0) {
++        GLImmediate.addRendererComponent(GLImmediate.VERTEX, 4, GLctx.FLOAT);
++        GLImmediate.addRendererComponent(GLImmediate.COLOR, 4, GLctx.UNSIGNED_BYTE);
++        if (GLImmediate.beginHasTexCoord) {
++          GLImmediate.addRendererComponent(GLImmediate.TEXTURE0, 2, GLctx.FLOAT);
++        }
++        if (GLImmediate.beginHasNormal) {
++          GLImmediate.addRendererComponent(GLImmediate.NORMAL, 3, GLctx.FLOAT);
++        }
++      }
++      var vc = GLImmediate.vertexCounter;
++      var vd = GLImmediate.vertexData;
++      vd[vc] = x;
++      vd[vc + 1] = y;
++      vd[vc + 2] = z;
++      vd[vc + 3] = w;
++      vc += 4;
++      var cOff = vc << 2;
++      var cu8 = GLImmediate.clientColorU8;
++      var vdu8 = GLImmediate.vertexDataU8;
++      vdu8[cOff] = cu8[0];
++      vdu8[cOff + 1] = cu8[1];
++      vdu8[cOff + 2] = cu8[2];
++      vdu8[cOff + 3] = cu8[3];
++      vc += 1;
++      if (GLImmediate.beginHasTexCoord) {
++        vd[vc] = GLImmediate.currentTexCoords[0];
++        vd[vc + 1] = GLImmediate.currentTexCoords[1];
++        vc += 2;
++      }
++      if (GLImmediate.beginHasNormal) {
++        vd[vc] = GLImmediate.currentNormal[0];
++        vd[vc + 1] = GLImmediate.currentNormal[1];
++        vd[vc + 2] = GLImmediate.currentNormal[2];
++        vc += 3;
++      }
++#if ASSERTIONS
++      assert(vc << 2 < GL.MAX_TEMP_BUFFER_SIZE);
++#endif
++      GLImmediate.vertexCounter = vc;
++      GLImmediate.beginVertexCount++;
+     },
+ 
+     // Prepares and analyzes client attributes.
+     // Modifies liveClientAttributes, stride, vertexPointer, vertexCounter
+-    //   count: number of elements we will draw
++    //   count: end vertex index (exclusive) we will draw
+     //   beginEnd: whether we are drawing the results of a begin/end block
+-    prepareClientAttributes(count, beginEnd) {
+-      // If no client attributes were modified since we were last called, do
+-      // nothing. Note that this does not work for glBegin/End, where we
+-      // generate renderer components dynamically and then disable them
+-      // ourselves, but it does help with glDrawElements/Arrays.
+-      if (!GLImmediate.modifiedClientAttributes) {
++    //   first: first vertex index (inclusive) to copy when restriding planar arrays
++    prepareClientAttributes(count, beginEnd, first = 0) {
++      var attributes = GLImmediate.liveClientAttributes;
++      if (GLImmediate.modifiedClientAttributes) {
++        GLImmediate.modifiedClientAttributes = false;
++
++        // The role of prepareClientAttributes is to examine the set of
++        // client-side vertex attribute buffers that user code has submitted, and
++        // to prepare them to be uploaded to a VBO in GPU memory (since WebGL does
++        // not support client-side rendering, i.e. rendering from vertex data in
++        // CPU memory).
++        var clientStartPointer = {{{ POINTER_MAX }}};
++        var bytes = 0; // Total number of bytes taken up by a single vertex.
++        var minStride = {{{ POINTER_MAX }}};
++        var maxStride = 0;
++        attributes.length = 0;
++        for (var i = 0; i < 3+GLImmediate.MAX_TEXTURES; i++) {
++          if (GLImmediate.enabledClientAttributes[i]) {
++            var attr = GLImmediate.clientAttributes[i];
++            attributes.push(attr);
++            clientStartPointer = Math.min(clientStartPointer, attr.pointer);
++            attr.sizeBytes = attr.size * GL.byteSizeByType[attr.type - GL.byteSizeByTypeRoot];
++            bytes += attr.sizeBytes;
++            minStride = Math.min(minStride, attr.stride);
++            maxStride = Math.max(maxStride, attr.stride);
++          }
++        }
++
++        GLImmediate.needsRestride = (minStride != maxStride || maxStride < bytes) && !beginEnd && !GLctx.currentArrayBufferBinding;
++        if (GLImmediate.needsRestride) {
+ #if GL_ASSERTIONS
+-        if ((GLImmediate.stride & 3) != 0) {
+-          warnOnce(`Warning: Rendering from client side vertex arrays where stride (${GLImmediate.stride}) is not a multiple of four! This is not currently supported!`);
+-        }
+-#endif
+-        GLImmediate.vertexCounter = (GLImmediate.stride * count) / 4; // XXX assuming float
+-        return;
+-      }
+-      GLImmediate.modifiedClientAttributes = false;
+-
+-      // The role of prepareClientAttributes is to examine the set of
+-      // client-side vertex attribute buffers that user code has submitted, and
+-      // to prepare them to be uploaded to a VBO in GPU memory (since WebGL does
+-      // not support client-side rendering, i.e. rendering from vertex data in
+-      // CPU memory). User can submit vertex data generally in three different
+-      // configurations:
+-      // 1. Fully planar: all attributes are in their own separate
+-      //                  tightly-packed arrays in CPU memory.
+-      // 2. Fully interleaved: all attributes share a single array where data is
+-      //                       interleaved something like (pos,uv,normal),
+-      //                       (pos,uv,normal), ...
+-      // 3. Complex hybrid: Multiple separate arrays that either are sparsely
+-      //                    strided, and/or partially interleaves vertex
+-      //                    attributes.
+-
+-      // For simplicity, we support the case (2) as the fast case. For (1) and
+-      // (3), we do a memory copy of the vertex data here to prepare a
+-      // relayouted buffer that is of the structure in case (2). The reason
+-      // for this is that it allows the emulation code to get away with using
+-      // just one VBO buffer for rendering, and not have to maintain multiple
+-      // ones. Therefore cases (1) and (3) will be very slow, and case (2) is
+-      // fast.
+-
+-      // Detect which case we are in by using a quick heuristic by examining the
+-      // strides of the buffers. If all the buffers have identical stride, we
+-      // assume we have case (2), otherwise we have something more complex.
+-      var clientStartPointer = {{{ POINTER_MAX }}};
+-      var bytes = 0; // Total number of bytes taken up by a single vertex.
+-      var minStride = {{{ POINTER_MAX }}};
+-      var maxStride = 0;
+-      var attributes = GLImmediate.liveClientAttributes;
+-      attributes.length = 0;
+-      for (var i = 0; i < 3+GLImmediate.MAX_TEXTURES; i++) {
+-        if (GLImmediate.enabledClientAttributes[i]) {
+-          var attr = GLImmediate.clientAttributes[i];
+-          attributes.push(attr);
+-          clientStartPointer = Math.min(clientStartPointer, attr.pointer);
+-          attr.sizeBytes = attr.size * GL.byteSizeByType[attr.type - GL.byteSizeByTypeRoot];
+-          bytes += attr.sizeBytes;
+-          minStride = Math.min(minStride, attr.stride);
+-          maxStride = Math.max(maxStride, attr.stride);
+-        }
+-      }
+-
+-      if ((minStride != maxStride || maxStride < bytes) && !beginEnd) {
+-        // We are in cases (1) or (3): slow path, shuffle the data around into a
+-        // single interleaved vertex buffer.
+-        // The immediate-mode glBegin()/glEnd() vertex submission gets
+-        // automatically generated in appropriate layout, so never need to come
+-        // down this path if that was used.
+-#if GL_ASSERTIONS
+-        warnOnce('Rendering from planar client-side vertex arrays. This is a very slow emulation path! Use interleaved vertex arrays for best performance.');
+-#endif
+-        GLImmediate.restrideBuffer ||= _malloc(GL.MAX_TEMP_BUFFER_SIZE);
++          warnOnce('Rendering from planar client-side vertex arrays. This is a very slow emulation path! Use interleaved vertex arrays for best performance.');
++#endif
++          GLImmediate.restrideBuffer ||= _malloc(GL.MAX_TEMP_BUFFER_SIZE);
++          bytes = 0;
++          // calculate restrided offsets and total size without clobbering attr.pointer
++          for (var attr of attributes) {
++            var size = attr.sizeBytes;
++            if (size % 4 != 0) size += 4 - (size % 4); // align everything
++            attr.offset = bytes;
++            bytes += size;
++          }
++          GLImmediate.stride = bytes;
++          GLImmediate.vertexPointer = GLImmediate.restrideBuffer;
++        } else {
++          // case (2): fast path, all data is interleaved to a single vertex array so we can get away with a single VBO upload.
++          if (GLctx.currentArrayBufferBinding) {
++            GLImmediate.vertexPointer = 0;
++          } else {
++            GLImmediate.vertexPointer = clientStartPointer;
++          }
++          for (var attr of attributes) {
++            attr.offset = attr.pointer - GLImmediate.vertexPointer; // Compute what will be the offset of this attribute in the VBO after we upload.
++          }
++          GLImmediate.stride = Math.max(maxStride, bytes);
++        }
++      }
++
++      if (GLImmediate.needsRestride && !beginEnd && !GLctx.currentArrayBufferBinding) {
+         var start = GLImmediate.restrideBuffer;
+-        bytes = 0;
+-        // calculate restrided offsets and total size
+-        for (var attr of attributes) {
+-          var size = attr.sizeBytes;
+-          if (size % 4 != 0) size += 4 - (size % 4); // align everything
+-          attr.offset = bytes;
+-          bytes += size;
+-        }
+-        // copy out the data (we need to know the stride for that, and define attr.pointer)
++        var strideBytes = GLImmediate.stride;
++#if ASSERTIONS
++        assert(count * strideBytes <= GL.MAX_TEMP_BUFFER_SIZE, 'too much planar vertex data');
++#endif
+         for (var attr of attributes) {
+           var srcStride = Math.max(attr.sizeBytes, attr.stride);
+           if ((srcStride & 3) == 0 && (attr.sizeBytes & 3) == 0) {
+-            for (var j = 0; j < count; j++) {
++            for (var j = first; j < count; j++) {
+               for (var k = 0; k < attr.sizeBytes; k+=4) { // copy in chunks of 4 bytes, our alignment makes this possible
+                 var val = {{{ makeGetValue('attr.pointer', 'j*srcStride + k', 'i32') }}};
+-                {{{ makeSetValue('start + attr.offset', 'bytes*j + k', 'val', 'i32') }}};
++                {{{ makeSetValue('start + attr.offset', 'strideBytes*j + k', 'val', 'i32') }}};
+               }
+             }
+           } else {
+-            for (var j = 0; j < count; j++) {
++            for (var j = first; j < count; j++) {
+               for (var k = 0; k < attr.sizeBytes; k++) { // source data was not aligned to multiples of 4, must copy byte by byte.
+-                HEAP8[start + attr.offset + bytes*j + k] = HEAP8[attr.pointer + j*srcStride + k];
++                HEAP8[start + attr.offset + strideBytes*j + k] = HEAP8[attr.pointer + j*srcStride + k];
+               }
+             }
+           }
+-          attr.pointer = start + attr.offset;
+-        }
+-        GLImmediate.stride = bytes;
+-        GLImmediate.vertexPointer = start;
+-      } else {
+-        // case (2): fast path, all data is interleaved to a single vertex array so we can get away with a single VBO upload.
+-        if (GLctx.currentArrayBufferBinding) {
+-          GLImmediate.vertexPointer = 0;
+-        } else {
+-          GLImmediate.vertexPointer = clientStartPointer;
+-        }
+-        for (var attr of attributes) {
+-          attr.offset = attr.pointer - GLImmediate.vertexPointer; // Compute what will be the offset of this attribute in the VBO after we upload.
+-        }
+-        GLImmediate.stride = Math.max(maxStride, bytes);
+-      }
++        }
++      }
++
+       if (!beginEnd) {
+ #if GL_ASSERTIONS
+         if ((GLImmediate.stride & 3) != 0) {
+           warnOnce(`Warning: Rendering from client side vertex arrays where stride (${GLImmediate.stride}) is not a multiple of four! This is not currently supported!`);
+         }
+ #endif
+-        GLImmediate.vertexCounter = (GLImmediate.stride * count) / 4; // XXX assuming float
++        GLImmediate.vertexCounter = (GLImmediate.stride * (count - first)) / 4; // XXX assuming float
+       }
+     },
+ 
+@@ -3053,23 +3088,29 @@
+           emulatedElementArrayBuffer = true;
+         }
+       } else if (GLImmediate.mode > 6) { // above GL_TRIANGLE_FAN are the non-GL ES modes
+-        if (GLImmediate.mode != 7) abort('unsupported immediate mode ' + GLImmediate.mode); // GL_QUADS
+-        // GLImmediate.firstVertex is the first vertex we want. Quad indexes are
+-        // in the pattern 0 1 2, 0 2 3, 4 5 6, 4 6 7, so we need to look at
+-        // index firstVertex * 1.5 to see it.  Then since indexes are 2 bytes
+-        // each, that means 3
++        if (GLImmediate.mode == 8) { // GL_QUAD_STRIP
++          GLImmediate.mode = GLctx.TRIANGLE_STRIP;
++        } else if (GLImmediate.mode == 9) { // GL_POLYGON
++          GLImmediate.mode = GLctx.TRIANGLE_FAN;
++        } else {
++          if (GLImmediate.mode != 7) abort('unsupported immediate mode ' + GLImmediate.mode); // GL_QUADS
++          // GLImmediate.firstVertex is the first vertex we want. Quad indexes are
++          // in the pattern 0 1 2, 0 2 3, 4 5 6, 4 6 7, so we need to look at
++          // index firstVertex * 1.5 to see it.  Then since indexes are 2 bytes
++          // each, that means 3
+ #if ASSERTIONS
+-        assert(GLImmediate.firstVertex % 4 == 0);
+-#endif
+-        ptr = GLImmediate.firstVertex * 3;
+-        var numQuads = numVertices / 4;
+-        numIndexes = numQuads * 6; // 0 1 2, 0 2 3 pattern
++          assert(GLImmediate.firstVertex % 4 == 0);
++#endif
++          ptr = GLImmediate.firstVertex * 3;
++          var numQuads = numVertices >> 2;
++          numIndexes = numQuads * 6; // 0 1 2, 0 2 3 pattern
+ #if ASSERTIONS
+-        assert(ptr + (numIndexes << 1) <= GL.MAX_TEMP_BUFFER_SIZE, 'too many immediate mode indexes (b)');
+-#endif
+-        GLctx.bindBuffer(GLctx.ELEMENT_ARRAY_BUFFER, GL.currentContext.tempQuadIndexBuffer);
+-        emulatedElementArrayBuffer = true;
+-        GLImmediate.mode = GLctx.TRIANGLES;
++          assert(ptr + (numIndexes << 1) <= GL.MAX_TEMP_BUFFER_SIZE, 'too many immediate mode indexes (b)');
++#endif
++          GLctx.bindBuffer(GLctx.ELEMENT_ARRAY_BUFFER, GL.currentContext.tempQuadIndexBuffer);
++          emulatedElementArrayBuffer = true;
++          GLImmediate.mode = GLctx.TRIANGLES;
++        }
+       }
+ 
+       renderer.prepare();
+@@ -3080,7 +3121,7 @@
          GLctx.drawArrays(GLImmediate.mode, startIndex, numVertices);
        }
  
@@ -97,7 +395,268 @@ index 626d91c..fda2d26 100644
          GLctx.bindBuffer(GLctx.ELEMENT_ARRAY_BUFFER, GL.buffers[GLctx.currentElementArrayBufferBinding] || null);
        }
  
-@@ -3653,9 +3666,20 @@ var LibraryGLEmulation = {
+@@ -3107,8 +3148,13 @@
+       GLImmediate.clientAttributes.push({});
+     }
+ 
++    GLImmediate.currentRenderer = null;
++    GLImmediate.modifiedClientAttributes = true;
+     GLImmediate.mode = mode;
+     GLImmediate.vertexCounter = 0;
++    GLImmediate.beginVertexCount = 0;
++    GLImmediate.beginHasTexCoord = 0;
++    GLImmediate.beginHasNormal = false;
+     var components = GLImmediate.rendererComponents = [];
+     for (var i = 0; i < GLImmediate.NUM_ATTRIBUTES; i++) {
+       components[i] = 0;
+@@ -3118,10 +3164,12 @@
+   },
+ 
+   glEnd: () => {
+-    GLImmediate.prepareClientAttributes(GLImmediate.rendererComponents[GLImmediate.VERTEX], true);
+-    GLImmediate.firstVertex = 0;
+-    GLImmediate.lastVertex = GLImmediate.vertexCounter / (GLImmediate.stride >> 2);
+-    GLImmediate.flush();
++    if (GLImmediate.beginVertexCount > 0) {
++      GLImmediate.prepareClientAttributes(GLImmediate.beginVertexCount, true, 0);
++      GLImmediate.firstVertex = 0;
++      GLImmediate.lastVertex = GLImmediate.beginVertexCount;
++      GLImmediate.flush();
++    }
+     GLImmediate.disableBeginEndClientAttributes();
+     GLImmediate.mode = -1;
+ 
+@@ -3133,45 +3181,15 @@
+   },
+ 
+   glVertex2f: (x, y) => {
+-#if ASSERTIONS
+-    assert(GLImmediate.mode >= 0); // must be in begin/end
+-#endif
+-    GLImmediate.vertexData[GLImmediate.vertexCounter++] = x;
+-    GLImmediate.vertexData[GLImmediate.vertexCounter++] = y;
+-    GLImmediate.vertexData[GLImmediate.vertexCounter++] = 0;
+-    GLImmediate.vertexData[GLImmediate.vertexCounter++] = 1;
+-#if ASSERTIONS
+-    assert(GLImmediate.vertexCounter << 2 < GL.MAX_TEMP_BUFFER_SIZE);
+-#endif
+-    GLImmediate.addRendererComponent(GLImmediate.VERTEX, 4, GLctx.FLOAT);
++    GLImmediate.emitImmediateVertex(x, y, 0, 1);
+   },
+ 
+   glVertex3f: (x, y, z) => {
+-#if ASSERTIONS
+-    assert(GLImmediate.mode >= 0); // must be in begin/end
+-#endif
+-    GLImmediate.vertexData[GLImmediate.vertexCounter++] = x;
+-    GLImmediate.vertexData[GLImmediate.vertexCounter++] = y;
+-    GLImmediate.vertexData[GLImmediate.vertexCounter++] = z;
+-    GLImmediate.vertexData[GLImmediate.vertexCounter++] = 1;
+-#if ASSERTIONS
+-    assert(GLImmediate.vertexCounter << 2 < GL.MAX_TEMP_BUFFER_SIZE);
+-#endif
+-    GLImmediate.addRendererComponent(GLImmediate.VERTEX, 4, GLctx.FLOAT);
++    GLImmediate.emitImmediateVertex(x, y, z, 1);
+   },
+ 
+   glVertex4f: (x, y, z, w) => {
+-#if ASSERTIONS
+-    assert(GLImmediate.mode >= 0); // must be in begin/end
+-#endif
+-    GLImmediate.vertexData[GLImmediate.vertexCounter++] = x;
+-    GLImmediate.vertexData[GLImmediate.vertexCounter++] = y;
+-    GLImmediate.vertexData[GLImmediate.vertexCounter++] = z;
+-    GLImmediate.vertexData[GLImmediate.vertexCounter++] = w;
+-#if ASSERTIONS
+-    assert(GLImmediate.vertexCounter << 2 < GL.MAX_TEMP_BUFFER_SIZE);
+-#endif
+-    GLImmediate.addRendererComponent(GLImmediate.VERTEX, 4, GLctx.FLOAT);
++    GLImmediate.emitImmediateVertex(x, y, z, w);
+   },
+ 
+   glVertex2fv__deps: ['glVertex2f'],
+@@ -3196,12 +3214,11 @@
+   glVertex4i: 'glVertex4f',
+ 
+   glTexCoord2i: (u, v) => {
+-#if ASSERTIONS
+-    assert(GLImmediate.mode >= 0); // must be in begin/end
+-#endif
+-    GLImmediate.vertexData[GLImmediate.vertexCounter++] = u;
+-    GLImmediate.vertexData[GLImmediate.vertexCounter++] = v;
+-    GLImmediate.addRendererComponent(GLImmediate.TEXTURE0, 2, GLctx.FLOAT);
++    GLImmediate.currentTexCoords[0] = u;
++    GLImmediate.currentTexCoords[1] = v;
++    if (GLImmediate.mode >= 0) {
++      GLImmediate.beginHasTexCoord = 1;
++    }
+   },
+   glTexCoord2f: 'glTexCoord2i',
+ 
+@@ -3209,7 +3226,8 @@
+   glTexCoord2fv: (v) =>
+     _glTexCoord2i({{{ makeGetValue('v', '0', 'float') }}}, {{{ makeGetValue('v', '4', 'float') }}}),
+ 
+-  glTexCoord4f: () => { abort('glTexCoord4f: TODO') },
++  glTexCoord4f__deps: ['glTexCoord2i'],
++  glTexCoord4f: (s, t, r, q) => _glTexCoord2i(s, t),
+ 
+   glColor4f: (r, g, b, a) => {
+     r = Math.max(Math.min(r, 1), 0);
+@@ -3217,24 +3235,19 @@
+     b = Math.max(Math.min(b, 1), 0);
+     a = Math.max(Math.min(a, 1), 0);
+ 
+-    // TODO: make ub the default, not f, save a few mathops
+-    if (GLImmediate.mode >= 0) {
+-      var start = GLImmediate.vertexCounter << 2;
+-      GLImmediate.vertexDataU8[start + 0] = r * 255;
+-      GLImmediate.vertexDataU8[start + 1] = g * 255;
+-      GLImmediate.vertexDataU8[start + 2] = b * 255;
+-      GLImmediate.vertexDataU8[start + 3] = a * 255;
+-      GLImmediate.vertexCounter++;
+-      GLImmediate.addRendererComponent(GLImmediate.COLOR, 4, GLctx.UNSIGNED_BYTE);
+-    } else {
+-      GLImmediate.clientColor[0] = r;
+-      GLImmediate.clientColor[1] = g;
+-      GLImmediate.clientColor[2] = b;
+-      GLImmediate.clientColor[3] = a;
++    GLImmediate.clientColor[0] = r;
++    GLImmediate.clientColor[1] = g;
++    GLImmediate.clientColor[2] = b;
++    GLImmediate.clientColor[3] = a;
++    GLImmediate.clientColorU8[0] = (r * 255 + 0.5) | 0;
++    GLImmediate.clientColorU8[1] = (g * 255 + 0.5) | 0;
++    GLImmediate.clientColorU8[2] = (b * 255 + 0.5) | 0;
++    GLImmediate.clientColorU8[3] = (a * 255 + 0.5) | 0;
+ #if GL_FFP_ONLY
++    if (GLImmediate.mode < 0) {
+       GLctx.vertexAttrib4fv(GLImmediate.COLOR, GLImmediate.clientColor);
+-#endif
+-    }
++    }
++#endif
+   },
+ 
+   glColor4d: 'glColor4f',
+@@ -3386,16 +3399,12 @@
+   },
+ 
+   glNormal3f: (x, y, z) => {
+-#if ASSERTIONS
+-    assert(GLImmediate.mode >= 0); // must be in begin/end
+-#endif
+-    GLImmediate.vertexData[GLImmediate.vertexCounter++] = x;
+-    GLImmediate.vertexData[GLImmediate.vertexCounter++] = y;
+-    GLImmediate.vertexData[GLImmediate.vertexCounter++] = z;
+-#if ASSERTIONS
+-    assert(GLImmediate.vertexCounter << 2 < GL.MAX_TEMP_BUFFER_SIZE);
+-#endif
+-    GLImmediate.addRendererComponent(GLImmediate.NORMAL, 3, GLctx.FLOAT);
++    GLImmediate.currentNormal[0] = x;
++    GLImmediate.currentNormal[1] = y;
++    GLImmediate.currentNormal[2] = z;
++    if (GLImmediate.mode >= 0) {
++      GLImmediate.beginHasNormal = true;
++    }
+   },
+ 
+   glNormal3fv__deps: ['glNormal3f'],
+@@ -3496,11 +3505,12 @@
+   // client attributes enabled, and we use webgl-friendly modes (no GL_QUADS),
+   // then no need for emulation
+   glDrawArrays: (mode, first, count) => {
++    if (count <= 0) return;
+     if (GLImmediate.totalEnabledClientAttributes == 0 && mode <= 6) {
+       GLctx.drawArrays(mode, first, count);
+       return;
+     }
+-    GLImmediate.prepareClientAttributes(count, false);
++    GLImmediate.prepareClientAttributes(first + count, false, first);
+     GLImmediate.mode = mode;
+     if (!GLctx.currentArrayBufferBinding) {
+       GLImmediate.vertexData = {{{ makeHEAPView('F32', 'GLImmediate.vertexPointer', 'GLImmediate.vertexPointer + (first+count)*GLImmediate.stride') }}}; // XXX assuming float
+@@ -3513,30 +3523,61 @@
+ 
+   // start, end are given if we come from glDrawRangeElements
+   glDrawElements: (mode, count, type, indices, start, end) => {
++    if (count <= 0) return;
+     if (GLImmediate.totalEnabledClientAttributes == 0 && mode <= 6 && GLctx.currentElementArrayBufferBinding) {
+       GLctx.drawElements(mode, count, type, indices);
+       return;
+     }
+-#if ASSERTIONS
+-    if (!GLctx.currentElementArrayBufferBinding) {
+-      assert(type == GLctx.UNSIGNED_SHORT); // We can only emulate buffers of this kind, for now
+-    }
+-    warnOnce("DrawElements doesn't actually prepareClientAttributes properly.");
+-#endif
+-    GLImmediate.prepareClientAttributes(count, false);
++    var firstVertex = 0;
++    var lastVertex = count;
++    if (!GLctx.currentArrayBufferBinding) {
++      if (end !== undefined) {
++        firstVertex = start || 0;
++        lastVertex = end + 1;
++      } else if (!GLctx.currentElementArrayBufferBinding) {
++        firstVertex = HEAP8.length;
++        lastVertex = 0;
++        if (type == 0x1403 /* GL_UNSIGNED_SHORT */) {
++          for (var i = 0; i < count; i++) {
++            var currIndex = {{{ makeGetValue('indices', 'i*2', 'u16') }}};
++            if (currIndex < firstVertex) firstVertex = currIndex;
++            if (currIndex + 1 > lastVertex) lastVertex = currIndex + 1;
++          }
++        } else if (type == 0x1405 /* GL_UNSIGNED_INT */) {
++          GLImmediate.tempU16Indices ||= _malloc(GL.MAX_TEMP_BUFFER_SIZE);
++          var dstIdx = GLImmediate.tempU16Indices >> 1;
++          for (var i = 0; i < count; i++) {
++            var currIndex = {{{ makeGetValue('indices', 'i*4', 'u32') }}};
++            HEAPU16[dstIdx + i] = currIndex;
++            if (currIndex < firstVertex) firstVertex = currIndex;
++            if (currIndex + 1 > lastVertex) lastVertex = currIndex + 1;
++          }
++          indices = GLImmediate.tempU16Indices;
++          type = 0x1403;
++        } else if (type == 0x1401 /* GL_UNSIGNED_BYTE */) {
++          GLImmediate.tempU16Indices ||= _malloc(GL.MAX_TEMP_BUFFER_SIZE);
++          var dstIdx = GLImmediate.tempU16Indices >> 1;
++          for (var i = 0; i < count; i++) {
++            var currIndex = HEAPU8[indices + i];
++            HEAPU16[dstIdx + i] = currIndex;
++            if (currIndex < firstVertex) firstVertex = currIndex;
++            if (currIndex + 1 > lastVertex) lastVertex = currIndex + 1;
++          }
++          indices = GLImmediate.tempU16Indices;
++          type = 0x1403;
++        }
++        if (firstVertex > lastVertex) firstVertex = 0;
++      }
++      if (lastVertex <= 0) return;
++    }
++    GLImmediate.prepareClientAttributes(lastVertex, false, firstVertex);
+     GLImmediate.mode = mode;
+     if (!GLctx.currentArrayBufferBinding) {
+-      GLImmediate.firstVertex = end ? start : HEAP8.length; // if we don't know the start, set an invalid value and we will calculate it later from the indices
+-      GLImmediate.lastVertex = end ? end + 1 : 0;
+-      start = GLImmediate.vertexPointer;
+-      // TODO(sbc): Combine these two subarray calls back into a single one if
+-      // we ever fix https://github.com/emscripten-core/emscripten/issues/21250.
+-      if (end) {
+-        end = GLImmediate.vertexPointer + (end +1 ) * GLImmediate.stride;
+-        GLImmediate.vertexData = HEAPF32.subarray({{{ getHeapOffset('start', 'float') }}}, {{{ getHeapOffset('end', 'float') }}});
+-      } else {
+-        GLImmediate.vertexData = HEAPF32.subarray({{{ getHeapOffset('start', 'float') }}});
+-      }
++      GLImmediate.firstVertex = firstVertex;
++      GLImmediate.lastVertex = lastVertex;
++      var vStart = GLImmediate.vertexPointer;
++      var vEnd = vStart + lastVertex * GLImmediate.stride;
++      GLImmediate.vertexData = HEAPF32.subarray({{{ getHeapOffset('vStart', 'float') }}}, {{{ getHeapOffset('vEnd', 'float') }}});
+     }
+     GLImmediate.flush(count, 0, indices);
+     GLImmediate.mode = -1;
+@@ -3653,9 +3694,20 @@
  #if GL_DEBUG
      if (GL.debug) dbg('glLoadMatrixf receiving: ' + Array.prototype.slice.call(HEAPF32.subarray(matrix >> 2, (matrix >> 2) + 16)));
  #endif
@@ -122,10 +681,9 @@ index 626d91c..fda2d26 100644
  
    glLoadTransposeMatrixd: (matrix) => {
 diff --git a/src/lib/libwebgl.js b/src/lib/libwebgl.js
-index f0807ae..7f941ef 100644
 --- a/src/lib/libwebgl.js
 +++ b/src/lib/libwebgl.js
-@@ -400,7 +400,7 @@ for (/**@suppress{duplicate}*/var i = 0; i <= {{{ GL_POOL_TEMP_BUFFERS_SIZE }}};
+@@ -400,7 +400,7 @@
      // Maximum number of temp VBOs of one size to maintain, after that we start
      // reusing old ones, which is safe but can give a performance impact. If
      // CPU-GPU stalls are a problem, increasing this might help.
@@ -134,7 +692,7 @@ index f0807ae..7f941ef 100644
  
      // Precompute a lookup table for the function ceil(log2(x)), i.e. how many
      // bits are needed to represent x, or, if x was rounded up to next pow2,
-@@ -410,27 +410,34 @@ for (/**@suppress{duplicate}*/var i = 0; i <= {{{ GL_POOL_TEMP_BUFFERS_SIZE }}};
+@@ -410,27 +410,34 @@
  
      generateTempBuffers: (quads, context) => {
        var largestIndex = GL.log2ceilLookup(GL.MAX_TEMP_BUFFER_SIZE);
@@ -188,7 +746,7 @@ index f0807ae..7f941ef 100644
  
        if (quads) {
          // GL_QUAD indexes can be precalculated
-@@ -471,26 +478,27 @@ for (/**@suppress{duplicate}*/var i = 0; i <= {{{ GL_POOL_TEMP_BUFFERS_SIZE }}};
+@@ -471,26 +478,27 @@
        if (vbo) {
          return vbo;
        }
@@ -227,7 +785,7 @@ index f0807ae..7f941ef 100644
      },
  
      // Called at start of each new WebGL rendering frame. This swaps the
-@@ -498,18 +506,20 @@ for (/**@suppress{duplicate}*/var i = 0; i <= {{{ GL_POOL_TEMP_BUFFERS_SIZE }}};
+@@ -498,18 +506,20 @@
      // utilizes different set of temp buffers. The aim is to keep the set of
      // buffers being rendered, and the set of buffers being updated disjoint.
      newRenderingFrameStarted: () => {
