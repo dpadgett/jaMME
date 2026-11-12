@@ -1438,6 +1438,18 @@
     };
   }
 
+  function getTrimExtraPhysH(unit) {
+    const card = document.getElementById('jk-pip-card');
+    if (!card || card.hidden || isCardFullscreen()) return 0;
+    const bar = document.getElementById('jk-trim-bar');
+    if (!bar || bar.hidden || !card.contains(bar)) return 0;
+    const u = Number(unit) > 0.05 ? Number(unit) : 1;
+    const barCssH = bar.getBoundingClientRect().height;
+    if (!(barCssH > 0)) return 0;
+    const baseTimelinePhysH = isCoarsePointer() ? 24 : 18;
+    return Math.max(0, Math.round(barCssH / u - baseTimelinePhysH));
+  }
+
   function clampSize(physWidth, physHeight, vpOverride) {
     const vp = vpOverride || getViewportRect();
     const mobileDoc = isMobileDocMode();
@@ -1469,10 +1481,11 @@
       const hdrEl = document.getElementById('jk-pip-header');
       const ctrlEl = document.getElementById('jk-pip-controls');
       if (hdrEl && ctrlEl) {
+        const trimExtraPhys = getTrimExtraPhysH(unit);
         const chromeCssH =
           hdrEl.getBoundingClientRect().height + ctrlEl.getBoundingClientRect().height;
         if (chromeCssH > 0) {
-          minH = Math.max(minH, Math.ceil(chromeCssH / unit) + 68);
+          minH = Math.max(minH, Math.ceil(chromeCssH / unit) - trimExtraPhys + 68);
         }
       }
     }
@@ -1755,27 +1768,32 @@
       const docUnit = pipState.mobileDocUnit || unit;
       pipState.mobileDocUnit = docUnit;
       const cssW = Math.round(pipState.width * docUnit * 100) / 100;
-      const cssH = Math.round(pipState.height * docUnit * 100) / 100;
       card.classList.toggle('jk-pip-narrow', pipState.width < 450);
       card.classList.toggle('jk-pip-xs', pipState.width < 310);
       if (docUnit < 0.999) {
         card.style.setProperty('--jk-ui-scale', '1');
         card.style.width = Math.round(pipState.width * 100) / 100 + 'px';
-        card.style.height = Math.round(pipState.height * 100) / 100 + 'px';
         card.style.transformOrigin = '0 0';
         card.style.transform = 'scale(' + Math.round(docUnit * 100000) / 100000 + ')';
+        const trimExtraPhys = getTrimExtraPhysH(docUnit);
+        const renderPhysH = pipState.height + trimExtraPhys;
+        card.style.height = Math.round(renderPhysH * 100) / 100 + 'px';
+        targetW = Math.round(cssW);
+        targetH = Math.round(renderPhysH * docUnit);
       } else {
         card.style.setProperty('--jk-ui-scale', String(Math.round(docUnit * 10000) / 10000));
         card.style.transform = 'none';
         card.style.width = cssW + 'px';
-        card.style.height = cssH + 'px';
+        const trimExtraPhys = getTrimExtraPhysH(docUnit);
+        const renderCssH = Math.round((pipState.height + trimExtraPhys) * docUnit * 100) / 100;
+        card.style.height = renderCssH + 'px';
+        targetW = Math.round(cssW);
+        targetH = Math.round(renderCssH);
       }
       card.style.left = Math.max(0, Math.round(pipState.x * 100) / 100) + 'px';
       card.style.top = Math.max(0, Math.round(pipState.y * 100) / 100) + 'px';
       card.style.right = 'auto';
       card.style.bottom = 'auto';
-      targetW = Math.round(cssW);
-      targetH = Math.round(cssH);
     } else {
       card.classList.remove('jk-pip-force-landscape');
       card.style.position = 'fixed';
@@ -1788,28 +1806,45 @@
       pipState.width = dims.width;
       pipState.height = dims.height;
       const cssW = Math.round(Math.min(vp.width, dims.width * unit) * 100) / 100;
-      const cssH = Math.round(Math.min(vp.height, dims.height * unit) * 100) / 100;
+      const baseCssH = Math.round(Math.min(vp.height, dims.height * unit) * 100) / 100;
 
       card.classList.toggle('jk-pip-narrow', dims.width < 450);
       card.classList.toggle('jk-pip-xs', dims.width < 310);
       card.style.setProperty('--jk-ui-scale', '1');
       card.style.transform = 'none';
       card.style.width = cssW + 'px';
-      card.style.height = cssH + 'px';
+
+      const trimExtraPhys = getTrimExtraPhysH(unit);
+      const marginCss = (physVpW < 440 ? 4 : 8) * unit;
+      const maxCardCssH = Math.max(HARD_MIN_HEIGHT * unit, vp.height - marginCss * 2);
+      const renderCssH =
+        trimExtraPhys > 0
+          ? Math.round(Math.min(maxCardCssH, (dims.height + trimExtraPhys) * unit) * 100) / 100
+          : baseCssH;
+      card.style.height = renderCssH + 'px';
 
       if (typeof pipState.x !== 'number' || typeof pipState.y !== 'number') {
         pipState.x = Math.round(vp.left + vp.width - cssW - 16);
-        pipState.y = Math.round(vp.top + vp.height - cssH - 16);
+        pipState.y = Math.round(vp.top + vp.height - baseCssH - 16);
       }
-      const pos = clampPosition(pipState.x, pipState.y, cssW, cssH, vp);
-      pipState.x = pos.x;
-      pipState.y = pos.y;
-      card.style.left = pos.x + 'px';
-      card.style.top = pos.y + 'px';
+      if (trimExtraPhys > 0 && !pipState.dragging && !pipState.resizing) {
+        const basePos = clampPosition(pipState.x, pipState.y, cssW, baseCssH, vp);
+        pipState.x = basePos.x;
+        pipState.y = basePos.y;
+        const renderPos = clampPosition(basePos.x, basePos.y, cssW, renderCssH, vp);
+        card.style.left = renderPos.x + 'px';
+        card.style.top = renderPos.y + 'px';
+      } else {
+        const pos = clampPosition(pipState.x, pipState.y, cssW, renderCssH, vp);
+        pipState.x = pos.x;
+        pipState.y = pos.y;
+        card.style.left = pos.x + 'px';
+        card.style.top = pos.y + 'px';
+      }
       card.style.right = 'auto';
       card.style.bottom = 'auto';
       targetW = pipState.width;
-      targetH = pipState.height;
+      targetH = Math.round(renderCssH / unit);
     }
 
     ['compact', 'default', 'large'].forEach((p) => {
@@ -1841,18 +1876,20 @@
     const rect = card.getBoundingClientRect();
     if (isMobileDocMode()) {
       const u = pipState.mobileDocUnit || getVisualUnit(vp);
+      const trimExtra = getTrimExtraPhysH(u);
       const scrollX = Number(window.scrollX ?? window.pageXOffset) || 0;
       const scrollY = Number(window.scrollY ?? window.pageYOffset) || 0;
       pipState.x = rect.left + scrollX;
       pipState.y = rect.top + scrollY;
       if (rect.width > 0) pipState.width = Math.round(rect.width / u);
-      if (rect.height > 0) pipState.height = Math.round(rect.height / u);
+      if (rect.height > 0) pipState.height = Math.max(HARD_MIN_HEIGHT, Math.round(rect.height / u) - trimExtra);
     } else {
       const unit = getVisualUnit(vp);
+      const trimExtra = getTrimExtraPhysH(unit);
       pipState.x = rect.left;
       pipState.y = rect.top;
       if (rect.width > 0) pipState.width = Math.round(rect.width / unit);
-      if (rect.height > 0) pipState.height = Math.round(rect.height / unit);
+      if (rect.height > 0) pipState.height = Math.max(HARD_MIN_HEIGHT, Math.round(rect.height / unit) - trimExtra);
     }
   }
 
@@ -2029,7 +2066,7 @@
       if (isMobileDocMode()) {
         const u = pipState.mobileDocUnit || getVisualUnit(vp);
         const boxW = pipState.width * u;
-        const boxH = pipState.height * u;
+        const boxH = (pipState.height + getTrimExtraPhysH(u)) * u;
         const docW = Math.max(
           document.documentElement ? document.documentElement.scrollWidth || 0 : 0,
           document.body ? document.body.scrollWidth || 0 : 0,
@@ -2055,9 +2092,10 @@
         return;
       }
       const unit = getVisualUnit(vp);
+      const trimExtra = getTrimExtraPhysH(unit);
       const nextX = e.clientX - pipState.dragOffsetX;
       const nextY = e.clientY - pipState.dragOffsetY;
-      const pos = clampPosition(nextX, nextY, pipState.width * unit, pipState.height * unit, vp);
+      const pos = clampPosition(nextX, nextY, pipState.width * unit, (pipState.height + trimExtra) * unit, vp);
       pipState.x = pos.x;
       pipState.y = pos.y;
       card.style.left = pos.x + 'px';
@@ -2127,11 +2165,12 @@
         const scrollX = Number(window.scrollX ?? window.pageXOffset) || 0;
         const scrollY = Number(window.scrollY ?? window.pageYOffset) || 0;
         const nextUnit = getVisualUnit(vp);
+        const trimExtra = getTrimExtraPhysH(nextUnit);
         pipState.mobileDocUnit = nextUnit;
         pipState.x = rect.left + scrollX;
         pipState.y = rect.top + scrollY;
         if (rect.width > 0) pipState.width = rect.width / nextUnit;
-        if (rect.height > 0) pipState.height = rect.height / nextUnit;
+        if (rect.height > 0) pipState.height = Math.max(HARD_MIN_HEIGHT, rect.height / nextUnit - trimExtra);
       } else {
         syncCoordsFromDOM();
       }
@@ -2171,8 +2210,9 @@
       const hasN = dir.indexOf('n') !== -1;
       const hasS = dir.indexOf('s') !== -1;
 
+      const trimExtra = getTrimExtraPhysH(unit);
       const anchorRight = pipState.resizeStartCardX + pipState.resizeStartW * unit;
-      const anchorBottom = pipState.resizeStartCardY + pipState.resizeStartH * unit;
+      const anchorBottom = pipState.resizeStartCardY + (pipState.resizeStartH + trimExtra) * unit;
       const minLeft = mobileDoc ? 4 * unit : vp.left + marginCss;
       const minTop = mobileDoc ? 4 * unit : vp.top + marginCss;
 
@@ -2186,7 +2226,7 @@
 
       let rawH = pipState.resizeStartH;
       if (hasN) {
-        const maxNorthH = Math.max(HARD_MIN_HEIGHT, (anchorBottom - minTop) / unit);
+        const maxNorthH = Math.max(HARD_MIN_HEIGHT, (anchorBottom - minTop) / unit - trimExtra);
         rawH = Math.min(pipState.resizeStartH - dy, maxNorthH);
       } else if (hasS) {
         rawH = pipState.resizeStartH + dy;
@@ -2213,7 +2253,7 @@
       }
 
       if (hasN) {
-        pipState.y = Math.round(Math.max(0, anchorBottom - dims.height * unit) * 100) / 100;
+        pipState.y = Math.round(Math.max(0, anchorBottom - (dims.height + trimExtra) * unit) * 100) / 100;
       } else if (hasS) {
         pipState.y = pipState.resizeStartCardY;
       }
@@ -3042,7 +3082,7 @@
       return Promise.resolve(window.JKVideoExport);
     }
     if (videoExportScriptPromise) return videoExportScriptPromise;
-    const PLAYER_ASSET_VERSION = '20261111d';
+    const PLAYER_ASSET_VERSION = '20261111f';
     videoExportScriptPromise = new Promise((resolve, reject) => {
       const existing = document.querySelector('script[src*="/jkplayer/jk-video-export.js"]');
       if (existing) {
@@ -3087,8 +3127,8 @@
     }
 
     // Separate engine vs wrapper versions so UI/JS updates do not invalidate cached openjk.wasm
-    const ENGINE_ASSET_VERSION = '20261111d';
-    const PLAYER_ASSET_VERSION = '20261111d';
+    const ENGINE_ASSET_VERSION = '20261111e';
+    const PLAYER_ASSET_VERSION = '20261111f';
     ensureVideoExportScriptLoaded().catch(() => {});
     window.JKDemoConfig = Object.assign(
       {
@@ -4165,6 +4205,7 @@
     toggleMusic,
     setSizePreset,
     toggleFullscreen,
+    refreshLayout: () => applyCardGeometry(),
     isOpen: () => pipState.open,
     getState: () => Object.assign({}, pipState, { ready: Boolean(getPlayer() && getPlayer().getStatus && getPlayer().getStatus().ready) }),
   };

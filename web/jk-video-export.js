@@ -5,11 +5,14 @@
     return;
   }
 
-  const ASSET_VERSION = '20261111d';
+  const ASSET_VERSION = '20261111f';
   const MIN_CLIP_MS = 500;
+  const MIN_VIEW_SPAN_MS = 5000;
   const DEFAULT_PRE_MS = 10000;
   const DEFAULT_POST_MS = 5000;
   const FINE_STEP_MS = 100;
+  const COARSE_STEP_MS = 1000;
+  const FINE_DRAG_FACTOR = 0.15;
   const AUTO_DISMISS_MS = 6000;
 
   const RESOLUTIONS = {
@@ -49,8 +52,16 @@
     durationMs: 0,
     startMs: 0,
     endMs: 5000,
+    viewStartMs: 0,
+    viewEndMs: 5000,
     previewing: false,
     previewRaf: 0,
+    playheadRaf: 0,
+    edgePanRaf: 0,
+    draggingHandle: null, // 'start' | 'end' | null
+    shiftDown: false,
+    fineOriginRawMs: null,
+    fineOriginValMs: null,
     wasPaused: true,
     activeHandle: 'end',
     lastSeekSentAt: 0,
@@ -184,6 +195,56 @@
     return mins + 'm ' + (rem < 10 ? '0' + rem : rem) + 's';
   }
 
+  function formatZoomSpanLabel(spanMs, durMs) {
+    if (!durMs || spanMs >= durMs - 50) return 'Full';
+    const sec = Math.max(1, spanMs / 1000);
+    if (sec < 60) {
+      const rounded = sec < 15 ? sec.toFixed(1).replace(/\.0$/, '') : String(Math.round(sec));
+      return rounded + 's';
+    }
+    const mins = sec / 60;
+    return (mins < 10 ? mins.toFixed(1).replace(/\.0$/, '') : String(Math.round(mins))) + 'm';
+  }
+
+  function parseFlexibleTimestamp(raw, currentMs, maxDurMs) {
+    const s = String(raw == null ? '' : raw).trim();
+    if (!s) return null;
+    if (/^[+-]/.test(s)) {
+      const relSec = Number(s);
+      if (!Number.isFinite(relSec)) return null;
+      return Math.max(0, Math.min(maxDurMs, Math.round(currentMs + relSec * 1000)));
+    }
+    const parts = s.split(':');
+    if (parts.length === 1) {
+      const sec = Number(parts[0].replace(/s$/i, ''));
+      if (!Number.isFinite(sec) || sec < 0) return null;
+      return Math.max(0, Math.min(maxDurMs, Math.round(sec * 1000)));
+    }
+    if (parts.length === 2) {
+      const mins = Number(parts[0]);
+      const secs = Number(parts[1]);
+      if (!Number.isFinite(mins) || !Number.isFinite(secs) || mins < 0 || secs < 0) return null;
+      return Math.max(0, Math.min(maxDurMs, Math.round((mins * 60 + secs) * 1000)));
+    }
+    if (parts.length === 3) {
+      const hrs = Number(parts[0]);
+      const mins = Number(parts[1]);
+      const secs = Number(parts[2]);
+      if (
+        !Number.isFinite(hrs) ||
+        !Number.isFinite(mins) ||
+        !Number.isFinite(secs) ||
+        hrs < 0 ||
+        mins < 0 ||
+        secs < 0
+      ) {
+        return null;
+      }
+      return Math.max(0, Math.min(maxDurMs, Math.round((hrs * 3600 + mins * 60 + secs) * 1000)));
+    }
+    return null;
+  }
+
   function formatBytesMB(bytes) {
     const mb = Math.max(0, Number(bytes) || 0) / (1024 * 1024);
     return mb.toFixed(mb >= 10 ? 1 : 2) + ' MB';
@@ -232,15 +293,17 @@
       /* Inline Scrubber Trim Bar */
       #jk-trim-bar {
         color-scheme: only dark;
-        background: rgba(13, 17, 23, 0.92);
+        -webkit-user-select: none;
+        user-select: none;
+        background: rgba(13, 17, 23, 0.94);
         color: #e6edf3;
         accent-color: #58a6ff;
         border: 1px solid #1f6feb;
         border-radius: calc(6px * var(--jk-ui-scale, 1));
-        padding: calc(6px * var(--jk-ui-scale, 1)) calc(8px * var(--jk-ui-scale, 1));
+        padding: calc(5px * var(--jk-ui-scale, 1)) calc(6px * var(--jk-ui-scale, 1));
         display: flex;
         flex-direction: column;
-        gap: calc(5px * var(--jk-ui-scale, 1));
+        gap: calc(4px * var(--jk-ui-scale, 1));
         inline-size: 100%;
         box-sizing: border-box;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -253,49 +316,178 @@
         flex: 1 1 360px;
         min-inline-size: 260px;
       }
+
+      /* Row 1: Full-Demo Overview Minimap + Zoom Controls */
+      .jk-trim-overview-row {
+        display: flex;
+        align-items: center;
+        gap: calc(6px * var(--jk-ui-scale, 1));
+        inline-size: 100%;
+      }
+      .jk-trim-overview {
+        position: relative;
+        flex: 1 1 auto;
+        min-inline-size: 80px;
+        block-size: calc(12px * var(--jk-ui-scale, 1));
+        background: #0d1117;
+        border: 1px solid #30363d;
+        border-radius: 4px;
+        overflow: hidden;
+        cursor: pointer;
+        touch-action: none;
+      }
+      .jk-trim-overview-sel {
+        position: absolute;
+        top: calc(2px * var(--jk-ui-scale, 1));
+        bottom: calc(2px * var(--jk-ui-scale, 1));
+        inset-inline-start: var(--ov-sel-start-pct, 0%);
+        inline-size: max(3px, calc(var(--ov-sel-end-pct, 10%) - var(--ov-sel-start-pct, 0%)));
+        background: linear-gradient(90deg, #58a6ff, #3fb950);
+        border-radius: 2px;
+        pointer-events: none;
+        z-index: 2;
+      }
+      .jk-trim-overview-cur {
+        position: absolute;
+        inset-block: 0;
+        inset-inline-start: var(--ov-cur-pct, 0%);
+        inline-size: 1.5px;
+        background: rgba(240, 246, 252, 0.9);
+        pointer-events: none;
+        z-index: 3;
+      }
+      .jk-trim-overview-win {
+        position: absolute;
+        inset-block: 0;
+        inset-inline-start: var(--ov-win-start-pct, 0%);
+        inline-size: max(6px, calc(var(--ov-win-end-pct, 100%) - var(--ov-win-start-pct, 0%)));
+        background: rgba(121, 192, 255, 0.16);
+        border-inline: 1.5px solid #79c0ff;
+        box-sizing: border-box;
+        cursor: grab;
+        z-index: 4;
+      }
+      .jk-trim-overview-win:active,
+      .jk-trim-overview.jk-trim-panning .jk-trim-overview-win {
+        cursor: grabbing;
+        background: rgba(121, 192, 255, 0.26);
+      }
+      .jk-trim-zoom-bar {
+        display: inline-flex;
+        align-items: center;
+        gap: calc(2px * var(--jk-ui-scale, 1));
+        flex-shrink: 0;
+      }
+      .jk-trim-zoom-btn {
+        background: #161b22;
+        color: #c9d1d9;
+        border: 1px solid #30363d;
+        border-radius: 3px;
+        min-inline-size: calc(18px * var(--jk-ui-scale, 1));
+        block-size: calc(17px * var(--jk-ui-scale, 1));
+        padding: 0 calc(4px * var(--jk-ui-scale, 1));
+        font-size: calc(10px * var(--jk-ui-scale, 1));
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        line-height: 1;
+        cursor: pointer;
+      }
+      .jk-trim-zoom-btn:hover:not(:disabled) {
+        background: #30363d;
+        color: #ffffff;
+        border-color: #484f58;
+      }
+      .jk-trim-zoom-btn:disabled {
+        opacity: 0.4;
+        cursor: default;
+      }
+      .jk-trim-zoom-span-btn {
+        min-inline-size: calc(40px * var(--jk-ui-scale, 1));
+        color: #79c0ff;
+        background: rgba(31, 111, 235, 0.14);
+        border-color: rgba(88, 166, 255, 0.35);
+      }
+
+      /* Row 2: Zoomed Precision Trim Track */
       .jk-trim-track-wrap {
         position: relative;
         inline-size: 100%;
-        block-size: calc(24px * var(--jk-ui-scale, 1));
+        block-size: calc(26px * var(--jk-ui-scale, 1));
         display: flex;
         align-items: center;
+        padding-inline: calc(5px * var(--jk-ui-scale, 1));
+        box-sizing: border-box;
+        cursor: pointer;
+        touch-action: none;
+      }
+      .jk-trim-bounds-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: calc(9.5px * var(--jk-ui-scale, 1));
+        color: #8b949e;
+        font-variant-numeric: tabular-nums;
+        line-height: 1;
+        margin-top: calc(-2px * var(--jk-ui-scale, 1));
+        pointer-events: none;
+      }
+      .jk-trim-fine-hint {
+        color: #6e7681;
+      }
+      #jk-trim-bar.jk-trim-fine-active .jk-trim-fine-hint {
+        color: #79c0ff;
+        font-weight: 600;
       }
       .jk-trim-rail {
-        position: absolute;
-        inset-inline: 0;
-        block-size: calc(6px * var(--jk-ui-scale, 1));
+        position: relative;
+        inline-size: 100%;
+        block-size: calc(8px * var(--jk-ui-scale, 1));
         background: #21262d;
         border: 1px solid #30363d;
         border-radius: 999px;
         overflow: hidden;
         pointer-events: none;
+        z-index: 1;
       }
       .jk-trim-range-fill {
         position: absolute;
-        inset-block: 0;
-        inset-inline-start: var(--trim-start-pct, 0%);
-        inline-size: calc(var(--trim-end-pct, 100%) - var(--trim-start-pct, 0%));
-        background: linear-gradient(90deg, rgba(47, 129, 247, 0.55), rgba(88, 166, 255, 0.75));
-        border-inline: 1px solid #79c0ff;
+        top: calc(7px * var(--jk-ui-scale, 1));
+        bottom: calc(7px * var(--jk-ui-scale, 1));
+        inset-inline-start: calc(5px * var(--jk-ui-scale, 1) + (100% - 10px * var(--jk-ui-scale, 1)) * var(--trim-start-frac, 0));
+        inline-size: max(0px, calc((100% - 10px * var(--jk-ui-scale, 1)) * (var(--trim-end-frac, 1) - var(--trim-start-frac, 0))));
+        background: linear-gradient(90deg, rgba(47, 129, 247, 0.58), rgba(63, 185, 80, 0.62));
+        border-top: 1px solid rgba(121, 192, 255, 0.65);
+        border-bottom: 1px solid rgba(121, 192, 255, 0.65);
         box-sizing: border-box;
+        cursor: grab;
+        pointer-events: auto;
+        z-index: 2;
+      }
+      .jk-trim-range-fill:active,
+      .jk-trim-range-fill.jk-trim-sliding {
+        cursor: grabbing;
+        background: linear-gradient(90deg, rgba(88, 166, 255, 0.72), rgba(63, 185, 80, 0.76));
       }
       .jk-trim-playhead {
         position: absolute;
-        top: calc(3px * var(--jk-ui-scale, 1));
-        bottom: calc(3px * var(--jk-ui-scale, 1));
-        inset-inline-start: var(--trim-cur-pct, 0%);
+        top: calc(2px * var(--jk-ui-scale, 1));
+        bottom: calc(2px * var(--jk-ui-scale, 1));
+        inset-inline-start: calc(5px * var(--jk-ui-scale, 1) + (100% - 10px * var(--jk-ui-scale, 1)) * var(--trim-cur-frac, 0));
         inline-size: 2px;
         background: #f0f6fc;
-        box-shadow: 0 0 4px rgba(240, 246, 252, 0.9);
+        box-shadow: 0 0 4px rgba(240, 246, 252, 0.95);
         transform: translateX(-1px);
         pointer-events: none;
         z-index: 3;
       }
+      .jk-trim-playhead.jk-trim-cur-offscreen {
+        opacity: 0;
+      }
       input[type="range"].jk-trim-range {
-        --slider-track-size: calc(6px * var(--jk-ui-scale, 1));
-        --slider-thumb-size: calc(16px * var(--jk-ui-scale, 1));
+        --slider-track-size: calc(8px * var(--jk-ui-scale, 1));
+        --slider-thumb-size: calc(20px * var(--jk-ui-scale, 1));
         --slider-track-radius: 999px;
-        --slider-thumb-radius: 4px;
+        --slider-thumb-radius: 5px 2px 2px 5px;
         --slider-track-color: transparent;
         --slider-fill-color: #58a6ff;
         --slider-thumb-color: #58a6ff;
@@ -332,6 +524,16 @@
       input[type="range"].jk-trim-range#jk-trim-end {
         --slider-thumb-color: #3fb950;
         --slider-fill-color: #3fb950;
+        --slider-thumb-radius: 2px 5px 5px 2px;
+      }
+      input[type="range"].jk-trim-range.jk-trim-offscreen {
+        opacity: 0;
+      }
+      input[type="range"].jk-trim-range.jk-trim-offscreen::-webkit-slider-thumb {
+        pointer-events: none;
+      }
+      input[type="range"].jk-trim-range.jk-trim-offscreen::-moz-range-thumb {
+        pointer-events: none;
       }
       input[type="range"].jk-trim-range::-webkit-slider-runnable-track {
         block-size: var(--slider-track-size);
@@ -343,13 +545,19 @@
         appearance: none;
         pointer-events: auto;
         cursor: ew-resize;
-        inline-size: calc(12px * var(--jk-ui-scale, 1));
-        block-size: calc(18px * var(--jk-ui-scale, 1));
-        margin-block-start: calc((var(--slider-track-size) - 18px * var(--jk-ui-scale, 1)) / 2);
+        inline-size: calc(11px * var(--jk-ui-scale, 1));
+        block-size: calc(20px * var(--jk-ui-scale, 1));
+        margin-block-start: calc((var(--slider-track-size) - 20px * var(--jk-ui-scale, 1)) / 2);
         border: 1.5px solid #f0f6fc;
         border-radius: var(--slider-thumb-radius);
         background: var(--slider-thumb-color);
-        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.65);
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.7);
+      }
+      input[type="range"].jk-trim-range#jk-trim-start::-webkit-slider-thumb {
+        transform: translateX(calc(-3px * var(--jk-ui-scale, 1)));
+      }
+      input[type="range"].jk-trim-range#jk-trim-end::-webkit-slider-thumb {
+        transform: translateX(calc(3px * var(--jk-ui-scale, 1)));
       }
       input[type="range"].jk-trim-range::-moz-range-track {
         block-size: var(--slider-track-size);
@@ -362,71 +570,128 @@
       input[type="range"].jk-trim-range::-moz-range-thumb {
         pointer-events: auto;
         cursor: ew-resize;
-        inline-size: calc(12px * var(--jk-ui-scale, 1));
-        block-size: calc(18px * var(--jk-ui-scale, 1));
+        inline-size: calc(11px * var(--jk-ui-scale, 1));
+        block-size: calc(20px * var(--jk-ui-scale, 1));
         border: 1.5px solid #f0f6fc;
         border-radius: var(--slider-thumb-radius);
         background: var(--slider-thumb-color);
-        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.65);
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.7);
       }
+      input[type="range"].jk-trim-range#jk-trim-start::-moz-range-thumb {
+        transform: translateX(calc(-3px * var(--jk-ui-scale, 1)));
+      }
+      input[type="range"].jk-trim-range#jk-trim-end::-moz-range-thumb {
+        transform: translateX(calc(3px * var(--jk-ui-scale, 1)));
+      }
+      input[type="range"].jk-trim-range:focus,
       input[type="range"].jk-trim-range:focus-visible {
-        outline: 2px solid var(--slider-fill-color);
-        outline-offset: 2px;
-        border-radius: 4px;
+        outline: none;
       }
+      input[type="range"].jk-trim-range:focus-visible::-webkit-slider-thumb {
+        outline: 2px solid #f0f6fc;
+        outline-offset: 2px;
+        box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.55);
+      }
+      input[type="range"].jk-trim-range:focus-visible::-moz-range-thumb {
+        outline: 2px solid #f0f6fc;
+        outline-offset: 2px;
+        box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.55);
+      }
+
+      /* Row 3: Start/End Fine-Step Boxes, Editable Timestamps & Actions */
       .jk-trim-row {
         display: flex;
         align-items: center;
         justify-content: space-between;
         flex-wrap: wrap;
-        gap: calc(5px * var(--jk-ui-scale, 1));
+        gap: calc(3px * var(--jk-ui-scale, 1));
       }
       .jk-trim-times {
         display: inline-flex;
         align-items: center;
         flex-wrap: wrap;
-        gap: calc(4px * var(--jk-ui-scale, 1));
-        font-size: calc(11px * var(--jk-ui-scale, 1));
+        gap: calc(3px * var(--jk-ui-scale, 1));
+        font-size: calc(10.5px * var(--jk-ui-scale, 1));
         font-variant-numeric: tabular-nums;
       }
       .jk-trim-edge-box {
         display: inline-flex;
         align-items: center;
-        gap: calc(2px * var(--jk-ui-scale, 1));
+        gap: calc(1.5px * var(--jk-ui-scale, 1));
         background: #161b22;
         border: 1px solid #30363d;
+        border-inline-start: 2.5px solid #58a6ff;
         border-radius: 4px;
-        padding: calc(1px * var(--jk-ui-scale, 1)) calc(4px * var(--jk-ui-scale, 1));
+        padding: calc(1px * var(--jk-ui-scale, 1)) calc(2.5px * var(--jk-ui-scale, 1));
       }
-      .jk-trim-dot {
-        inline-size: 6px;
-        block-size: 6px;
-        border-radius: 50%;
-        background: #58a6ff;
-        flex-shrink: 0;
+      .jk-trim-edge-box.jk-trim-edge-end {
+        border-inline-start-color: #3fb950;
       }
-      .jk-trim-dot-end {
-        background: #3fb950;
+      .jk-trim-edge-box:focus-within {
+        border-color: #58a6ff;
       }
-      .jk-trim-val {
+      .jk-trim-edge-box.jk-trim-edge-end:focus-within {
+        border-color: #3fb950;
+      }
+      .jk-trim-val-input {
+        -webkit-user-select: text;
+        user-select: text;
+        background: #0d1117;
         color: #f0f6fc;
+        border: 1px solid transparent;
+        border-radius: 3px;
+        font: inherit;
+        font-size: calc(10.5px * var(--jk-ui-scale, 1));
         font-weight: 600;
-        min-inline-size: calc(38px * var(--jk-ui-scale, 1));
+        font-variant-numeric: tabular-nums;
+        inline-size: calc(41px * var(--jk-ui-scale, 1));
+        min-block-size: calc(18px * var(--jk-ui-scale, 1));
+        padding: 0 calc(1px * var(--jk-ui-scale, 1));
         text-align: center;
+        box-sizing: border-box;
       }
-      .jk-trim-step-btn {
+      .jk-trim-val-input:hover {
+        border-color: #30363d;
+      }
+      .jk-trim-val-input:focus-visible {
+        outline: 2px solid #58a6ff;
+        outline-offset: 0;
+        background: #010409;
+      }
+      .jk-trim-val-input[aria-invalid="true"] {
+        border-color: #f85149;
+        outline-color: #f85149;
+      }
+      @media (pointer: coarse) {
+        .jk-trim-val-input {
+          font-size: 16px;
+          inline-size: 62px;
+        }
+      }
+      .jk-trim-step-btn,
+      .jk-trim-mark-btn {
         background: #21262d;
         color: #c9d1d9;
         border: 1px solid #30363d;
         border-radius: 3px;
-        min-inline-size: calc(18px * var(--jk-ui-scale, 1));
+        min-inline-size: calc(16px * var(--jk-ui-scale, 1));
         min-block-size: calc(18px * var(--jk-ui-scale, 1));
-        padding: 0 calc(3px * var(--jk-ui-scale, 1));
-        font-size: calc(10px * var(--jk-ui-scale, 1));
+        padding: 0 calc(2.5px * var(--jk-ui-scale, 1));
+        font-size: calc(9.5px * var(--jk-ui-scale, 1));
+        font-variant-numeric: tabular-nums;
         line-height: 1;
         cursor: pointer;
+        touch-action: manipulation;
       }
-      .jk-trim-step-btn:hover {
+      .jk-trim-mark-btn {
+        color: #79c0ff;
+        font-weight: 600;
+      }
+      .jk-trim-edge-end .jk-trim-mark-btn {
+        color: #7ee787;
+      }
+      .jk-trim-step-btn:hover,
+      .jk-trim-mark-btn:hover {
         background: #30363d;
         color: #ffffff;
       }
@@ -435,14 +700,14 @@
         color: #79c0ff;
         border: 1px solid rgba(88, 166, 255, 0.4);
         border-radius: 999px;
-        padding: calc(1px * var(--jk-ui-scale, 1)) calc(6px * var(--jk-ui-scale, 1));
-        font-size: calc(10.5px * var(--jk-ui-scale, 1));
+        padding: calc(1px * var(--jk-ui-scale, 1)) calc(5px * var(--jk-ui-scale, 1));
+        font-size: calc(10px * var(--jk-ui-scale, 1));
         font-weight: 600;
       }
       .jk-trim-actions {
         display: inline-flex;
         align-items: center;
-        gap: calc(4px * var(--jk-ui-scale, 1));
+        gap: calc(3px * var(--jk-ui-scale, 1));
         margin-inline-start: auto;
       }
       .jk-trim-btn {
@@ -450,9 +715,9 @@
         color: #c9d1d9;
         border: 1px solid #30363d;
         border-radius: 4px;
-        min-block-size: calc(22px * var(--jk-ui-scale, 1));
-        padding: calc(2px * var(--jk-ui-scale, 1)) calc(7px * var(--jk-ui-scale, 1));
-        font-size: calc(11px * var(--jk-ui-scale, 1));
+        min-block-size: calc(20px * var(--jk-ui-scale, 1));
+        padding: calc(1.5px * var(--jk-ui-scale, 1)) calc(5.5px * var(--jk-ui-scale, 1));
+        font-size: calc(10.5px * var(--jk-ui-scale, 1));
         font-weight: 500;
         cursor: pointer;
       }
@@ -474,11 +739,17 @@
       .jk-trim-btn-primary:hover {
         background: #2ea043;
       }
-      #jk-pip-card.jk-pip-xs .jk-trim-step-btn {
+      #jk-pip-card.jk-pip-xs .jk-trim-step-coarse {
         display: none;
       }
+      @container jk-card (max-width: 480px) {
+        .jk-trim-step-coarse {
+          display: none;
+        }
+      }
       @container jk-card (max-width: 340px) {
-        .jk-trim-step-btn {
+        .jk-trim-step-btn,
+        .jk-trim-fine-hint {
           display: none;
         }
       }
@@ -652,6 +923,8 @@
       .jk-exp-btn:focus-visible,
       .jk-trim-btn:focus-visible,
       .jk-trim-step-btn:focus-visible,
+      .jk-trim-mark-btn:focus-visible,
+      .jk-trim-zoom-btn:focus-visible,
       .jk-exp-icon-close:focus-visible {
         outline: 2px solid #58a6ff;
         outline-offset: 2px;
@@ -899,6 +1172,148 @@
     document.head.appendChild(style);
   }
 
+  function getMinViewSpanMs() {
+    const dur = Math.max(MIN_CLIP_MS, trimState.durationMs || MIN_VIEW_SPAN_MS);
+    return Math.min(MIN_VIEW_SPAN_MS, dur);
+  }
+
+  function setTrimViewport(nextStartMs, nextEndMs) {
+    const dur = Math.max(MIN_CLIP_MS, trimState.durationMs || 1000);
+    const minSpan = getMinViewSpanMs();
+    let span = Math.round(Number(nextEndMs) - Number(nextStartMs));
+    if (!Number.isFinite(span) || span <= 0) span = dur;
+    span = Math.max(minSpan, Math.min(dur, span));
+    let vStart = Math.round(Number(nextStartMs) || 0);
+    vStart = Math.max(0, Math.min(dur - span, vStart));
+    trimState.viewStartMs = vStart;
+    trimState.viewEndMs = vStart + span;
+    syncTrimBarUI();
+  }
+
+  function zoomTrimBy(factor, anchorFrac = 0.5) {
+    const dur = Math.max(MIN_CLIP_MS, trimState.durationMs || 1000);
+    const curSpan = Math.max(getMinViewSpanMs(), trimState.viewEndMs - trimState.viewStartMs || dur);
+    const frac = Math.max(0, Math.min(1, Number.isFinite(anchorFrac) ? anchorFrac : 0.5));
+    const anchorMs = trimState.viewStartMs + curSpan * frac;
+    const nextSpan = Math.max(getMinViewSpanMs(), Math.min(dur, Math.round(curSpan * factor)));
+    const nextStart = Math.round(anchorMs - nextSpan * frac);
+    setTrimViewport(nextStart, nextStart + nextSpan);
+  }
+
+  function fitTrimToSelection(toggleFull = false) {
+    const dur = Math.max(MIN_CLIP_MS, trimState.durationMs || 1000);
+    const clipSpan = Math.max(MIN_CLIP_MS, trimState.endMs - trimState.startMs);
+    const targetSpan = Math.max(getMinViewSpanMs(), Math.min(dur, Math.max(10000, Math.round(clipSpan * 3))));
+    const center = (trimState.startMs + trimState.endMs) * 0.5;
+    const fittedStart = Math.max(0, Math.min(dur - targetSpan, Math.round(center - targetSpan * 0.5)));
+    const curSpan = trimState.viewEndMs - trimState.viewStartMs;
+    if (
+      toggleFull &&
+      dur > targetSpan + 250 &&
+      Math.abs(curSpan - targetSpan) <= Math.max(500, targetSpan * 0.08) &&
+      Math.abs(trimState.viewStartMs - fittedStart) <= Math.max(500, targetSpan * 0.08)
+    ) {
+      setTrimViewport(0, dur);
+      return;
+    }
+    setTrimViewport(fittedStart, fittedStart + targetSpan);
+  }
+
+  function ensureMsVisibleInView(targetMs) {
+    const dur = Math.max(MIN_CLIP_MS, trimState.durationMs || 1000);
+    const span = Math.max(getMinViewSpanMs(), trimState.viewEndMs - trimState.viewStartMs || dur);
+    if (span >= dur) return;
+    const pad = Math.round(span * 0.08);
+    if (targetMs < trimState.viewStartMs) {
+      const nextStart = Math.max(0, Math.min(dur - span, Math.round(targetMs - pad)));
+      trimState.viewStartMs = nextStart;
+      trimState.viewEndMs = nextStart + span;
+    } else if (targetMs > trimState.viewEndMs) {
+      const nextEnd = Math.min(dur, Math.max(span, Math.round(targetMs + pad)));
+      trimState.viewEndMs = nextEnd;
+      trimState.viewStartMs = nextEnd - span;
+    }
+  }
+
+  function nudgeTrimHandle(which, deltaMs, seekMode = 'normal') {
+    if (!Number.isFinite(deltaMs) || deltaMs === 0) return;
+    const dur = Math.max(MIN_CLIP_MS, trimState.durationMs || 1000);
+    const minGap = Math.min(MIN_CLIP_MS, dur);
+    stopTrimPreview(true);
+    let nextTargetMs = 0;
+    if (which === 'start') {
+      trimState.activeHandle = 'start';
+      trimState.startMs = Math.max(0, Math.min(trimState.endMs - minGap, trimState.startMs + deltaMs));
+      ensureMsVisibleInView(trimState.startMs);
+      syncTrimBarUI();
+      nextTargetMs = trimState.startMs;
+    } else {
+      trimState.activeHandle = 'end';
+      trimState.endMs = Math.min(dur, Math.max(trimState.startMs + minGap, trimState.endMs + deltaMs));
+      ensureMsVisibleInView(trimState.endMs);
+      syncTrimBarUI();
+      nextTargetMs = trimState.endMs;
+    }
+    if (seekMode === 'skip') return;
+    if (seekMode === 'hold') {
+      throttledLiveSeek(nextTargetMs, 320, true);
+    } else {
+      throttledLiveSeek(nextTargetMs, 65, false);
+    }
+  }
+
+  function markTrimEdgeAtPlayhead(which) {
+    const player = getPlayer();
+    if (!player || typeof player.getCurrentTimeMs !== 'function') return;
+    const dur = Math.max(MIN_CLIP_MS, trimState.durationMs || 1000);
+    const minGap = Math.min(MIN_CLIP_MS, dur);
+    const cur = Math.max(0, Math.min(dur, Math.round(player.getCurrentTimeMs())));
+    stopTrimPreview(false);
+    if (which === 'start') {
+      trimState.activeHandle = 'start';
+      if (cur > trimState.endMs - minGap) {
+        trimState.endMs = Math.min(dur, cur + Math.max(minGap, 5000));
+      }
+      trimState.startMs = Math.max(0, Math.min(trimState.endMs - minGap, cur));
+      ensureMsVisibleInView(trimState.startMs);
+    } else {
+      trimState.activeHandle = 'end';
+      if (cur < trimState.startMs + minGap) {
+        trimState.startMs = Math.max(0, cur - Math.max(minGap, 5000));
+      }
+      trimState.endMs = Math.min(dur, Math.max(trimState.startMs + minGap, cur));
+      ensureMsVisibleInView(trimState.endMs);
+    }
+    syncTrimBarUI();
+  }
+
+  function stopEdgeAutoPan() {
+    if (trimState.edgePanRaf) {
+      cancelAnimationFrame(trimState.edgePanRaf);
+      trimState.edgePanRaf = 0;
+    }
+  }
+
+  function startTrimPlayheadTicker() {
+    if (trimState.playheadRaf) return;
+    const loop = () => {
+      if (!trimState.active) {
+        trimState.playheadRaf = 0;
+        return;
+      }
+      syncTrimPlayheadOnly();
+      trimState.playheadRaf = requestAnimationFrame(loop);
+    };
+    trimState.playheadRaf = requestAnimationFrame(loop);
+  }
+
+  function stopTrimPlayheadTicker() {
+    if (trimState.playheadRaf) {
+      cancelAnimationFrame(trimState.playheadRaf);
+      trimState.playheadRaf = 0;
+    }
+  }
+
   function ensureTrimBarDOM(hostMode) {
     injectStyles();
     let bar = document.getElementById('jk-trim-bar');
@@ -909,28 +1324,48 @@
       bar.setAttribute('aria-label', 'Clip start and end trim handles');
       bar.hidden = true;
       bar.innerHTML = `
-        <div class="jk-trim-track-wrap">
-          <div class="jk-trim-rail">
-            <div class="jk-trim-range-fill"></div>
+        <div class="jk-trim-overview-row">
+          <div id="jk-trim-overview" class="jk-trim-overview" title="Full demo overview — click or drag to pan zoomed region, double-click to toggle Fit / Full">
+            <div class="jk-trim-overview-sel"></div>
+            <div class="jk-trim-overview-cur"></div>
+            <div id="jk-trim-overview-win" class="jk-trim-overview-win"></div>
           </div>
-          <div class="jk-trim-playhead"></div>
-          <input type="range" id="jk-trim-start" class="jk-trim-range" min="0" max="1000" step="50" value="0" aria-label="Clip start time" />
-          <input type="range" id="jk-trim-end" class="jk-trim-range jk-trim-top" min="0" max="1000" step="50" value="1000" aria-label="Clip end time" />
+          <div class="jk-trim-zoom-bar" role="group" aria-label="Timeline zoom">
+            <button type="button" id="jk-trim-zoom-out" class="jk-trim-zoom-btn" title="Zoom out timeline (-)" aria-label="Zoom out timeline">\u2212</button>
+            <button type="button" id="jk-trim-zoom-fit" class="jk-trim-zoom-btn jk-trim-zoom-span-btn" title="Frame clip in scrubber / toggle Full view (F)" aria-label="Toggle fit clip or full timeline">45s</button>
+            <button type="button" id="jk-trim-zoom-in" class="jk-trim-zoom-btn" title="Zoom in timeline (+)" aria-label="Zoom in timeline">+</button>
+          </div>
+        </div>
+        <div id="jk-trim-track-wrap" class="jk-trim-track-wrap" title="Scroll wheel to zoom · Drag clip bar to slide window · Hold Shift for fine precision">
+          <div class="jk-trim-rail"></div>
+          <div id="jk-trim-range-fill" class="jk-trim-range-fill" title="Drag to slide clip window (keep duration) · Click to seek playhead"></div>
+          <div id="jk-trim-playhead" class="jk-trim-playhead"></div>
+          <input type="range" id="jk-trim-start" class="jk-trim-range" min="0" max="1000" step="10" value="0" aria-label="Clip start time" />
+          <input type="range" id="jk-trim-end" class="jk-trim-range jk-trim-top" min="0" max="1000" step="10" value="1000" aria-label="Clip end time" />
+        </div>
+        <div class="jk-trim-bounds-row" aria-hidden="true">
+          <span id="jk-trim-view-start">0:00.0</span>
+          <span class="jk-trim-fine-hint">Wheel: zoom \u00B7 Shift+drag: fine \u00B7 [ / ]: mark playhead</span>
+          <span id="jk-trim-view-end">0:00.0</span>
         </div>
         <div class="jk-trim-row">
           <div class="jk-trim-times">
-            <span class="jk-trim-edge-box" title="Clip Start">
-              <span class="jk-trim-dot" aria-hidden="true"></span>
-              <button type="button" class="jk-trim-step-btn" data-trim-step="start:-100" aria-label="Nudge start -0.1 seconds">-0.1</button>
-              <span id="jk-trim-start-text" class="jk-trim-val">0:00.0</span>
-              <button type="button" class="jk-trim-step-btn" data-trim-step="start:100" aria-label="Nudge start +0.1 seconds">+0.1</button>
+            <span class="jk-trim-edge-box" title="Clip Start — click time to type mm:ss.t, scroll or Up/Down to step">
+              <button type="button" class="jk-trim-mark-btn" data-trim-mark="start" title="Set Start to current playhead ( [ )" aria-label="Set clip start to current playhead">[\u21A6</button>
+              <button type="button" class="jk-trim-step-btn jk-trim-step-coarse" data-trim-step="start:-1000" title="Nudge Start -1.0s (hold to repeat)" aria-label="Nudge start -1 second">-1</button>
+              <button type="button" class="jk-trim-step-btn" data-trim-step="start:-100" title="Nudge Start -0.1s (hold to repeat)" aria-label="Nudge start -0.1 seconds">-.1</button>
+              <input type="text" id="jk-trim-start-text" class="jk-trim-val-input" value="0:00.0" aria-label="Clip start timestamp" autocorrect="off" autocapitalize="none" spellcheck="false" enterkeyhint="done" />
+              <button type="button" class="jk-trim-step-btn" data-trim-step="start:100" title="Nudge Start +0.1s (hold to repeat)" aria-label="Nudge start +0.1 seconds">+.1</button>
+              <button type="button" class="jk-trim-step-btn jk-trim-step-coarse" data-trim-step="start:1000" title="Nudge Start +1.0s (hold to repeat)" aria-label="Nudge start +1 second">+1</button>
             </span>
-            <span id="jk-trim-duration" class="jk-trim-dur-pill">5.0s</span>
-            <span class="jk-trim-edge-box" title="Clip End">
-              <span class="jk-trim-dot jk-trim-dot-end" aria-hidden="true"></span>
-              <button type="button" class="jk-trim-step-btn" data-trim-step="end:-100" aria-label="Nudge end -0.1 seconds">-0.1</button>
-              <span id="jk-trim-end-text" class="jk-trim-val">0:05.0</span>
-              <button type="button" class="jk-trim-step-btn" data-trim-step="end:100" aria-label="Nudge end +0.1 seconds">+0.1</button>
+            <span id="jk-trim-duration" class="jk-trim-dur-pill" title="Selected clip duration — click to frame clip in scrubber" style="cursor:pointer;">5.0s</span>
+            <span class="jk-trim-edge-box jk-trim-edge-end" title="Clip End — click time to type mm:ss.t, scroll or Up/Down to step">
+              <button type="button" class="jk-trim-step-btn jk-trim-step-coarse" data-trim-step="end:-1000" title="Nudge End -1.0s (hold to repeat)" aria-label="Nudge end -1 second">-1</button>
+              <button type="button" class="jk-trim-step-btn" data-trim-step="end:-100" title="Nudge End -0.1s (hold to repeat)" aria-label="Nudge end -0.1 seconds">-.1</button>
+              <input type="text" id="jk-trim-end-text" class="jk-trim-val-input" value="0:05.0" aria-label="Clip end timestamp" autocorrect="off" autocapitalize="none" spellcheck="false" enterkeyhint="done" />
+              <button type="button" class="jk-trim-step-btn" data-trim-step="end:100" title="Nudge End +0.1s (hold to repeat)" aria-label="Nudge end +0.1 seconds">+.1</button>
+              <button type="button" class="jk-trim-step-btn jk-trim-step-coarse" data-trim-step="end:1000" title="Nudge End +1.0s (hold to repeat)" aria-label="Nudge end +1 second">+1</button>
+              <button type="button" class="jk-trim-mark-btn" data-trim-mark="end" title="Set End to current playhead ( ] )" aria-label="Set clip end to current playhead">\u21A4]</button>
             </span>
           </div>
           <div class="jk-trim-actions">
@@ -943,81 +1378,734 @@
 
       const startInput = bar.querySelector('#jk-trim-start');
       const endInput = bar.querySelector('#jk-trim-end');
+      const overviewEl = bar.querySelector('#jk-trim-overview');
+      const trackWrap = bar.querySelector('#jk-trim-track-wrap');
+      const rangeFill = bar.querySelector('#jk-trim-range-fill');
+      const startTextInput = bar.querySelector('#jk-trim-start-text');
+      const endTextInput = bar.querySelector('#jk-trim-end-text');
 
-      const onStartInput = () => {
-        trimState.activeHandle = 'start';
-        let nextStart = Math.round(parseFloat(startInput.value) || 0);
-        const minGap = Math.min(MIN_CLIP_MS, trimState.durationMs);
-        if (nextStart > trimState.endMs - minGap) {
-          nextStart = Math.max(0, trimState.endMs - minGap);
+      let handleDrag = null;
+      let fillDrag = null;
+      let trackScrub = null;
+      let ovDrag = null;
+
+      const clearAccidentalSelection = () => {
+        const ae = document.activeElement;
+        if (ae === startTextInput || ae === endTextInput) {
+          try {
+            ae.blur();
+          } catch (_) {}
         }
-        trimState.startMs = nextStart;
+        try {
+          const sel = window.getSelection && window.getSelection();
+          if (sel && sel.rangeCount > 0) {
+            sel.removeAllRanges();
+          }
+        } catch (_) {}
+      };
+
+      bar.addEventListener('selectstart', (ev) => {
+        const t = ev.target;
+        if (t === startTextInput || t === endTextInput) return;
+        ev.preventDefault();
+      });
+      bar.addEventListener('mousedown', (ev) => {
+        const t = ev.target;
+        if (t === startTextInput || t === endTextInput) return;
+        if (ev.shiftKey) {
+          ev.preventDefault();
+          clearAccidentalSelection();
+        }
+      });
+
+      const isAnyScrubActive = () =>
+        Boolean(handleDrag || (fillDrag && fillDrag.slid) || trackScrub || ovDrag);
+
+      const syncFineActiveUI = () => {
+        bar.classList.toggle('jk-trim-fine-active', Boolean(trimState.shiftDown && isAnyScrubActive()));
+      };
+
+      const maybeStartEdgeAutoPan = () => {
+        if (!handleDrag || !trimState.draggingHandle) {
+          stopEdgeAutoPan();
+          return;
+        }
+        if (trimState.edgePanRaf) return;
+        let lastTs = performance.now();
+        const stepEdge = (now) => {
+          if (!trimState.active || !handleDrag || !trimState.draggingHandle) {
+            trimState.edgePanRaf = 0;
+            return;
+          }
+          const dur = Math.max(MIN_CLIP_MS, trimState.durationMs || 1000);
+          const span = trimState.viewEndMs - trimState.viewStartMs;
+          if (span <= 0 || span >= dur) {
+            trimState.edgePanRaf = 0;
+            return;
+          }
+          const rect = trackWrap.getBoundingClientRect();
+          const dt = Math.min(0.08, Math.max(0.004, (now - lastTs) / 1000));
+          lastTs = now;
+          const curVal =
+            trimState.draggingHandle === 'start' ? trimState.startMs : trimState.endMs;
+          const edgeZone = span * 0.035;
+          const gear = trimState.shiftDown ? FINE_DRAG_FACTOR : 1.0;
+          let panDelta = 0;
+          if (
+            curVal <= trimState.viewStartMs + edgeZone &&
+            trimState.viewStartMs > 0 &&
+            handleDrag.lastX <= rect.left + 28
+          ) {
+            panDelta = -Math.max(2, Math.round(span * 0.35 * gear * dt));
+          } else if (
+            curVal >= trimState.viewEndMs - edgeZone &&
+            trimState.viewEndMs < dur &&
+            handleDrag.lastX >= rect.right - 28
+          ) {
+            panDelta = Math.max(2, Math.round(span * 0.35 * gear * dt));
+          }
+          if (panDelta === 0) {
+            trimState.edgePanRaf = 0;
+            return;
+          }
+          const nextVStart = Math.max(0, Math.min(dur - span, trimState.viewStartMs + panDelta));
+          const actualDelta = nextVStart - trimState.viewStartMs;
+          if (actualDelta !== 0) {
+            trimState.viewStartMs = nextVStart;
+            trimState.viewEndMs = nextVStart + span;
+            const minGap = Math.min(MIN_CLIP_MS, dur);
+            if (trimState.draggingHandle === 'start') {
+              handleDrag.accumMs = Math.max(
+                0,
+                Math.min(trimState.endMs - minGap, handleDrag.accumMs + actualDelta)
+              );
+              trimState.startMs = Math.round(handleDrag.accumMs);
+              throttledLiveSeek(trimState.startMs);
+            } else {
+              handleDrag.accumMs = Math.min(
+                dur,
+                Math.max(trimState.startMs + minGap, handleDrag.accumMs + actualDelta)
+              );
+              trimState.endMs = Math.round(handleDrag.accumMs);
+              throttledLiveSeek(trimState.endMs);
+            }
+            syncTrimBarUI();
+          }
+          trimState.edgePanRaf = requestAnimationFrame(stepEdge);
+        };
+        trimState.edgePanRaf = requestAnimationFrame(stepEdge);
+      };
+
+      const onAssistiveRangeInput = (which, inputEl) => {
+        if (handleDrag || trimState.draggingHandle) {
+          syncTrimBarUI();
+          return;
+        }
+        if (inputEl.classList.contains('jk-trim-offscreen')) return;
+        const rawMs = parseFloat(inputEl.value) || 0;
+        const dur = Math.max(MIN_CLIP_MS, trimState.durationMs || 1000);
+        const minGap = Math.min(MIN_CLIP_MS, dur);
         stopTrimPreview(true);
+        if (which === 'start') {
+          trimState.activeHandle = 'start';
+          trimState.startMs = Math.max(0, Math.min(trimState.endMs - minGap, Math.round(rawMs)));
+          syncTrimBarUI();
+          throttledLiveSeek(trimState.startMs);
+        } else {
+          trimState.activeHandle = 'end';
+          trimState.endMs = Math.min(dur, Math.max(trimState.startMs + minGap, Math.round(rawMs)));
+          syncTrimBarUI();
+          throttledLiveSeek(trimState.endMs);
+        }
+      };
+
+      const startHandlePointerDrag = (which, ev) => {
+        if (ev.button !== 0 && ev.pointerType === 'mouse') return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        clearAccidentalSelection();
+        trimState.activeHandle = which;
+        trimState.draggingHandle = which;
+        trimState.shiftDown = Boolean(ev.shiftKey);
+        handleDrag = {
+          which,
+          pointerId: ev.pointerId,
+          lastX: ev.clientX,
+          accumMs: which === 'start' ? trimState.startMs : trimState.endMs,
+        };
+        syncFineActiveUI();
+        syncTrimHandleStacking();
+        try {
+          trackWrap.setPointerCapture(ev.pointerId);
+        } catch (_) {}
+      };
+
+      const onHandlePointerMove = (ev) => {
+        if (!handleDrag || ev.pointerId !== handleDrag.pointerId) return;
+        const stepDx = ev.clientX - handleDrag.lastX;
+        handleDrag.lastX = ev.clientX;
+        trimState.shiftDown = Boolean(ev.shiftKey);
+        syncFineActiveUI();
+        if (stepDx === 0) {
+          maybeStartEdgeAutoPan();
+          return;
+        }
+        const rect = trackWrap.getBoundingClientRect();
+        const usable = Math.max(1, rect.width - 11);
+        const span = Math.max(1, trimState.viewEndMs - trimState.viewStartMs);
+        const gear = trimState.shiftDown ? FINE_DRAG_FACTOR : 1.0;
+        const deltaMs = (stepDx / usable) * span * gear;
+        const dur = Math.max(MIN_CLIP_MS, trimState.durationMs || 1000);
+        const minGap = Math.min(MIN_CLIP_MS, dur);
+        stopTrimPreview(true);
+        if (handleDrag.which === 'start') {
+          const maxStart = trimState.endMs - minGap;
+          handleDrag.accumMs = Math.max(0, Math.min(maxStart, handleDrag.accumMs + deltaMs));
+          trimState.startMs = Math.round(handleDrag.accumMs);
+          syncTrimBarUI();
+          throttledLiveSeek(trimState.startMs);
+        } else {
+          const minEnd = trimState.startMs + minGap;
+          handleDrag.accumMs = Math.max(minEnd, Math.min(dur, handleDrag.accumMs + deltaMs));
+          trimState.endMs = Math.round(handleDrag.accumMs);
+          syncTrimBarUI();
+          throttledLiveSeek(trimState.endMs);
+        }
+        maybeStartEdgeAutoPan();
+      };
+
+      const endHandlePointerDrag = (ev) => {
+        if (!handleDrag || (ev && ev.pointerId !== undefined && ev.pointerId !== handleDrag.pointerId)) {
+          return;
+        }
+        const pid = handleDrag.pointerId;
+        handleDrag = null;
+        trimState.draggingHandle = null;
+        trimState.fineOriginRawMs = null;
+        trimState.fineOriginValMs = null;
+        stopEdgeAutoPan();
+        syncFineActiveUI();
+        try {
+          trackWrap.releasePointerCapture(pid);
+        } catch (_) {}
+      };
+
+      const bindRangeHandleEvents = (inputEl, which) => {
+        inputEl.addEventListener('pointerdown', (ev) => startHandlePointerDrag(which, ev));
+        inputEl.addEventListener('focus', () => {
+          trimState.activeHandle = which;
+          const curVal = which === 'start' ? trimState.startMs : trimState.endMs;
+          ensureMsVisibleInView(curVal);
+          syncTrimBarUI();
+        });
+        inputEl.addEventListener('keydown', (ev) => {
+          if (ev.key === 'ArrowLeft' || ev.key === 'ArrowDown') {
+            ev.preventDefault();
+            nudgeTrimHandle(which, ev.shiftKey ? -COARSE_STEP_MS : -FINE_STEP_MS);
+          } else if (ev.key === 'ArrowRight' || ev.key === 'ArrowUp') {
+            ev.preventDefault();
+            nudgeTrimHandle(which, ev.shiftKey ? COARSE_STEP_MS : FINE_STEP_MS);
+          } else if (ev.key === 'PageDown') {
+            ev.preventDefault();
+            nudgeTrimHandle(which, -5000);
+          } else if (ev.key === 'PageUp') {
+            ev.preventDefault();
+            nudgeTrimHandle(which, 5000);
+          }
+        });
+      };
+
+      bindRangeHandleEvents(startInput, 'start');
+      bindRangeHandleEvents(endInput, 'end');
+      startInput.addEventListener('input', () => onAssistiveRangeInput('start', startInput));
+      startInput.addEventListener('change', () => onAssistiveRangeInput('start', startInput));
+      endInput.addEventListener('input', () => onAssistiveRangeInput('end', endInput));
+      endInput.addEventListener('change', () => onAssistiveRangeInput('end', endInput));
+      window.addEventListener('pointermove', onHandlePointerMove);
+      window.addEventListener('pointerup', endHandlePointerDrag);
+      window.addEventListener('pointercancel', endHandlePointerDrag);
+
+      const syncShiftGearMidDrag = (isDown) => {
+        if (!trimState.active || trimState.shiftDown === isDown) return;
+        trimState.shiftDown = isDown;
+        syncFineActiveUI();
+      };
+      window.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Shift') syncShiftGearMidDrag(true);
+      });
+      window.addEventListener('keyup', (ev) => {
+        if (ev.key === 'Shift') syncShiftGearMidDrag(false);
+      });
+
+      // Zoom buttons + Duration pill Fit shortcut
+      bar.querySelector('#jk-trim-zoom-in').addEventListener('click', () => {
+        const center = (trimState.startMs + trimState.endMs) * 0.5;
+        const span = Math.max(1, trimState.viewEndMs - trimState.viewStartMs);
+        const anchorFrac =
+          center >= trimState.viewStartMs && center <= trimState.viewEndMs
+            ? (center - trimState.viewStartMs) / span
+            : 0.5;
+        zoomTrimBy(0.5, anchorFrac);
+      });
+      bar.querySelector('#jk-trim-zoom-out').addEventListener('click', () => {
+        const center = (trimState.startMs + trimState.endMs) * 0.5;
+        const span = Math.max(1, trimState.viewEndMs - trimState.viewStartMs);
+        const anchorFrac =
+          center >= trimState.viewStartMs && center <= trimState.viewEndMs
+            ? (center - trimState.viewStartMs) / span
+            : 0.5;
+        zoomTrimBy(2.0, anchorFrac);
+      });
+      bar.querySelector('#jk-trim-zoom-fit').addEventListener('click', () => {
+        fitTrimToSelection(true);
+      });
+      bar.querySelector('#jk-trim-duration').addEventListener('click', () => {
+        fitTrimToSelection(false);
+      });
+
+      // Wheel zoom & pan on both main track and overview minimap
+      const onTimelineWheel = (ev, isOverview) => {
+        if (!trimState.active) return;
+        ev.preventDefault();
+        const rect = (isOverview ? overviewEl : trackWrap).getBoundingClientRect();
+        const relX = rect.width > 0 ? Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width)) : 0.5;
+        const dur = Math.max(MIN_CLIP_MS, trimState.durationMs || 1000);
+        const span = Math.max(getMinViewSpanMs(), trimState.viewEndMs - trimState.viewStartMs || dur);
+
+        if (Math.abs(ev.deltaX) > Math.abs(ev.deltaY) || ev.altKey) {
+          const rawDelta = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+          const panMs = Math.round((rawDelta / Math.max(120, rect.width)) * span);
+          setTrimViewport(trimState.viewStartMs + panMs, trimState.viewEndMs + panMs);
+          return;
+        }
+
+        if (ev.deltaY === 0) return;
+        const factor = ev.deltaY < 0 ? 0.78 : 1.28;
+        if (isOverview) {
+          const targetMs = relX * dur;
+          const nextSpan = Math.max(getMinViewSpanMs(), Math.min(dur, Math.round(span * factor)));
+          const nextStart = Math.round(targetMs - nextSpan * 0.5);
+          setTrimViewport(nextStart, nextStart + nextSpan);
+        } else {
+          zoomTrimBy(factor, relX);
+        }
+      };
+      trackWrap.addEventListener('wheel', (ev) => onTimelineWheel(ev, false), { passive: false });
+      overviewEl.addEventListener('wheel', (ev) => onTimelineWheel(ev, true), { passive: false });
+
+      // Overview minimap click & drag to pan zoomed viewport across full demo
+      overviewEl.addEventListener('pointerdown', (ev) => {
+        if (ev.button !== 0 && ev.pointerType === 'mouse') return;
+        ev.preventDefault();
+        clearAccidentalSelection();
+        const rect = overviewEl.getBoundingClientRect();
+        if (rect.width <= 0) return;
+        const dur = Math.max(MIN_CLIP_MS, trimState.durationMs || 1000);
+        const span = Math.max(getMinViewSpanMs(), trimState.viewEndMs - trimState.viewStartMs || dur);
+        const clickMs = Math.max(0, Math.min(dur, ((ev.clientX - rect.left) / rect.width) * dur));
+        const inWin = clickMs >= trimState.viewStartMs && clickMs <= trimState.viewEndMs;
+        if (!inWin) {
+          const centeredStart = Math.round(clickMs - span * 0.5);
+          setTrimViewport(centeredStart, centeredStart + span);
+        }
+        trimState.shiftDown = Boolean(ev.shiftKey);
+        ovDrag = {
+          pointerId: ev.pointerId,
+          lastX: ev.clientX,
+          accumViewStartMs: trimState.viewStartMs,
+        };
+        overviewEl.classList.add('jk-trim-panning');
+        syncFineActiveUI();
+        try {
+          overviewEl.setPointerCapture(ev.pointerId);
+        } catch (_) {}
+      });
+      overviewEl.addEventListener('pointermove', (ev) => {
+        if (!ovDrag || ev.pointerId !== ovDrag.pointerId) return;
+        const rect = overviewEl.getBoundingClientRect();
+        if (rect.width <= 0) return;
+        const stepDx = ev.clientX - ovDrag.lastX;
+        ovDrag.lastX = ev.clientX;
+        trimState.shiftDown = Boolean(ev.shiftKey);
+        syncFineActiveUI();
+        if (stepDx === 0) return;
+        const dur = Math.max(MIN_CLIP_MS, trimState.durationMs || 1000);
+        const span = Math.max(getMinViewSpanMs(), trimState.viewEndMs - trimState.viewStartMs || dur);
+        const gear = trimState.shiftDown ? FINE_DRAG_FACTOR : 1.0;
+        ovDrag.accumViewStartMs = Math.max(
+          0,
+          Math.min(dur - span, ovDrag.accumViewStartMs + (stepDx / rect.width) * dur * gear)
+        );
+        const nextStart = Math.round(ovDrag.accumViewStartMs);
+        setTrimViewport(nextStart, nextStart + span);
+      });
+      const endOvDrag = (ev) => {
+        if (!ovDrag || (ev && ev.pointerId !== ovDrag.pointerId)) return;
+        try {
+          overviewEl.releasePointerCapture(ovDrag.pointerId);
+        } catch (_) {}
+        overviewEl.classList.remove('jk-trim-panning');
+        ovDrag = null;
+        syncFineActiveUI();
+      };
+      overviewEl.addEventListener('pointerup', endOvDrag);
+      overviewEl.addEventListener('pointercancel', endOvDrag);
+      overviewEl.addEventListener('dblclick', () => {
+        fitTrimToSelection(true);
+      });
+
+      // Drag highlighted clip fill to slide [startMs, endMs] at fixed duration; click (<4px) scrubs playhead
+      const clientXToViewMs = (clientX) => {
+        const rect = trackWrap.getBoundingClientRect();
+        const pad = 5;
+        const usable = Math.max(1, rect.width - pad * 2);
+        const frac = Math.max(0, Math.min(1, (clientX - (rect.left + pad)) / usable));
+        const span = Math.max(1, trimState.viewEndMs - trimState.viewStartMs);
+        return Math.round(trimState.viewStartMs + frac * span);
+      };
+
+      rangeFill.addEventListener('pointerdown', (ev) => {
+        if (ev.button !== 0 && ev.pointerType === 'mouse') return;
+        ev.stopPropagation();
+        ev.preventDefault();
+        clearAccidentalSelection();
+        trimState.shiftDown = Boolean(ev.shiftKey);
+        fillDrag = {
+          pointerId: ev.pointerId,
+          startX: ev.clientX,
+          lastX: ev.clientX,
+          origStartMs: trimState.startMs,
+          clipLen: Math.max(MIN_CLIP_MS, trimState.endMs - trimState.startMs),
+          accumMs: 0,
+          slid: false,
+        };
+        try {
+          rangeFill.setPointerCapture(ev.pointerId);
+        } catch (_) {}
+      });
+      rangeFill.addEventListener('pointermove', (ev) => {
+        if (!fillDrag || ev.pointerId !== fillDrag.pointerId) return;
+        const totalDx = ev.clientX - fillDrag.startX;
+        if (!fillDrag.slid && Math.abs(totalDx) < 4) return;
+        if (!fillDrag.slid) {
+          fillDrag.slid = true;
+          rangeFill.classList.add('jk-trim-sliding');
+          stopTrimPreview(true);
+        }
+        const rect = trackWrap.getBoundingClientRect();
+        const usable = Math.max(1, rect.width - 10);
+        const span = Math.max(1, trimState.viewEndMs - trimState.viewStartMs);
+        const stepDx = ev.clientX - fillDrag.lastX;
+        fillDrag.lastX = ev.clientX;
+        trimState.shiftDown = Boolean(ev.shiftKey);
+        syncFineActiveUI();
+        const gear = trimState.shiftDown ? FINE_DRAG_FACTOR : 1.0;
+        const dur = Math.max(MIN_CLIP_MS, trimState.durationMs || 1000);
+        const minAccum = -fillDrag.origStartMs;
+        const maxAccum = dur - fillDrag.clipLen - fillDrag.origStartMs;
+        fillDrag.accumMs = Math.max(
+          minAccum,
+          Math.min(maxAccum, fillDrag.accumMs + (stepDx / usable) * span * gear)
+        );
+        const nextStart = Math.max(
+          0,
+          Math.min(dur - fillDrag.clipLen, Math.round(fillDrag.origStartMs + fillDrag.accumMs))
+        );
+        trimState.startMs = nextStart;
+        trimState.endMs = nextStart + fillDrag.clipLen;
         syncTrimBarUI();
         throttledLiveSeek(trimState.startMs);
-      };
-
-      const onEndInput = () => {
-        trimState.activeHandle = 'end';
-        let nextEnd = Math.round(parseFloat(endInput.value) || 0);
-        const minGap = Math.min(MIN_CLIP_MS, trimState.durationMs);
-        if (nextEnd < trimState.startMs + minGap) {
-          nextEnd = Math.min(trimState.durationMs, trimState.startMs + minGap);
+      });
+      const endFillDrag = (ev) => {
+        if (!fillDrag || (ev && ev.pointerId !== fillDrag.pointerId)) return;
+        const wasSlide = fillDrag.slid;
+        const upX = ev ? ev.clientX : fillDrag.startX;
+        try {
+          rangeFill.releasePointerCapture(fillDrag.pointerId);
+        } catch (_) {}
+        rangeFill.classList.remove('jk-trim-sliding');
+        fillDrag = null;
+        syncFineActiveUI();
+        if (!wasSlide) {
+          stopTrimPreview(false);
+          throttledLiveSeek(clientXToViewMs(upX));
         }
-        trimState.endMs = nextEnd;
-        stopTrimPreview(true);
-        syncTrimBarUI();
-        throttledLiveSeek(trimState.endMs);
+      };
+      rangeFill.addEventListener('pointerup', endFillDrag);
+      rangeFill.addEventListener('pointercancel', endFillDrag);
+
+      const findNearbyHandleAtClientX = (clientX, maxDistPx) => {
+        const rect = trackWrap.getBoundingClientRect();
+        const pad = 5;
+        const usable = Math.max(1, rect.width - pad * 2);
+        const span = Math.max(1, trimState.viewEndMs - trimState.viewStartMs);
+        let best = null;
+        let bestDist = maxDistPx;
+        if (!startInput.classList.contains('jk-trim-offscreen')) {
+          const sx =
+            rect.left + pad + ((trimState.startMs - trimState.viewStartMs) / span) * usable - 3;
+          const ds = Math.abs(clientX - sx);
+          if (ds <= bestDist) {
+            bestDist = ds;
+            best = 'start';
+          }
+        }
+        if (!endInput.classList.contains('jk-trim-offscreen')) {
+          const ex =
+            rect.left + pad + ((trimState.endMs - trimState.viewStartMs) / span) * usable + 3;
+          const de = Math.abs(clientX - ex);
+          if (de <= bestDist) {
+            bestDist = de;
+            best = 'end';
+          }
+        }
+        return best;
       };
 
-      startInput.addEventListener('pointerdown', () => {
-        trimState.activeHandle = 'start';
-        syncTrimHandleStacking();
+      // Click/drag empty track area to scrub playhead directly within zoomed window (supports Shift fine gear)
+      trackWrap.addEventListener('pointerdown', (ev) => {
+        if (handleDrag || ev.target === startInput || ev.target === endInput || ev.target === rangeFill) {
+          return;
+        }
+        if (ev.button !== 0 && ev.pointerType === 'mouse') return;
+        const nearHandle = findNearbyHandleAtClientX(ev.clientX, 10);
+        if (nearHandle) {
+          startHandlePointerDrag(nearHandle, ev);
+          return;
+        }
+        ev.preventDefault();
+        clearAccidentalSelection();
+        const initMs = clientXToViewMs(ev.clientX);
+        trimState.shiftDown = Boolean(ev.shiftKey);
+        trackScrub = {
+          pointerId: ev.pointerId,
+          lastX: ev.clientX,
+          accumMs: initMs,
+        };
+        syncFineActiveUI();
+        stopTrimPreview(false);
+        throttledLiveSeek(initMs);
+        try {
+          trackWrap.setPointerCapture(ev.pointerId);
+        } catch (_) {}
       });
-      endInput.addEventListener('pointerdown', () => {
-        trimState.activeHandle = 'end';
-        syncTrimHandleStacking();
+      trackWrap.addEventListener('pointermove', (ev) => {
+        if (!trackScrub || ev.pointerId !== trackScrub.pointerId) return;
+        const stepDx = ev.clientX - trackScrub.lastX;
+        trackScrub.lastX = ev.clientX;
+        trimState.shiftDown = Boolean(ev.shiftKey);
+        syncFineActiveUI();
+        if (stepDx === 0) return;
+        const rect = trackWrap.getBoundingClientRect();
+        const usable = Math.max(1, rect.width - 10);
+        const span = Math.max(1, trimState.viewEndMs - trimState.viewStartMs);
+        const gear = trimState.shiftDown ? FINE_DRAG_FACTOR : 1.0;
+        const dur = Math.max(MIN_CLIP_MS, trimState.durationMs || 1000);
+        trackScrub.accumMs = Math.max(
+          0,
+          Math.min(dur, trackScrub.accumMs + (stepDx / usable) * span * gear)
+        );
+        throttledLiveSeek(Math.round(trackScrub.accumMs));
       });
-      startInput.addEventListener('focus', () => {
-        trimState.activeHandle = 'start';
-        syncTrimHandleStacking();
-      });
-      endInput.addEventListener('focus', () => {
-        trimState.activeHandle = 'end';
-        syncTrimHandleStacking();
-      });
-      startInput.addEventListener('input', onStartInput);
-      startInput.addEventListener('change', onStartInput);
-      endInput.addEventListener('input', onEndInput);
-      endInput.addEventListener('change', onEndInput);
+      const endTrackScrub = (ev) => {
+        if (!trackScrub || (ev && ev.pointerId !== trackScrub.pointerId)) return;
+        try {
+          trackWrap.releasePointerCapture(trackScrub.pointerId);
+        } catch (_) {}
+        trackScrub = null;
+        syncFineActiveUI();
+      };
+      trackWrap.addEventListener('pointerup', endTrackScrub);
+      trackWrap.addEventListener('pointercancel', endTrackScrub);
 
+      // Press-and-hold auto-repeat + Shift multiplier on step buttons
       bar.querySelectorAll('[data-trim-step]').forEach((btn) => {
+        const spec = (btn.getAttribute('data-trim-step') || '').split(':');
+        const which = spec[0];
+        const baseDelta = parseInt(spec[1] || '0', 10);
+        if (!Number.isFinite(baseDelta) || baseDelta === 0) return;
+
+        let holdDelayTimer = 0;
+        let holdInterval = 0;
+        let holdStartedAt = 0;
+        let lastRepeatTickAt = 0;
+        let activeMult = 1;
+        let activePointerId = null;
+        let handledByPointer = false;
+
+        const clearHold = (flushSeek = false) => {
+          const wasActive = holdDelayTimer !== 0 || holdInterval !== 0 || activePointerId != null;
+          if (flushSeek && holdInterval !== 0 && lastRepeatTickAt > 0) {
+            const now = Date.now();
+            const remDt = now - lastRepeatTickAt;
+            if (remDt >= 50) {
+              const elapsed = now - holdStartedAt;
+              const accel = elapsed > 1800 ? 4 : elapsed > 900 ? 2 : 1;
+              const ticks = Math.max(1, Math.min(12, Math.floor(remDt / 55)));
+              nudgeTrimHandle(which, baseDelta * activeMult * accel * ticks, 'skip');
+            }
+          }
+          if (holdDelayTimer) {
+            clearTimeout(holdDelayTimer);
+            holdDelayTimer = 0;
+          }
+          if (holdInterval) {
+            clearInterval(holdInterval);
+            holdInterval = 0;
+          }
+          lastRepeatTickAt = 0;
+          if (activePointerId != null) {
+            try {
+              btn.releasePointerCapture(activePointerId);
+            } catch (_) {}
+            activePointerId = null;
+          }
+          if (flushSeek && wasActive) {
+            throttledLiveSeek(which === 'start' ? trimState.startMs : trimState.endMs, 0);
+          }
+        };
+
+        btn.addEventListener('pointerdown', (ev) => {
+          if (ev.button !== 0 && ev.pointerType === 'mouse') return;
+          ev.preventDefault();
+          handledByPointer = true;
+          clearHold(false);
+          activePointerId = ev.pointerId;
+          try {
+            btn.setPointerCapture(ev.pointerId);
+          } catch (_) {}
+          activeMult = ev.shiftKey ? 5 : 1;
+          holdStartedAt = Date.now();
+          holdDelayTimer = setTimeout(() => {
+            holdDelayTimer = 0;
+            const now0 = Date.now();
+            const initLateTicks = Math.max(1, Math.min(8, 1 + Math.floor(Math.max(0, now0 - holdStartedAt - 200) / 55)));
+            lastRepeatTickAt = now0;
+            nudgeTrimHandle(which, baseDelta * activeMult * initLateTicks, 'hold');
+            holdInterval = setInterval(() => {
+              const now = Date.now();
+              const dt = Math.max(1, now - lastRepeatTickAt);
+              lastRepeatTickAt = now;
+              const elapsed = now - holdStartedAt;
+              const accel = elapsed > 1800 ? 4 : elapsed > 900 ? 2 : 1;
+              const ticks = Math.max(1, Math.min(12, Math.round(dt / 55)));
+              nudgeTrimHandle(which, baseDelta * activeMult * accel * ticks, 'hold');
+            }, 55);
+          }, 200);
+          nudgeTrimHandle(which, baseDelta * activeMult, 'skip');
+        });
+        btn.addEventListener('pointerup', () => clearHold(true));
+        btn.addEventListener('pointercancel', () => clearHold(true));
+        btn.addEventListener('lostpointercapture', () => clearHold(true));
+        btn.addEventListener('blur', () => clearHold(true));
+        btn.addEventListener('click', (ev) => {
+          if (handledByPointer) {
+            handledByPointer = false;
+            return;
+          }
+          nudgeTrimHandle(which, baseDelta * (ev.shiftKey ? 5 : 1), 'normal');
+        });
+      });
+
+      // Mark Start / Mark End at current playhead
+      bar.querySelectorAll('[data-trim-mark]').forEach((btn) => {
         btn.addEventListener('click', () => {
-          const spec = (btn.getAttribute('data-trim-step') || '').split(':');
-          const which = spec[0];
-          const delta = parseInt(spec[1] || '0', 10);
-          if (!Number.isFinite(delta)) return;
-          const minGap = Math.min(MIN_CLIP_MS, trimState.durationMs);
-          stopTrimPreview(true);
-          if (which === 'start') {
-            trimState.activeHandle = 'start';
-            trimState.startMs = Math.max(
-              0,
-              Math.min(trimState.endMs - minGap, trimState.startMs + delta)
-            );
-            syncTrimBarUI();
-            throttledLiveSeek(trimState.startMs);
-          } else {
-            trimState.activeHandle = 'end';
-            trimState.endMs = Math.min(
-              trimState.durationMs,
-              Math.max(trimState.startMs + minGap, trimState.endMs + delta)
-            );
-            syncTrimBarUI();
-            throttledLiveSeek(trimState.endMs);
+          const which = btn.getAttribute('data-trim-mark');
+          if (which === 'start' || which === 'end') {
+            markTrimEdgeAtPlayhead(which);
           }
         });
       });
+
+      // Editable timestamp inputs (validate on blur / Enter per modern-web-guidance forms)
+      const bindTimestampInput = (inputEl, which) => {
+        if (!inputEl) return;
+        const commitValue = () => {
+          const dur = Math.max(MIN_CLIP_MS, trimState.durationMs || 1000);
+          const minGap = Math.min(MIN_CLIP_MS, dur);
+          const curVal = which === 'start' ? trimState.startMs : trimState.endMs;
+          const parsed = parseFlexibleTimestamp(inputEl.value, curVal, dur);
+          if (parsed == null) {
+            inputEl.setAttribute('aria-invalid', 'true');
+            return false;
+          }
+          inputEl.removeAttribute('aria-invalid');
+          stopTrimPreview(true);
+          if (which === 'start') {
+            trimState.activeHandle = 'start';
+            if (parsed > trimState.endMs - minGap) {
+              trimState.endMs = Math.min(dur, parsed + Math.max(minGap, 5000));
+            }
+            trimState.startMs = Math.max(0, Math.min(trimState.endMs - minGap, parsed));
+            ensureMsVisibleInView(trimState.startMs);
+            syncTrimBarUI(true);
+            throttledLiveSeek(trimState.startMs);
+          } else {
+            trimState.activeHandle = 'end';
+            if (parsed < trimState.startMs + minGap) {
+              trimState.startMs = Math.max(0, parsed - Math.max(minGap, 5000));
+            }
+            trimState.endMs = Math.min(dur, Math.max(trimState.startMs + minGap, parsed));
+            ensureMsVisibleInView(trimState.endMs);
+            syncTrimBarUI(true);
+            throttledLiveSeek(trimState.endMs);
+          }
+          return true;
+        };
+
+        inputEl.addEventListener('focus', () => {
+          trimState.activeHandle = which;
+          try {
+            inputEl.select();
+          } catch (_) {}
+        });
+        inputEl.addEventListener('input', () => {
+          inputEl.removeAttribute('aria-invalid');
+        });
+        inputEl.addEventListener('blur', () => {
+          if (!commitValue()) {
+            const fallbackMs = which === 'start' ? trimState.startMs : trimState.endMs;
+            inputEl.value = formatTimePrecise(fallbackMs);
+            inputEl.removeAttribute('aria-invalid');
+          }
+        });
+        inputEl.addEventListener('keydown', (ev) => {
+          if (ev.isComposing) return;
+          if (ev.key === 'Enter') {
+            ev.preventDefault();
+            if (commitValue()) {
+              inputEl.blur();
+            }
+          } else if (ev.key === 'Escape') {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const fallbackMs = which === 'start' ? trimState.startMs : trimState.endMs;
+            inputEl.value = formatTimePrecise(fallbackMs);
+            inputEl.removeAttribute('aria-invalid');
+            inputEl.blur();
+          } else if (ev.key === 'ArrowUp' || ev.key === 'ArrowDown') {
+            ev.preventDefault();
+            const step = (ev.shiftKey ? COARSE_STEP_MS : FINE_STEP_MS) * (ev.key === 'ArrowUp' ? 1 : -1);
+            nudgeTrimHandle(which, step);
+            inputEl.value = formatTimePrecise(which === 'start' ? trimState.startMs : trimState.endMs);
+          }
+        });
+        inputEl.addEventListener(
+          'wheel',
+          (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const step = (ev.shiftKey ? COARSE_STEP_MS : FINE_STEP_MS) * (ev.deltaY < 0 ? 1 : -1);
+            nudgeTrimHandle(which, step);
+            if (document.activeElement === inputEl) {
+              inputEl.value = formatTimePrecise(which === 'start' ? trimState.startMs : trimState.endMs);
+            }
+          },
+          { passive: false }
+        );
+      };
+      bindTimestampInput(startTextInput, 'start');
+      bindTimestampInput(endTextInput, 'end');
 
       bar.querySelector('#jk-trim-preview').addEventListener('click', () => {
         toggleTrimPreview();
@@ -1057,26 +2145,32 @@
     return bar;
   }
 
-  function throttledLiveSeek(targetMs) {
+  function throttledLiveSeek(targetMs, minIntervalMs = 65, preferTrailing = false) {
     const player = getPlayer();
     if (!player || typeof player.seekToMs !== 'function') return;
+    trimState.pendingSeekTargetMs = Math.round(targetMs);
     const now = Date.now();
     const run = () => {
+      const p = getPlayer();
+      if (!p || typeof p.seekToMs !== 'function') return;
       trimState.lastSeekSentAt = Date.now();
-      player.seekToMs(Math.round(targetMs));
+      p.seekToMs(trimState.pendingSeekTargetMs);
       syncTrimPlayheadOnly();
     };
-    if (now - trimState.lastSeekSentAt >= 65) {
+    if (!preferTrailing && (minIntervalMs <= 0 || now - trimState.lastSeekSentAt >= minIntervalMs)) {
       if (trimState.pendingSeekTimer) {
         clearTimeout(trimState.pendingSeekTimer);
         trimState.pendingSeekTimer = 0;
       }
       run();
     } else if (!trimState.pendingSeekTimer) {
+      const waitMs = preferTrailing
+        ? Math.max(40, minIntervalMs)
+        : Math.max(16, minIntervalMs - (now - trimState.lastSeekSentAt));
       trimState.pendingSeekTimer = setTimeout(() => {
         trimState.pendingSeekTimer = 0;
         run();
-      }, 65);
+      }, waitMs);
     }
   }
 
@@ -1084,8 +2178,8 @@
     const startInput = document.getElementById('jk-trim-start');
     const endInput = document.getElementById('jk-trim-end');
     if (!startInput || !endInput) return;
-    const nearRightEdge =
-      trimState.durationMs > 0 && trimState.startMs > trimState.durationMs * 0.85;
+    const vSpan = Math.max(1, trimState.viewEndMs - trimState.viewStartMs);
+    const nearRightEdge = trimState.startMs - trimState.viewStartMs > vSpan * 0.85;
     const startOnTop = trimState.activeHandle === 'start' || nearRightEdge;
     startInput.classList.toggle('jk-trim-top', startOnTop);
     endInput.classList.toggle('jk-trim-top', !startOnTop);
@@ -1095,50 +2189,104 @@
     const bar = document.getElementById('jk-trim-bar');
     if (!bar || !trimState.active) return;
     const player = getPlayer();
+    const dur = Math.max(1, trimState.durationMs);
     const cur =
       player && typeof player.getCurrentTimeMs === 'function'
-        ? Math.max(0, Math.min(trimState.durationMs, player.getCurrentTimeMs()))
+        ? Math.max(0, Math.min(dur, player.getCurrentTimeMs()))
         : trimState.startMs;
-    const dur = Math.max(1, trimState.durationMs);
-    const curPct = Math.max(0, Math.min(100, (cur / dur) * 100));
-    bar.style.setProperty('--trim-cur-pct', curPct.toFixed(3) + '%');
+
+    const vStart = trimState.viewStartMs;
+    const vSpan = Math.max(1, trimState.viewEndMs - vStart);
+    const playheadEl = bar.querySelector('#jk-trim-playhead');
+    const curInView = cur >= vStart && cur <= trimState.viewEndMs;
+    const curFrac = Math.max(0, Math.min(1, (cur - vStart) / vSpan));
+    bar.style.setProperty('--trim-cur-frac', curFrac.toFixed(5));
+    if (playheadEl) {
+      playheadEl.classList.toggle('jk-trim-cur-offscreen', !curInView);
+    }
+
+    const ovCurPct = Math.max(0, Math.min(100, (cur / dur) * 100));
+    bar.style.setProperty('--ov-cur-pct', ovCurPct.toFixed(3) + '%');
   }
 
-  function syncTrimBarUI() {
+  function syncTrimBarUI(forceTextSync = false) {
     const bar = document.getElementById('jk-trim-bar');
     if (!bar) return;
     const dur = Math.max(MIN_CLIP_MS, trimState.durationMs || 1000);
     const startMs = Math.max(0, Math.min(dur, trimState.startMs));
     const endMs = Math.max(startMs, Math.min(dur, trimState.endMs));
 
+    const minSpan = getMinViewSpanMs();
+    if (trimState.viewEndMs <= trimState.viewStartMs) {
+      trimState.viewStartMs = 0;
+      trimState.viewEndMs = dur;
+    }
+    let vSpan = Math.max(minSpan, Math.min(dur, trimState.viewEndMs - trimState.viewStartMs));
+    let vStart = Math.max(0, Math.min(dur - vSpan, trimState.viewStartMs));
+    let vEnd = vStart + vSpan;
+    trimState.viewStartMs = vStart;
+    trimState.viewEndMs = vEnd;
+
     const startInput = bar.querySelector('#jk-trim-start');
     const endInput = bar.querySelector('#jk-trim-end');
+    const startOffscreen = startMs < vStart || startMs > vEnd;
+    const endOffscreen = endMs < vStart || endMs > vEnd;
+
     if (startInput) {
-      startInput.max = String(dur);
-      startInput.value = String(startMs);
+      startInput.min = String(vStart);
+      startInput.max = String(vEnd);
+      startInput.value = String(Math.max(vStart, Math.min(vEnd, startMs)));
       startInput.setAttribute('aria-valuetext', formatTimePrecise(startMs));
+      startInput.classList.toggle('jk-trim-offscreen', startOffscreen);
       syncRangeCssVars(startInput);
     }
     if (endInput) {
-      endInput.max = String(dur);
-      endInput.value = String(endMs);
+      endInput.min = String(vStart);
+      endInput.max = String(vEnd);
+      endInput.value = String(Math.max(vStart, Math.min(vEnd, endMs)));
       endInput.setAttribute('aria-valuetext', formatTimePrecise(endMs));
+      endInput.classList.toggle('jk-trim-offscreen', endOffscreen);
       syncRangeCssVars(endInput);
     }
 
-    const startPct = (startMs / dur) * 100;
-    const endPct = (endMs / dur) * 100;
-    bar.style.setProperty('--trim-start-pct', startPct.toFixed(3) + '%');
-    bar.style.setProperty('--trim-end-pct', endPct.toFixed(3) + '%');
+    const startFrac = Math.max(0, Math.min(1, (startMs - vStart) / vSpan));
+    const endFrac = Math.max(0, Math.min(1, (endMs - vStart) / vSpan));
+    bar.style.setProperty('--trim-start-frac', startFrac.toFixed(5));
+    bar.style.setProperty('--trim-end-frac', endFrac.toFixed(5));
+
+    // Overview minimap CSS vars
+    bar.style.setProperty('--ov-sel-start-pct', ((startMs / dur) * 100).toFixed(3) + '%');
+    bar.style.setProperty('--ov-sel-end-pct', ((endMs / dur) * 100).toFixed(3) + '%');
+    bar.style.setProperty('--ov-win-start-pct', ((vStart / dur) * 100).toFixed(3) + '%');
+    bar.style.setProperty('--ov-win-end-pct', ((vEnd / dur) * 100).toFixed(3) + '%');
+
     syncTrimPlayheadOnly();
     syncTrimHandleStacking();
+
+    const viewStartEl = bar.querySelector('#jk-trim-view-start');
+    const viewEndEl = bar.querySelector('#jk-trim-view-end');
+    if (viewStartEl) viewStartEl.textContent = formatTimePrecise(vStart);
+    if (viewEndEl) viewEndEl.textContent = formatTimePrecise(vEnd);
+
+    const zoomInBtn = bar.querySelector('#jk-trim-zoom-in');
+    const zoomOutBtn = bar.querySelector('#jk-trim-zoom-out');
+    const zoomFitBtn = bar.querySelector('#jk-trim-zoom-fit');
+    if (zoomInBtn) zoomInBtn.disabled = vSpan <= minSpan + 20;
+    if (zoomOutBtn) zoomOutBtn.disabled = vSpan >= dur - 20;
+    if (zoomFitBtn) {
+      zoomFitBtn.textContent = formatZoomSpanLabel(vSpan, dur);
+    }
 
     const startText = bar.querySelector('#jk-trim-start-text');
     const endText = bar.querySelector('#jk-trim-end-text');
     const durPill = bar.querySelector('#jk-trim-duration');
     const prevBtn = bar.querySelector('#jk-trim-preview');
-    if (startText) startText.textContent = formatTimePrecise(startMs);
-    if (endText) endText.textContent = formatTimePrecise(endMs);
+    if (startText && (forceTextSync || document.activeElement !== startText)) {
+      startText.value = formatTimePrecise(startMs);
+    }
+    if (endText && (forceTextSync || document.activeElement !== endText)) {
+      endText.value = formatTimePrecise(endMs);
+    }
     if (durPill) durPill.textContent = formatDurationShort(endMs - startMs);
     if (prevBtn) {
       prevBtn.setAttribute('aria-pressed', trimState.previewing ? 'true' : 'false');
@@ -1229,6 +2377,14 @@
         showTrim && trimState.hostMode === 'standalone' ? '#58a6ff' : '';
       standaloneBtn.style.color =
         showTrim && trimState.hostMode === 'standalone' ? '#58a6ff' : '';
+    }
+    if (
+      window.JKPiPPlayer &&
+      typeof window.JKPiPPlayer.isOpen === 'function' &&
+      window.JKPiPPlayer.isOpen() &&
+      typeof window.JKPiPPlayer.refreshLayout === 'function'
+    ) {
+      window.JKPiPPlayer.refreshLayout();
     }
   }
 
@@ -1323,11 +2479,28 @@
     trimState.endMs = endMs;
     trimState.previewing = false;
     trimState.activeHandle = 'end';
+    trimState.draggingHandle = null;
+    trimState.fineOriginRawMs = null;
+    trimState.fineOriginValMs = null;
+
+    // Auto-zoom around initial clip so small clips on 20-30m demos are immediately easy to grab
+    const initClipSpan = Math.max(MIN_CLIP_MS, endMs - startMs);
+    const initViewSpan = Math.max(
+      getMinViewSpanMs(),
+      Math.min(dur, Math.max(10000, Math.round(initClipSpan * 3)))
+    );
+    const initCenter = (startMs + endMs) * 0.5;
+    trimState.viewStartMs = Math.max(
+      0,
+      Math.min(dur - initViewSpan, Math.round(initCenter - initViewSpan * 0.5))
+    );
+    trimState.viewEndMs = trimState.viewStartMs + initViewSpan;
 
     snapshotLivePlayerDefaults();
     ensureTrimBarDOM(mode);
+    syncTrimBarUI(true);
     syncHostTrimVisibility(true);
-    syncTrimBarUI();
+    startTrimPlayheadTicker();
 
     const nextBtn = document.getElementById('jk-trim-next');
     if (nextBtn) {
@@ -1341,6 +2514,9 @@
   function exitTrimMode(restorePlayState) {
     if (!trimState.active) return;
     stopTrimPreview(false);
+    stopTrimPlayheadTicker();
+    stopEdgeAutoPan();
+    trimState.draggingHandle = null;
     if (trimState.pendingSeekTimer) {
       clearTimeout(trimState.pendingSeekTimer);
       trimState.pendingSeekTimer = 0;
@@ -2445,16 +3621,58 @@
     }
   });
 
-  // Esc exits Trim Mode when the modal dialog is not open
+  // Trim Mode keyboard shortcuts (Esc, [ / ] mark playhead, +/- zoom, F fit/full)
   window.addEventListener(
     'keydown',
     (ev) => {
-      if (ev.key !== 'Escape' || !trimState.active) return;
+      if (!trimState.active || ev.isComposing) return;
       const dlg = document.getElementById('jk-export-dialog');
       if (dlg && dlg.hasAttribute('open')) return;
-      ev.preventDefault();
-      ev.stopPropagation();
-      exitTrimMode(false);
+
+      const activeEl = document.activeElement;
+      const isTextInput =
+        activeEl &&
+        activeEl.tagName === 'INPUT' &&
+        activeEl.type !== 'range' &&
+        activeEl.type !== 'button' &&
+        activeEl.type !== 'checkbox' &&
+        activeEl.type !== 'radio';
+      const isOtherField =
+        activeEl &&
+        (activeEl.tagName === 'TEXTAREA' || activeEl.tagName === 'SELECT' || activeEl.isContentEditable);
+
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (isTextInput && activeEl.classList.contains('jk-trim-val-input')) {
+          const isStart = activeEl.id === 'jk-trim-start-text';
+          activeEl.value = formatTimePrecise(isStart ? trimState.startMs : trimState.endMs);
+          activeEl.removeAttribute('aria-invalid');
+          activeEl.blur();
+          return;
+        }
+        exitTrimMode(false);
+        return;
+      }
+
+      if (isTextInput || isOtherField || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+
+      if (ev.key === '[' || ev.key === 'i' || ev.key === 'I') {
+        ev.preventDefault();
+        markTrimEdgeAtPlayhead('start');
+      } else if (ev.key === ']' || ev.key === 'o' || ev.key === 'O') {
+        ev.preventDefault();
+        markTrimEdgeAtPlayhead('end');
+      } else if (ev.key === '=' || ev.key === '+') {
+        ev.preventDefault();
+        zoomTrimBy(0.5);
+      } else if (ev.key === '-' || ev.key === '_') {
+        ev.preventDefault();
+        zoomTrimBy(2.0);
+      } else if (ev.key === 'f' || ev.key === 'F' || ev.key === '0') {
+        ev.preventDefault();
+        fitTrimToSelection(true);
+      }
     },
     true
   );
@@ -2483,6 +3701,8 @@
       durationMs: trimState.durationMs,
       startMs: trimState.startMs,
       endMs: trimState.endMs,
+      viewStartMs: trimState.viewStartMs,
+      viewEndMs: trimState.viewEndMs,
       previewing: trimState.previewing,
     }),
     setTrimRange: (startMs, endMs) => {
@@ -2494,9 +3714,25 @@
         trimState.startMs + minGap,
         Math.min(dur, Math.round(Number(endMs) || trimState.startMs + minGap))
       );
-      syncTrimBarUI();
+      syncTrimBarUI(true);
       return true;
     },
+    setTrimViewport: (viewStartMs, viewEndMs) => {
+      if (!trimState.active) return false;
+      setTrimViewport(viewStartMs, viewEndMs);
+      return true;
+    },
+    zoomTrimBy: (factor, anchorFrac) => {
+      if (!trimState.active) return false;
+      zoomTrimBy(factor, anchorFrac);
+      return true;
+    },
+    fitTrimToSelection: (toggleFull) => {
+      if (!trimState.active) return false;
+      fitTrimToSelection(Boolean(toggleFull));
+      return true;
+    },
+    markTrimEdgeAtPlayhead,
     openSettingsDialog,
     setDialogOption: (group, val) => {
       if (Object.prototype.hasOwnProperty.call(dialogOptions, group)) {
