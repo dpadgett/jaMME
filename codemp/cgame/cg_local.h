@@ -2755,6 +2755,7 @@ Ghoul2 Insert End
 
 extern qboolean gCGHasFallVector;
 extern vec3_t gCGFallVector;
+void CG_ResetThirdPersonCameraState( void );
 extern qboolean cgQueueLoad;
 extern void CG_ActualLoadDeferredPlayers( void );
 

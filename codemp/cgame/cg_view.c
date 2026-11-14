@@ -242,9 +242,21 @@ vec3_t	cameraIdealTarget,			cameraIdealLoc;
 vec3_t	cameraCurTarget={0,0,0},	cameraCurLoc={0,0,0};
 vec3_t	cameraOldLoc={0,0,0},		cameraNewLoc={0,0,0};
 int		cameraLastFrame=0;
+int		cameraLastClientNum=-1;
 
 float	cameraLastYaw=0;
 float	cameraStiffFactor=0.0f;
+
+void CG_ResetThirdPersonCameraState( void )
+{
+	cameraLastFrame = 0;
+	cameraLastClientNum = -1;
+	cameraLastYaw = 0.0f;
+	cameraStiffFactor = 0.0f;
+	VectorClear( cameraCurTarget );
+	VectorClear( cameraCurLoc );
+	gCGHasFallVector = qfalse;
+}
 
 /*
 ===============
@@ -383,18 +395,27 @@ static void CG_CalcIdealThirdPersonViewLocation(void)
 
 
 
+extern qboolean BG_UnrestrainedPitchRoll( playerState_t *ps, Vehicle_t *pVeh );
 static void CG_ResetThirdPersonViewDamp(void)
 {
 	trace_t trace;
 
 	// Cap the pitch within reasonable limits
-	if (cameraFocusAngles[PITCH] > 89.0)
+	if ( cg.predictedPlayerState.m_iVehicleNum
+		&& BG_UnrestrainedPitchRoll( &cg.predictedPlayerState, cg_entities[cg.predictedPlayerState.m_iVehicleNum].m_pVehicle ) )
 	{
-		cameraFocusAngles[PITCH] = 89.0;
+		// no clamp on pitch
 	}
-	else if (cameraFocusAngles[PITCH] < -89.0)
+	else
 	{
-		cameraFocusAngles[PITCH] = -89.0;
+		if (cameraFocusAngles[PITCH] > 80.0)
+		{
+			cameraFocusAngles[PITCH] = 80.0;
+		}
+		else if (cameraFocusAngles[PITCH] < -80.0)
+		{
+			cameraFocusAngles[PITCH] = -80.0;
+		}
 	}
 
 	AngleVectors(cameraFocusAngles, camerafwd, NULL, cameraup);
@@ -424,6 +445,7 @@ static void CG_ResetThirdPersonViewDamp(void)
 	}
 
 	cameraLastFrame = cg.time;
+	cameraLastClientNum = cg.playerCent ? cg.playerCent->currentState.number : -1;
 	cameraLastYaw = cameraFocusAngles[YAW];
 	cameraStiffFactor = 0.0f;
 }
@@ -444,7 +466,7 @@ static void CG_UpdateThirdPersonTargetDamp(void)
 	{//hyperspacing, no damp
 		VectorCopy(cameraIdealTarget, cameraCurTarget);
 	}
-	else if (cg_thirdPersonTargetDamp.value>=1.0||cg.thisFrameTeleport||cg.predictedPlayerState.m_iVehicleNum||CG_MultiSpecActive())
+	else if (cg_thirdPersonTargetDamp.value>=1.0||cg.thisFrameTeleport||cg.predictedPlayerState.m_iVehicleNum||CG_MultiSpecActive()||(cg.demoPlayback && !cg_smoothCamera.integer))
 	{	// No damping.
 		VectorCopy(cameraIdealTarget, cameraCurTarget);
 	}
@@ -539,7 +561,7 @@ static void CG_UpdateThirdPersonCameraDamp(void)
 		}
 	}
 
-	if (dampfactor>=1.0||cg.thisFrameTeleport||CG_MultiSpecActive())
+	if (dampfactor>=1.0||cg.thisFrameTeleport||CG_MultiSpecActive()||(cg.demoPlayback && !cg_smoothCamera.integer))
 	{	// No damping.
 		VectorCopy(cameraIdealLoc, cameraCurLoc);
 	}
@@ -743,8 +765,9 @@ static void CG_OffsetThirdPersonView( void )
 
 	// The next thing to do is to see if we need to calculate a new camera target location.
 
-	// If we went back in time for some reason, or if we just started, reset the sample.
-	if (cameraLastFrame == 0 || cameraLastFrame > cg.time)
+	// If we went back in time for some reason, switched target, teleported, or just started, reset the sample.
+	if (cameraLastFrame == 0 || cameraLastFrame > cg.time || cg.thisFrameTeleport ||
+		(cg.playerCent && cg.playerCent->currentState.number != cameraLastClientNum))
 	{
 		CG_ResetThirdPersonViewDamp();
 	}
@@ -838,6 +861,7 @@ static void CG_OffsetThirdPersonView( void )
 	VectorCopy(cameraCurLoc, cg.refdef.vieworg);
 
 	cameraLastFrame=cg.time;
+	cameraLastClientNum = cg.playerCent ? cg.playerCent->currentState.number : -1;
 }
 
 void CG_GetVehicleCamPos( vec3_t camPos )
@@ -2920,12 +2944,13 @@ void CG_DrawActiveFrame( int serverTime, stereoFrame_t stereoView, int demoPlayb
 
 	// this counter will be bumped for every valid scene we generate
 	cg.clientFrame++;
-	//mme
-	cg.playerCent = &cg_entities[cg.predictedPlayerState.clientNum];
-	cg.playerPredicted = qtrue;
 
 	// update cg.predictedPlayerState
 	CG_PredictPlayerState();
+
+	//mme
+	cg.playerCent = &cg_entities[cg.predictedPlayerState.clientNum];
+	cg.playerPredicted = qtrue;
 
 	// generate and add the entity from the playerstate	
 	CG_CheckPlayerG2Weapons(&cg.predictedPlayerState, &cg_entities[cg.predictedPlayerState.clientNum]);
@@ -3078,6 +3103,9 @@ void CG_DrawActiveFrame( int serverTime, stereoFrame_t stereoView, int demoPlayb
 
 	if ( cg_stats.integer ) {
 		CG_Printf( "cg.clientFrame:%i\n", cg.clientFrame );
+	}
+	if ( cg.demoPlayback || (cg.snap && (cg.snap->ps.pm_flags & PMF_FOLLOW)) ) {
+		cg.thisFrameTeleport = qfalse;
 	}
 }
 

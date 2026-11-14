@@ -688,7 +688,7 @@ void CG_ResetForDemoSeek( int serverCommandSeq, int processedSnapNum ) {
 	cg.headEndTime = 0;
 	cg.headStartTime = 0;
 	cg.nextOrbitTime = 0;
-	cameraLastFrame = 0;
+	CG_ResetThirdPersonCameraState();
 	memset( &cgScreenEffects, 0, sizeof( cgScreenEffects ) );
 	CG_InitLocalEntities();
 	CG_InitMarkPolys();

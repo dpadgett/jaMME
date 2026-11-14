@@ -3132,6 +3132,7 @@ void CG_Init_Step1_MapAndSounds( int serverMessageNum, int serverCommandSequence
 	int i = 0;
 
 	trap_MME_RequestFeatures();
+	CG_ResetThirdPersonCameraState();
 
 #ifdef __EMSCRIPTEN__
 	{

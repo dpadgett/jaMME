@@ -430,6 +430,8 @@ void demoProcessSnapShots( qboolean hadSkip ) {
 		BG_PlayerStateToEntityState( &snap->ps, &cg_entities[ snap->ps.clientNum ].currentState, qfalse );
 		CG_BuildSolidList();
 		CG_ExecuteNewServerCommands( snap->serverCommandSequence );
+		cg.weaponSelect = snap->ps.weapon;
+		cg.thisFrameTeleport = qtrue;
 		CG_RecordSnapshotHistory( NULL, snap );
 		for ( i = 0; i < cg.snap->numEntities; i++ ) {
 			entityState_t *state = &cg.snap->entities[ i ];
@@ -515,6 +517,7 @@ void CG_DemosDrawActiveFrame( int serverTime, stereoFrame_t stereoView ) {
 	int deltaTime;
 	qboolean hadSkip;
 	qboolean isInitialSeekFrame;
+	qboolean justInitialized = qfalse;
 	qboolean captureFrame;
 	float captureFPS;
 	float frameSpeed;
@@ -535,6 +538,7 @@ void CG_DemosDrawActiveFrame( int serverTime, stereoFrame_t stereoView ) {
 			CG_Error( "No Initial demo snapshot found" );
 		}
 		demoPlaybackInit();
+		justInitialized = qtrue;
 	}
 
 	if (cgQueueLoad)
@@ -580,7 +584,7 @@ void CG_DemosDrawActiveFrame( int serverTime, stereoFrame_t stereoView ) {
 	}
 
 	/* Forward the demo */
-	isInitialSeekFrame = (s_mmeJustSeekedFrames > 0) ? qtrue : qfalse;
+	isInitialSeekFrame = (justInitialized || s_mmeJustSeekedFrames > 0) ? qtrue : qfalse;
 	deltaTime = (demo.serverTime > 0) ? (serverTime - demo.serverTime) : 0;
 	if (deltaTime < 0)
 		deltaTime = 0;
@@ -729,10 +733,8 @@ void CG_DemosDrawActiveFrame( int serverTime, stereoFrame_t stereoView ) {
 		cg.eventCoeff = cg.eventOldCoeff = 0;
 		VectorClear(cg.eventOrigin);
 		VectorClear(cg.eventOldOrigin);
-		{
-			extern int cameraLastFrame;
-			cameraLastFrame = 0;
-		}
+		CG_ResetThirdPersonCameraState();
+		cg.thisFrameTeleport = qtrue;
 
 		cg.centerPrintTime = 0;
         cg.damageTime = 0;
@@ -779,9 +781,9 @@ void CG_DemosDrawActiveFrame( int serverTime, stereoFrame_t stereoView ) {
 		}
 		CG_LoadDeferredPlayers();
 	} else if (cg.frametime > 100) {
-		extern int cameraLastFrame;
 		hadSkip = qtrue;
-		cameraLastFrame = 0;
+		CG_ResetThirdPersonCameraState();
+		cg.thisFrameTeleport = qtrue;
 		CG_LoadDeferredPlayers();
 	} else {
 		hadSkip = qfalse;
@@ -824,15 +826,9 @@ void CG_DemosDrawActiveFrame( int serverTime, stereoFrame_t stereoView ) {
 	}
 
 	CG_PreparePacketEntities( );
-	CG_DemosUpdatePlayer( );
-	chaseUpdate( demo.play.time, demo.play.fraction );
-	cameraUpdate( demo.play.time, demo.play.fraction );
-	dofUpdate( demo.play.time, demo.play.fraction );
-#ifdef DEMO_ANIM
-	animUpdate( demo.play.time, demo.play.fraction );
-#endif
 	cg.clientFrame++;
-	// update cg.predictedPlayerState
+	// update cg.predictedPlayerState before chase/camera updates so chaseUpdate
+	// sees the active clientNum and interpolated origin on frame 0 and after seeks
 	CG_InterpolatePlayerState( qfalse );
 	if (CG_Piloting(cg.predictedPlayerState.m_iVehicleNum))
 		CG_InterpolateVehiclePlayerState( qfalse );
@@ -841,6 +837,14 @@ void CG_DemosDrawActiveFrame( int serverTime, stereoFrame_t stereoView ) {
 	cg_entities[cg.snap->ps.clientNum].currentValid = qtrue;
 	VectorCopy( cg_entities[cg.snap->ps.clientNum].currentState.pos.trBase, cg_entities[cg.snap->ps.clientNum].lerpOrigin );
 	VectorCopy( cg_entities[cg.snap->ps.clientNum].currentState.apos.trBase, cg_entities[cg.snap->ps.clientNum].lerpAngles );
+
+	CG_DemosUpdatePlayer( );
+	chaseUpdate( demo.play.time, demo.play.fraction );
+	cameraUpdate( demo.play.time, demo.play.fraction );
+	dofUpdate( demo.play.time, demo.play.fraction );
+#ifdef DEMO_ANIM
+	animUpdate( demo.play.time, demo.play.fraction );
+#endif
 
 	inwater = demoSetupView();
 	CG_SetupFrustum();
@@ -1076,6 +1080,7 @@ void CG_DemosDrawActiveFrame( int serverTime, stereoFrame_t stereoView ) {
 		} 
 		demo.capture.active = qfalse;
 	}
+	cg.thisFrameTeleport = qfalse;
 }
 
 void CG_DemosAddLog(const char *fmt, ...) {
@@ -1691,6 +1696,7 @@ void CG_MME_Reset( void ) {
 	demo.play.speed = 1.0f;
 	demo.length = trap_MME_DemoLength();
 	s_mmeJustSeekedFrames = 0;
+	CG_ResetThirdPersonCameraState();
 }
 
 int CG_MME_IsInitialized( void ) {
@@ -1721,6 +1727,8 @@ void CG_MME_SetTimeMs( int ms ) {
 	demo.play.oldTime = ms;
 	demo.play.fraction = 0.0f;
 	s_mmeJustSeekedFrames = 1;
+	CG_ResetThirdPersonCameraState();
+	cg.thisFrameTeleport = qtrue;
 	cg.time = trap_MME_SeekTime( ms );
 	cg.timeFraction = 0.0f;
 	if ( demo.initDone ) {
