@@ -173,8 +173,10 @@
         <button id="btn-play-pause" type="button">Pause</button>
       </div>
 
-      <div class="control-group" style="flex: 1 1 200px; min-width: 180px;">
-        <input id="slider-seek" type="range" min="0" max="1000" step="50" value="0" aria-label="Seek timeline" style="flex: 1 1 auto;" />
+      <div class="control-group" style="flex: 1 1 220px; min-width: 180px;">
+        <div id="jk-standalone-seek-shell" class="jk-tl-shell jk-tl-empty">
+          <input id="slider-seek" class="jk-tl-range" type="range" min="0" max="1000" step="1" value="0" aria-label="Seek timeline" />
+        </div>
         <span id="time-display" style="font-family: ui-monospace, monospace; font-size: 12px; min-width: 85px;">00:00 / 00:00</span>
       </div>
 
@@ -233,7 +235,7 @@
     </div>
   </main>
 
-  <script src="/jk-video-export.js"></script>
-  <script src="/player.js"></script>
+  <script src="/jk-video-export.js?v=20261115a"></script>
+  <script src="/player.js?v=20261115a"></script>
 </body>
 </html>

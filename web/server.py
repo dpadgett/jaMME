@@ -261,6 +261,55 @@ class OpenJKRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, self.server.manifest, head_only=head_only)
             return
 
+        if path == "/api/demo-timeline":
+            qs = urllib.parse.parse_qs(parsed.query)
+            demo_name = (qs.get("demo") or [""])[0].strip()
+            demo_base = os.path.basename(demo_name)
+            if not is_safe_filename(demo_base):
+                self._send_json(200, {"timeline": None}, head_only=head_only)
+                return
+            candidate = resolve_demo_path(demo_base, self.server.demo_dirs)
+            meta_file = (candidate + ".dm_meta") if candidate else ""
+            if not candidate or not os.path.isfile(meta_file):
+                self._send_json(200, {"timeline": None}, head_only=head_only)
+                return
+            timeline_obj = None
+            try:
+                tl_dir = "/home/dan/goog/pyservices/python"
+                if os.path.isdir(tl_dir) and tl_dir not in sys.path:
+                    sys.path.insert(0, tl_dir)
+                import timeline_events_lib
+                dm = timeline_events_lib.load_json_file(meta_file)
+                if dm and dm.get("maps"):
+                    m0 = dm["maps"][0]
+                    s_raw = m0.get("map_start_time_raw")
+                    e_raw = m0.get("map_end_time_raw")
+                    if s_raw is None:
+                        s_raw = m0.get("map_start_time", 0)
+                    if e_raw is None:
+                        e_raw = m0.get("map_end_time", 0)
+                    cid = (dm.get("client") or {}).get("id")
+                    cid = int(cid) if cid is not None else None
+                    teams_d = m0.get("teams") or {}
+                    names_d = m0.get("names") or {}
+                    pov_nm = timeline_events_lib.resolve_player_name_at(names_d, cid, time_raw=s_raw) or ""
+                    spec = timeline_events_lib.is_pure_spectator(teams_d, cid, s_raw, e_raw)
+                    timeline_obj = timeline_events_lib.build_timeline_from_map_data(
+                        map_obj=m0,
+                        start_raw=int(s_raw),
+                        end_raw=int(e_raw),
+                        mode="spectator" if spec else "pov",
+                        active_pov_fn=(lambda _tr: None) if spec else (lambda _tr: cid),
+                        pov_client_id=None if spec else cid,
+                        pov_name="" if spec else pov_nm,
+                    )
+                    if timeline_obj:
+                        timeline_obj["baseStartTimeRaw"] = int(s_raw)
+            except Exception:
+                timeline_obj = None
+            self._send_json(200, {"timeline": timeline_obj}, head_only=head_only)
+            return
+
         if path.startswith("/base/demos/") or path.startswith("/demos/"):
             prefix = "/base/demos/" if path.startswith("/base/demos/") else "/demos/"
             demo_name = path[len(prefix) :]

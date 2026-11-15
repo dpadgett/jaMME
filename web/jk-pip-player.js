@@ -808,12 +808,19 @@
         gap: calc(6px * var(--jk-ui-scale, 1));
         inline-size: 100%;
       }
+      #jk-pip-seek-shell {
+        position: relative;
+        flex: 1 1 auto;
+        min-inline-size: 0;
+        display: flex;
+        align-items: flex-end;
+      }
       #jk-pip-seek {
         position: relative;
         z-index: 12;
         flex: 1 1 auto;
+        inline-size: 100%;
         min-inline-size: 0;
-        min-block-size: calc(18px * var(--jk-ui-scale, 1));
         margin: 0;
         cursor: pointer;
         accent-color: #58a6ff;
@@ -1348,9 +1355,11 @@
         .jk-pip-primary-group {
           margin-inline-end: calc(6px * var(--jk-ui-scale, 1));
         }
-        #jk-pip-seek,
         #jk-pip-volume {
           min-block-size: calc(24px * var(--jk-ui-scale, 1));
+        }
+        #jk-pip-seek-shell {
+          min-block-size: calc(30px * var(--jk-ui-scale, 1));
         }
         .jk-pip-resize-se,
         .jk-pip-resize-sw {
@@ -1652,7 +1661,11 @@
         return;
       }
       const speedSelect = document.getElementById('jk-pip-speed');
-      if (speedSelect && document.activeElement === speedSelect) {
+      const tlTip = document.getElementById('jk-timeline-tooltip');
+      if (
+        (speedSelect && document.activeElement === speedSelect) ||
+        (tlTip && !tlTip.hidden)
+      ) {
         showFullscreenControls(true);
         return;
       }
@@ -1945,7 +1958,9 @@
       </div>
       <div id="jk-pip-controls">
         <div class="jk-pip-timeline-row">
-          <input type="range" id="jk-pip-seek" min="0" max="1000" step="1" value="0" aria-label="Seek timeline" />
+          <div id="jk-pip-seek-shell" class="jk-tl-shell jk-tl-empty">
+            <input type="range" id="jk-pip-seek" class="jk-tl-range" min="0" max="1000" step="1" value="0" aria-label="Seek timeline" />
+          </div>
           <span id="jk-pip-time">0:00 / 0:00</span>
         </div>
         <div class="jk-pip-buttons-row">
@@ -2471,6 +2486,13 @@
       const val = parseFloat(seekInput.value);
       if (Number.isFinite(val)) {
         const ms = Math.round(val);
+        if (window.JKTimelineUI && typeof window.JKTimelineUI.syncRangeInputCss === 'function') {
+          window.JKTimelineUI.syncRangeInputCss(
+            seekInput,
+            ms,
+            parseFloat(seekInput.max) || 1000
+          );
+        }
         lastScrubMs = ms;
         lastScrubAt = Date.now();
         seekToMs(ms);
@@ -3069,11 +3091,45 @@
     }
 
     const seekInput = document.getElementById('jk-pip-seek');
-    if (seekInput && !pipState.scrubbing) {
+    if (seekInput) {
+      ensurePipTimelineMounted(seekInput);
       const maxMs = durationMs > 0 ? durationMs : 1000;
-      seekInput.max = String(maxMs);
-      seekInput.value = String(Math.min(maxMs, Math.max(0, Math.round(elapsedMs))));
+      if (!pipState.scrubbing) {
+        seekInput.max = String(maxMs);
+        seekInput.value = String(Math.min(maxMs, Math.max(0, Math.round(elapsedMs))));
+      }
+      if (pipTimelineMount) {
+        pipTimelineMount.syncProgress(
+          pipState.scrubbing ? parseFloat(seekInput.value) || elapsedMs : elapsedMs,
+          durationMs
+        );
+      }
     }
+  }
+
+  let pipTimelineMount = null;
+  function ensurePipTimelineMounted(seekEl) {
+    if (pipTimelineMount) return pipTimelineMount;
+    if (!window.JKTimelineUI || typeof window.JKTimelineUI.attachRangeScrubber !== 'function') {
+      return null;
+    }
+    const target = seekEl || document.getElementById('jk-pip-seek');
+    if (!target) return null;
+    pipTimelineMount = window.JKTimelineUI.attachRangeScrubber(target, {
+      onSelectEvent: (ev) => {
+        const p = getPlayer();
+        if (p && typeof p.seekToTimelineEvent === 'function') {
+          p.seekToTimelineEvent(ev);
+        } else if (ev && typeof ev.t === 'number') {
+          seekToMs(Math.max(0, ev.t - 3000));
+        }
+        if (isCardFullscreen()) {
+          showFullscreenControls(true);
+        }
+        updateControlState();
+      },
+    });
+    return pipTimelineMount;
   }
 
   let videoExportScriptPromise = null;
@@ -3082,7 +3138,7 @@
       return Promise.resolve(window.JKVideoExport);
     }
     if (videoExportScriptPromise) return videoExportScriptPromise;
-    const PLAYER_ASSET_VERSION = '20261113a';
+    const PLAYER_ASSET_VERSION = '20261115a';
     videoExportScriptPromise = new Promise((resolve, reject) => {
       const existing = document.querySelector('script[src*="/jkplayer/jk-video-export.js"]');
       if (existing) {
@@ -3128,7 +3184,7 @@
 
     // Separate engine vs wrapper versions so UI/JS updates do not invalidate cached openjk.wasm
     const ENGINE_ASSET_VERSION = '20261113a';
-    const PLAYER_ASSET_VERSION = '20261113a';
+    const PLAYER_ASSET_VERSION = '20261115a';
     ensureVideoExportScriptLoaded().catch(() => {});
     window.JKDemoConfig = Object.assign(
       {
@@ -3680,6 +3736,9 @@
 
   function closePiP() {
     const card = document.getElementById('jk-pip-card');
+    if (window.JKTimelineUI && typeof window.JKTimelineUI.hideTooltip === 'function') {
+      window.JKTimelineUI.hideTooltip();
+    }
     if (isExportTrimActive() && window.JKVideoExport) {
       window.JKVideoExport.exitTrimMode(false);
     }

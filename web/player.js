@@ -19,7 +19,7 @@
 
   const BOOT_START_MS = typeof performance !== 'undefined' ? performance.now() : Date.now();
   const DEFAULT_ENGINE_VERSION = '20261113a';
-  const DEFAULT_PLAYER_VERSION = '20261113a';
+  const DEFAULT_PLAYER_VERSION = '20261115a';
 
   function installDocumentTitleGuard() {
     if (typeof document === 'undefined' || document.__jkTitleGuardInstalled) return;
@@ -114,6 +114,7 @@
       updatedAt: 0,
     },
     loadChain: Promise.resolve(true),
+    timeline: null,
     metrics: {
       bootStartMs: BOOT_START_MS,
       idbHydrateDurationMs: 0,
@@ -1943,6 +1944,14 @@
       type === 'touchcancel'
     ) {
       if (!state.interactiveMode) return true;
+      if (
+        ev &&
+        ev.target &&
+        typeof ev.target.closest === 'function' &&
+        ev.target.closest('#jk-timeline-tooltip, .jk-tl-shell')
+      ) {
+        return true;
+      }
     }
     return false;
   }
@@ -3263,9 +3272,13 @@
             onFirstMessageReady(cachedBytes);
           } catch (_) {}
         }
+        const fsSafe = /\s/.test(fileName)
+          ? fileName.replace(/\s+/g, '_')
+          : fileName;
         return {
-          fileName,
-          shortName: stripDemoExt(fileName),
+          fileName: fsSafe,
+          origFileName: fileName,
+          shortName: stripDemoExt(fsSafe),
           sourceUrl: raw,
           label: customLabel,
           bytes: cachedBytes,
@@ -3467,9 +3480,13 @@
             } catch (_) {}
           });
         }
+        const fsSafe = /\s/.test(fileName)
+          ? fileName.replace(/\s+/g, '_')
+          : fileName;
         return {
-          fileName,
-          shortName: stripDemoExt(fileName),
+          fileName: fsSafe,
+          origFileName: fileName,
+          shortName: stripDemoExt(fsSafe),
           sourceUrl: raw,
           label: headerLabel || fileName,
           bytes,
@@ -4601,6 +4618,7 @@
         }
         const rawStr = typeof rawInput === 'string' ? rawInput.trim() : '';
         const canUseMmeStream = isQueryDemoUrl(rawStr);
+        setTimelineData(null);
         let usedMmeStream = false;
         let mmeStreamInitBytes = null;
         let mmeStreamUrl = '';
@@ -4873,6 +4891,7 @@
           mmeStreamState.totalFrames = Number(meta.totalFrames || 1);
           mmeStreamState.index = meta.index;
           applyMmeStreamToWasm(meta);
+          setTimelineData(meta.timeline || null);
         } else {
           resetMmeStreamState();
           writeDemoToFS(demoData.fileName, demoData.bytes);
@@ -4964,6 +4983,10 @@
             })
           );
         } catch (_) {}
+
+        if (!usedMmeStream && demoData && (demoData.origFileName || demoData.fileName) && !isQueryDemoUrl(rawStr)) {
+          fetchLocalDemoTimeline(demoData.origFileName || demoData.fileName, loadSignal, isSuperseded);
+        }
 
         let pollTicks = 0;
         const targetShort = demoData.shortName.toLowerCase();
@@ -5942,6 +5965,1684 @@
     };
   }
 
+  // =========================================================================
+  // Timeline Event Markers, Carry Spans, Tooltip & Navigation (JKTimelineUI)
+  // =========================================================================
+
+  const TIMELINE_EVENT_META = {
+    cap_pov: {
+      priority: 1,
+      preRollMs: 3000,
+      framePreMs: 10000,
+      framePostMs: 3500,
+      label: 'Flag Capture',
+    },
+    nice_shot: {
+      priority: 2,
+      preRollMs: 3000,
+      framePreMs: 9000,
+      framePostMs: 5000,
+      label: 'Nice Shot',
+    },
+    bookmark: {
+      priority: 2,
+      preRollMs: 3000,
+      framePreMs: 10000,
+      framePostMs: 5000,
+      label: 'Bookmark',
+    },
+    cap_other: {
+      priority: 3,
+      preRollMs: 3000,
+      framePreMs: 8000,
+      framePostMs: 4000,
+      label: 'Match Capture',
+    },
+    fc_kill: {
+      priority: 4,
+      preRollMs: 3000,
+      framePreMs: 8000,
+      framePostMs: 4000,
+      label: 'FC Frag',
+    },
+    flag_return: {
+      priority: 5,
+      preRollMs: 3000,
+      framePreMs: 7000,
+      framePostMs: 4000,
+      label: 'Flag Return',
+    },
+    kill: {
+      priority: 6,
+      preRollMs: 3000,
+      framePreMs: 7000,
+      framePostMs: 4000,
+      label: 'Frag',
+    },
+    flag_death: {
+      priority: 7,
+      preRollMs: 3000,
+      framePreMs: 7000,
+      framePostMs: 3000,
+      label: 'Dropped Flag',
+    },
+    flag_grab: {
+      priority: 8,
+      preRollMs: 1000,
+      framePreMs: 2000,
+      framePostMs: 8000,
+      label: 'Flag Grab',
+    },
+  };
+
+  const Q3_DARK_PALETTE = [
+    '#94a3b8', // ^0 Gunmetal (legible on dark surface)
+    '#ff6b6b', // ^1 Red
+    '#4ade80', // ^2 Green
+    '#facc15', // ^3 Yellow
+    '#60a5fa', // ^4 Blue
+    '#22d3ee', // ^5 Cyan
+    '#e879f9', // ^6 Magenta
+    '#f1f5f9', // ^7 White
+    '#fb923c', // ^8 Orange
+    '#cbd5e1', // ^9 Silver
+  ];
+
+  function classifyEventKey(ev) {
+    if (!ev || typeof ev !== 'object') return 'kill';
+    if (ev.type === 'cap') {
+      return ev.pov ? 'cap_pov' : 'cap_other';
+    }
+    if (TIMELINE_EVENT_META[ev.type]) {
+      return ev.type;
+    }
+    return 'kill';
+  }
+
+  function getEventPreRollMs(ev) {
+    const key = classifyEventKey(ev);
+    const info = TIMELINE_EVENT_META[key];
+    return info ? info.preRollMs : 3000;
+  }
+
+  function computeEventClipBounds(ev, durationMs) {
+    const dur = Math.max(500, Number(durationMs) || getDurationMs() || 1000);
+    if (!ev || typeof ev.t !== 'number') {
+      return { startMs: 0, endMs: Math.min(dur, 10000) };
+    }
+    const key = classifyEventKey(ev);
+    const meta = TIMELINE_EVENT_META[key] || TIMELINE_EVENT_META.kill;
+    let sMs = ev.t - meta.framePreMs;
+    let eMs = ev.t + meta.framePostMs;
+    if (key === 'cap_pov' && typeof ev.runStartMs === 'number' && ev.runStartMs < ev.t) {
+      sMs = ev.runStartMs - 2000;
+      eMs = ev.t + 3000;
+    } else if (key === 'flag_grab' && typeof ev.runEndMs === 'number' && ev.runEndMs > ev.t) {
+      sMs = ev.t - 2000;
+      eMs = ev.runEndMs + 3000;
+    }
+    sMs = Math.max(0, Math.round(sMs));
+    eMs = Math.min(dur, Math.round(eMs));
+    if (eMs - sMs < 500) {
+      if (eMs + 500 <= dur) eMs = sMs + 500;
+      else sMs = Math.max(0, eMs - 500);
+    }
+    return { startMs: sMs, endMs: eMs };
+  }
+
+  function normalizeTimelinePayload(rawTl) {
+    if (!rawTl || typeof rawTl !== 'object') return null;
+    const events = Array.isArray(rawTl.events)
+      ? rawTl.events
+          .filter((e) => e && Number.isFinite(Number(e.t)))
+          .map((e, i) =>
+            Object.assign({}, e, {
+              id: e.id || `ev_${i}`,
+              t: Math.max(0, Math.round(Number(e.t))),
+              pov: Boolean(e.pov),
+            })
+          )
+          .sort((a, b) => a.t - b.t)
+      : [];
+    const carrySpans = Array.isArray(rawTl.carrySpans)
+      ? rawTl.carrySpans
+          .filter(
+            (s) =>
+              s &&
+              Number.isFinite(Number(s.startMs)) &&
+              Number.isFinite(Number(s.endMs)) &&
+              Number(s.endMs) > Number(s.startMs)
+          )
+          .map((s) => ({
+            startMs: Math.max(0, Math.round(Number(s.startMs))),
+            endMs: Math.max(0, Math.round(Number(s.endMs))),
+            team: String(s.team || ''),
+            flagTeam: String(s.flagTeam || ''),
+            outcome: String(s.outcome || ''),
+          }))
+      : [];
+    if (events.length === 0 && carrySpans.length === 0) {
+      return null;
+    }
+    return {
+      mode: String(rawTl.mode || 'pov'),
+      povClientId: rawTl.povClientId != null ? Number(rawTl.povClientId) : null,
+      povName: String(rawTl.povName || ''),
+      povNameClean: String(rawTl.povNameClean || ''),
+      durationMs: Number(rawTl.durationMs || 0),
+      baseStartTimeRaw:
+        rawTl.baseStartTimeRaw != null ? Number(rawTl.baseStartTimeRaw) : null,
+      events,
+      carrySpans,
+      cuts: Array.isArray(rawTl.cuts) ? rawTl.cuts : [],
+    };
+  }
+
+  function setTimelineData(rawTl) {
+    state.timeline = normalizeTimelinePayload(rawTl);
+    if (JKTimelineUI && typeof JKTimelineUI.hideTooltip === 'function') {
+      JKTimelineUI.hideTooltip();
+    }
+    try {
+      window.dispatchEvent(
+        new CustomEvent('jk-timeline-updated', { detail: state.timeline })
+      );
+    } catch (_) {}
+    if (standaloneTimelineMount) {
+      standaloneTimelineMount.refresh();
+    }
+  }
+
+  function getTimeline() {
+    return state.timeline || null;
+  }
+
+  function fetchLocalDemoTimeline(fileName, signal, isSupersededFn) {
+    const url = '/api/demo-timeline?demo=' + encodeURIComponent(fileName);
+    fetch(url, { signal, credentials: 'same-origin' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((payload) => {
+        if (!payload || !payload.timeline) return;
+        if (typeof isSupersededFn === 'function' && isSupersededFn()) return;
+        const tl = payload.timeline;
+        const engineStart = getStartTimeMs();
+        if (
+          engineStart > 0 &&
+          typeof tl.baseStartTimeRaw === 'number' &&
+          Math.abs(tl.baseStartTimeRaw - engineStart) > 25 &&
+          Math.abs(tl.baseStartTimeRaw - engineStart) < 30000
+        ) {
+          const shift = tl.baseStartTimeRaw - engineStart;
+          if (Array.isArray(tl.events)) {
+            tl.events = tl.events.map((ev) =>
+              Object.assign({}, ev, {
+                t: Math.max(0, ev.t + shift),
+                runStartMs:
+                  typeof ev.runStartMs === 'number'
+                    ? Math.max(0, ev.runStartMs + shift)
+                    : undefined,
+                runEndMs:
+                  typeof ev.runEndMs === 'number'
+                    ? Math.max(0, ev.runEndMs + shift)
+                    : undefined,
+              })
+            );
+          }
+          if (Array.isArray(tl.carrySpans)) {
+            tl.carrySpans = tl.carrySpans.map((sp) =>
+              Object.assign({}, sp, {
+                startMs: Math.max(0, sp.startMs + shift),
+                endMs: Math.max(0, sp.endMs + shift),
+              })
+            );
+          }
+        }
+        setTimelineData(tl);
+      })
+      .catch(() => {});
+  }
+
+  function seekToTimelineEvent(evOrId) {
+    const tl = state.timeline;
+    let ev = null;
+    if (evOrId && typeof evOrId === 'object') {
+      ev = evOrId;
+    } else if (tl && Array.isArray(tl.events)) {
+      ev = tl.events.find((item) => item.id === evOrId) || null;
+    }
+    if (!ev || typeof ev.t !== 'number') {
+      return getCurrentTimeMs();
+    }
+    const dur = getDurationMs();
+    const preRoll = getEventPreRollMs(ev);
+    const targetMs = Math.max(0, Math.min(dur > 0 ? dur : ev.t, ev.t - preRoll));
+    return seekToMs(targetMs);
+  }
+
+  function stepTimelineEvent(direction) {
+    const tl = state.timeline;
+    if (!tl || !Array.isArray(tl.events) || tl.events.length === 0) {
+      return null;
+    }
+    const dur = getDurationMs();
+    const curMs = getCurrentTimeMs();
+    const sorted = tl.events;
+
+    if (direction >= 0) {
+      for (let i = 0; i < sorted.length; i++) {
+        const ev = sorted[i];
+        const target = Math.max(0, ev.t - getEventPreRollMs(ev));
+        if (target > curMs + 250) {
+          seekToMs(Math.min(dur > 0 ? dur : target, target));
+          return ev;
+        }
+      }
+      return null;
+    } else {
+      for (let i = sorted.length - 1; i >= 0; i--) {
+        const ev = sorted[i];
+        const target = Math.max(0, ev.t - getEventPreRollMs(ev));
+        if (target < curMs - 1800) {
+          seekToMs(Math.min(dur > 0 ? dur : target, target));
+          return ev;
+        }
+      }
+      return null;
+    }
+  }
+
+  function escapeHtmlText(str) {
+    return String(str == null ? '' : str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function renderQ3ColoredHtml(raw) {
+    const s = String(raw == null ? '' : raw);
+    if (!s) return '';
+    let html = '<span style="color:#f1f5f9">';
+    for (let i = 0; i < s.length; i++) {
+      if (s[i] === '^' && i + 1 < s.length && s[i + 1] >= '0' && s[i + 1] <= '9') {
+        const idx = s.charCodeAt(i + 1) - 48;
+        const col = Q3_DARK_PALETTE[idx] || '#f1f5f9';
+        html += `</span><span style="color:${col}">`;
+        i++;
+        continue;
+      }
+      const ch = s[i];
+      if (ch === '&') html += '&amp;';
+      else if (ch === '<') html += '&lt;';
+      else if (ch === '>') html += '&gt;';
+      else if (ch === '"') html += '&quot;';
+      else html += ch;
+    }
+    html += '</span>';
+    return html;
+  }
+
+  function describeTimelineEventPlain(ev) {
+    if (!ev) return 'Event';
+    const ts = formatTimeMMSS(ev.t);
+    const actor = ev.actorClean || 'Player';
+    const target = ev.targetClean || 'Flag Carrier';
+    const weap = ev.weapon ? ` (${ev.weapon})` : '';
+    const teamLabel = ev.team === 'RED' ? 'Red' : ev.team === 'BLUE' ? 'Blue' : '';
+
+    switch (ev.type) {
+      case 'cap':
+        if (ev.pov) {
+          return `${ts} — POV Flag Capture: ${actor}${teamLabel ? ` scored for ${teamLabel}` : ''}`;
+        }
+        return `${ts} — Match Flag Capture: ${actor}${teamLabel ? ` scored for ${teamLabel}` : ''}`;
+      case 'nice_shot':
+        return `${ts} — Nice Shot${ev.detail ? ` (${ev.detail})` : ''}${actor ? ` by ${actor}` : ''}`;
+      case 'bookmark':
+        return `${ts} — Bookmark${ev.detail ? `: ${ev.detail}` : ''}`;
+      case 'fc_kill':
+        return `${ts} — ${actor} fragged FC ${target}${weap}`;
+      case 'flag_return':
+        return `${ts} — ${actor} returned ${teamLabel || 'team'} flag`;
+      case 'flag_grab':
+        return `${ts} — ${actor} grabbed ${ev.flagTeam === 'RED' ? 'Red' : ev.flagTeam === 'BLUE' ? 'Blue' : 'enemy'} flag`;
+      case 'flag_death':
+        if (ev.selfKill) {
+          return `${ts} — ${target} lost flag${weap}`;
+        }
+        return `${ts} — ${target} fragged w/ flag by ${actor}${weap}`;
+      case 'kill':
+        return `${ts} — ${actor} fragged ${target}${weap}`;
+      default:
+        return `${ts} — ${actor}`;
+    }
+  }
+
+  function renderTimelineEventDetailHtml(ev) {
+    const actorHtml = ev.actor ? renderQ3ColoredHtml(ev.actor) : escapeHtmlText(ev.actorClean || '');
+    const targetHtml = ev.target ? renderQ3ColoredHtml(ev.target) : escapeHtmlText(ev.targetClean || '');
+    const weapBadge = ev.weapon
+      ? ` <span class="jk-tl-tip-weap">${escapeHtmlText(ev.weapon)}</span>`
+      : '';
+    const teamSpan =
+      ev.team === 'RED'
+        ? '<span class="jk-tl-team-red">Red</span>'
+        : ev.team === 'BLUE'
+        ? '<span class="jk-tl-team-blue">Blue</span>'
+        : '';
+
+    switch (ev.type) {
+      case 'cap':
+        return `${actorHtml || 'Player'} captured for ${teamSpan || 'team'}`;
+      case 'nice_shot':
+        return `Nice Shot${ev.detail ? ` <span class="jk-tl-tip-gold">${escapeHtmlText(ev.detail)}</span>` : ''}${actorHtml ? ` · ${actorHtml}` : ''}`;
+      case 'bookmark':
+        return `Bookmark${ev.detail ? ` · <span class="jk-tl-tip-gold">${escapeHtmlText(ev.detail)}</span>` : ''}`;
+      case 'fc_kill':
+        return `${actorHtml || 'POV'} fragged FC ${targetHtml || ''}${weapBadge}`;
+      case 'flag_return':
+        return `${actorHtml || 'POV'} returned ${teamSpan || 'team'} flag`;
+      case 'flag_grab': {
+        const enemyFlag =
+          ev.flagTeam === 'RED'
+            ? '<span class="jk-tl-team-red">Red</span>'
+            : ev.flagTeam === 'BLUE'
+            ? '<span class="jk-tl-team-blue">Blue</span>'
+            : 'enemy';
+        return `${actorHtml || 'POV'} grabbed ${enemyFlag} flag`;
+      }
+      case 'flag_death':
+        if (ev.selfKill) {
+          return `${targetHtml || 'POV'} dropped flag${weapBadge}`;
+        }
+        return `Fragged w/ flag by ${actorHtml || 'enemy'}${weapBadge}`;
+      case 'kill':
+        return `${actorHtml || 'POV'} fragged ${targetHtml || 'enemy'}${weapBadge}`;
+      default:
+        return actorHtml || 'Event';
+    }
+  }
+
+  function createTimelineUIManager() {
+    let stylesInjected = false;
+    let tooltipEl = null;
+    let activeTriggerBtn = null;
+    let hoveredPinBtn = null;
+    let isPointerOverTooltip = false;
+    let isTouchPinnedMode = false;
+    let lastPinPointerType = '';
+    let lastTouchPinTime = 0;
+    let hideTimer = 0;
+
+    function isCoarsePointerDevice() {
+      try {
+        return Boolean(
+          window.matchMedia && window.matchMedia('(pointer: coarse), (hover: none)').matches
+        );
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function isTouchPointerEvent(ev) {
+      if (!ev) return false;
+      if (ev.pointerType === 'touch') return true;
+      if (ev.pointerType && ev.pointerType !== 'mouse' && isCoarsePointerDevice()) return true;
+      return false;
+    }
+
+    function injectStyles() {
+      if (stylesInjected || document.getElementById('jk-timeline-shared-styles')) {
+        stylesInjected = true;
+        return;
+      }
+      stylesInjected = true;
+      const st = document.createElement('style');
+      st.id = 'jk-timeline-shared-styles';
+      st.textContent = `
+        .jk-tl-shell {
+          position: relative;
+          flex: 1 1 auto;
+          min-inline-size: 0;
+          block-size: calc(24px * var(--jk-ui-scale, 1));
+          display: flex;
+          align-items: flex-end;
+          box-sizing: border-box;
+          --tl-thumb-size: calc(13px * var(--jk-ui-scale, 1));
+          --tl-track-size: calc(5px * var(--jk-ui-scale, 1));
+          --tl-edge-inset: calc(6.5px * var(--jk-ui-scale, 1));
+        }
+        .jk-tl-shell.jk-tl-empty {
+          block-size: calc(18px * var(--jk-ui-scale, 1));
+          align-items: center;
+        }
+        input[type="range"].jk-tl-range {
+          --slider-track-size: var(--tl-track-size, calc(5px * var(--jk-ui-scale, 1)));
+          --slider-thumb-size: var(--tl-thumb-size, calc(13px * var(--jk-ui-scale, 1)));
+          --slider-track-radius: 999px;
+          --slider-thumb-radius: 50%;
+          --slider-track-color: rgba(48, 54, 61, 0.92);
+          --slider-fill-color: #2f81f7;
+          --slider-thumb-color: #f0f6fc;
+          --slider-direction: to right;
+          --attr-min: attr(min type(<number>), 0);
+          --attr-max: attr(max type(<number>), 1000);
+          --control-value: attr(value type(<number>), 0);
+          --slider-progress: calc(
+            progress(var(--control-value), var(--attr-min), var(--attr-max)) * 100%
+          );
+          position: relative;
+          z-index: 12;
+          appearance: none;
+          -webkit-appearance: none;
+          inline-size: 100%;
+          block-size: calc(16px * var(--jk-ui-scale, 1));
+          margin: 0;
+          padding: 0;
+          border: 0;
+          border-radius: 0;
+          background: transparent;
+          cursor: pointer;
+        }
+        input[type="range"].jk-tl-range:dir(rtl) {
+          --slider-direction: to left;
+        }
+        @supports not (opacity: progress(1, 0, 100)) {
+          input[type="range"].jk-tl-range {
+            --slider-progress: calc(
+              (var(--control-value) - var(--attr-min)) /
+              (var(--attr-max) - var(--attr-min)) * 100%
+            );
+          }
+        }
+        input[type="range"].jk-tl-range::-webkit-slider-runnable-track {
+          block-size: var(--slider-track-size);
+          border: 0;
+          border-radius: var(--slider-track-radius);
+          background: linear-gradient(
+            var(--slider-direction),
+            var(--slider-fill-color) var(--slider-progress),
+            var(--slider-track-color) var(--slider-progress)
+          );
+        }
+        input[type="range"].jk-tl-range::-webkit-slider-thumb {
+          -webkit-appearance: none;
+          appearance: none;
+          inline-size: var(--slider-thumb-size);
+          block-size: var(--slider-thumb-size);
+          margin-block-start: calc(
+            (var(--slider-track-size) - var(--slider-thumb-size)) / 2
+          );
+          border: 1.5px solid #1f6feb;
+          border-radius: var(--slider-thumb-radius);
+          background: var(--slider-thumb-color);
+          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.65);
+        }
+        input[type="range"].jk-tl-range::-moz-range-track {
+          block-size: var(--slider-track-size);
+          border: 0;
+          border-radius: var(--slider-track-radius);
+          background: var(--slider-track-color);
+        }
+        input[type="range"].jk-tl-range::-moz-range-progress {
+          block-size: var(--slider-track-size);
+          border-radius: var(--slider-track-radius);
+          background: var(--slider-fill-color);
+        }
+        input[type="range"].jk-tl-range::-moz-range-thumb {
+          inline-size: var(--slider-thumb-size);
+          block-size: var(--slider-thumb-size);
+          border: 1.5px solid #1f6feb;
+          border-radius: var(--slider-thumb-radius);
+          background: var(--slider-thumb-color);
+          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.65);
+        }
+        input[type="range"].jk-tl-range:focus-visible {
+          outline: 2px solid #58a6ff;
+          outline-offset: 2px;
+          border-radius: 4px;
+        }
+
+        .jk-tl-rail-overlay {
+          position: absolute;
+          inset-block: 0;
+          inset-inline: var(--tl-edge-inset, calc(6.5px * var(--jk-ui-scale, 1)));
+          pointer-events: none;
+          z-index: 14;
+        }
+        .jk-tl-shell.jk-tl-empty .jk-tl-rail-overlay {
+          display: none;
+        }
+        .jk-tl-carries-layer {
+          position: absolute;
+          inset-inline: 0;
+          bottom: calc(5.5px * var(--jk-ui-scale, 1));
+          block-size: calc(5px * var(--jk-ui-scale, 1));
+          pointer-events: none;
+        }
+        .jk-tl-carry {
+          position: absolute;
+          inset-block: 0;
+          border-radius: 999px;
+          pointer-events: none;
+          background: rgba(88, 166, 255, 0.45);
+          box-shadow: 0 -1px 0 rgba(240, 246, 252, 0.4) inset;
+        }
+        .jk-tl-carry[data-team="RED"] {
+          background: linear-gradient(90deg, rgba(255, 107, 107, 0.48), rgba(255, 107, 107, 0.68));
+          border-top: 1.5px solid rgba(255, 148, 148, 0.95);
+        }
+        .jk-tl-carry[data-team="BLUE"] {
+          background: linear-gradient(90deg, rgba(88, 166, 255, 0.48), rgba(88, 166, 255, 0.68));
+          border-top: 1.5px solid rgba(140, 200, 255, 0.95);
+        }
+        .jk-tl-carry[data-outcome="cap"] {
+          filter: brightness(1.16);
+        }
+
+        .jk-tl-pins-layer {
+          position: absolute;
+          inset: 0;
+          pointer-events: none;
+        }
+        button.jk-tl-pin {
+          position: absolute;
+          top: 0;
+          transform: translateX(-50%);
+          min-inline-size: calc(11px * var(--jk-ui-scale, 1));
+          min-block-size: calc(13px * var(--jk-ui-scale, 1));
+          block-size: calc(13px * var(--jk-ui-scale, 1));
+          padding: 0 calc(2px * var(--jk-ui-scale, 1));
+          margin: 0;
+          border: 0;
+          background: transparent;
+          display: inline-flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: flex-start;
+          pointer-events: auto;
+          cursor: pointer;
+          z-index: 15;
+          transition: transform 0.1s ease;
+        }
+        @media (pointer: coarse) {
+          .jk-tl-shell:not(.jk-tl-empty) {
+            block-size: calc(30px * var(--jk-ui-scale, 1));
+          }
+          button.jk-tl-pin {
+            top: -3px;
+            padding-top: 3px;
+            min-inline-size: 22px;
+            min-block-size: 20px;
+          }
+        }
+        button.jk-tl-pin:hover,
+        button.jk-tl-pin:focus-visible,
+        button.jk-tl-pin[data-open="1"] {
+          transform: translateX(-50%) scale(1.22);
+          z-index: 22;
+        }
+        button.jk-tl-pin:focus-visible {
+          outline: 2px solid #f0f6fc;
+          outline-offset: 1px;
+          border-radius: 3px;
+        }
+        .jk-tl-glyph {
+          display: block;
+          box-sizing: border-box;
+          flex-shrink: 0;
+        }
+        .jk-tl-stem {
+          display: block;
+          inline-size: 1.5px;
+          flex: 1 1 auto;
+          min-block-size: calc(2px * var(--jk-ui-scale, 1));
+          background: var(--pin-color, #8b949e);
+          opacity: 0.78;
+        }
+
+        /* Priority 1: POV Flag Capture — tall solid diamond/badge w/ crisp light rim */
+        button.jk-tl-pin[data-kind="cap_pov"] {
+          z-index: 20;
+        }
+        button.jk-tl-pin[data-kind="cap_pov"] .jk-tl-glyph {
+          inline-size: calc(8.5px * var(--jk-ui-scale, 1));
+          block-size: calc(8.5px * var(--jk-ui-scale, 1));
+          margin-top: calc(1px * var(--jk-ui-scale, 1));
+          background: var(--pin-color, #58a6ff);
+          border: 1.5px solid #f0f6fc;
+          border-radius: 2px;
+          transform: rotate(45deg);
+          box-shadow: 0 1px 4px rgba(0, 0, 0, 0.85);
+        }
+
+        /* Priority 2: Nice Shot / Bookmark — solid Gold diamond */
+        button.jk-tl-pin[data-kind="nice_shot"],
+        button.jk-tl-pin[data-kind="bookmark"] {
+          --pin-color: #f5b741;
+          z-index: 19;
+        }
+        button.jk-tl-pin[data-kind="nice_shot"] .jk-tl-glyph,
+        button.jk-tl-pin[data-kind="bookmark"] .jk-tl-glyph {
+          inline-size: calc(7.5px * var(--jk-ui-scale, 1));
+          block-size: calc(7.5px * var(--jk-ui-scale, 1));
+          margin-top: calc(1.5px * var(--jk-ui-scale, 1));
+          background: #f5b741;
+          border: 1px solid #fff8dc;
+          border-radius: 1.5px;
+          transform: rotate(45deg);
+          box-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+        }
+
+        /* Priority 3: Non-POV Match Flag Capture — hollow team-colored diamond */
+        button.jk-tl-pin[data-kind="cap_other"] {
+          z-index: 18;
+        }
+        button.jk-tl-pin[data-kind="cap_other"] .jk-tl-glyph {
+          inline-size: calc(7px * var(--jk-ui-scale, 1));
+          block-size: calc(7px * var(--jk-ui-scale, 1));
+          margin-top: calc(2px * var(--jk-ui-scale, 1));
+          background: #0d1117;
+          border: 1.75px solid var(--pin-color, #58a6ff);
+          border-radius: 1.5px;
+          transform: rotate(45deg);
+        }
+
+        /* Priority 4: POV FC Kill — solid Emerald pip */
+        button.jk-tl-pin[data-kind="fc_kill"] {
+          --pin-color: #3fb950;
+          z-index: 17;
+        }
+        button.jk-tl-pin[data-kind="fc_kill"] .jk-tl-glyph {
+          inline-size: calc(6px * var(--jk-ui-scale, 1));
+          block-size: calc(6px * var(--jk-ui-scale, 1));
+          margin-top: calc(2.5px * var(--jk-ui-scale, 1));
+          background: #3fb950;
+          border: 1px solid rgba(240, 246, 252, 0.85);
+          border-radius: 50%;
+        }
+
+        /* Priority 5: POV Flag Return — solid Cyan pip */
+        button.jk-tl-pin[data-kind="flag_return"] {
+          --pin-color: #22d3ee;
+          z-index: 16;
+        }
+        button.jk-tl-pin[data-kind="flag_return"] .jk-tl-glyph {
+          inline-size: calc(5.5px * var(--jk-ui-scale, 1));
+          block-size: calc(5.5px * var(--jk-ui-scale, 1));
+          margin-top: calc(3px * var(--jk-ui-scale, 1));
+          background: #22d3ee;
+          border-radius: 2px;
+        }
+
+        /* Priority 6-8: Kill / Flag Death / Flag Grab — compact ticks */
+        button.jk-tl-pin[data-kind="kill"] {
+          --pin-color: #4ade80;
+        }
+        button.jk-tl-pin[data-kind="flag_death"] {
+          --pin-color: #fb7185;
+        }
+        button.jk-tl-pin[data-kind="kill"] .jk-tl-glyph,
+        button.jk-tl-pin[data-kind="flag_death"] .jk-tl-glyph,
+        button.jk-tl-pin[data-kind="flag_grab"] .jk-tl-glyph {
+          inline-size: calc(4.5px * var(--jk-ui-scale, 1));
+          block-size: calc(5px * var(--jk-ui-scale, 1));
+          margin-top: calc(4px * var(--jk-ui-scale, 1));
+          background: var(--pin-color, #8b949e);
+          border-radius: 1.5px;
+        }
+
+        /* Multi-event cluster ring */
+        button.jk-tl-pin[data-cluster="1"] .jk-tl-glyph {
+          box-shadow: 0 0 0 1.5px rgba(240, 246, 252, 0.72), 0 1px 4px rgba(0, 0, 0, 0.85);
+        }
+
+        /* Shared Hoverable & Escape-Dismissible Tooltip */
+        #jk-timeline-tooltip {
+          position: fixed;
+          left: 0;
+          top: 0;
+          z-index: 2147483646;
+          max-inline-size: min(320px, calc(100vw - 16px));
+          background: rgba(13, 17, 23, 0.97);
+          color: #e6edf3;
+          border: 1px solid #3d444d;
+          border-radius: 6px;
+          padding: 6px 8px;
+          box-shadow: 0 8px 24px rgba(0, 0, 0, 0.72);
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+          font-size: 11.5px;
+          line-height: 1.35;
+          pointer-events: auto;
+          user-select: none;
+          -webkit-user-select: none;
+        }
+        #jk-timeline-tooltip[hidden] {
+          display: none !important;
+        }
+        #jk-timeline-tooltip::after {
+          content: "";
+          position: absolute;
+          inset-inline: 0;
+          bottom: -6px;
+          block-size: 6px;
+        }
+        #jk-timeline-tooltip[data-flipped]::after {
+          bottom: auto;
+          top: -6px;
+        }
+        #jk-timeline-tooltip[data-touch] {
+          max-inline-size: min(340px, calc(100vw - 16px));
+          padding: 8px 10px;
+          font-size: 12.5px;
+        }
+        #jk-timeline-tooltip[data-touch]::after {
+          display: none;
+        }
+        .jk-tl-tip-hdr {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+          margin-bottom: 4px;
+          font-size: 10.5px;
+          color: #8b949e;
+        }
+        #jk-timeline-tooltip[data-touch] .jk-tl-tip-hdr {
+          margin-bottom: 6px;
+          font-size: 11.5px;
+        }
+        .jk-tl-tip-hdr-meta {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          min-inline-size: 0;
+        }
+        button.jk-tl-tip-close {
+          position: relative;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          min-inline-size: 24px;
+          min-block-size: 24px;
+          padding: 0 5px;
+          background: rgba(48, 54, 61, 0.72);
+          color: #c9d1d9;
+          border: 1px solid rgba(110, 118, 129, 0.45);
+          border-radius: 4px;
+          font-size: 11px;
+          line-height: 1;
+          cursor: pointer;
+          flex-shrink: 0;
+        }
+        button.jk-tl-tip-close::after {
+          content: "";
+          position: absolute;
+          inset: -8px;
+        }
+        button.jk-tl-tip-close:hover,
+        button.jk-tl-tip-close:active {
+          background: #30363d;
+          color: #ffffff;
+          border-color: #58a6ff;
+        }
+        button.jk-tl-tip-close:focus-visible {
+          outline: 2px solid #58a6ff;
+          outline-offset: 1px;
+        }
+        .jk-tl-tip-time {
+          font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+          font-variant-numeric: tabular-nums;
+          font-weight: 600;
+          color: #79c0ff;
+          flex-shrink: 0;
+        }
+        .jk-tl-tip-badge {
+          display: inline-block;
+          padding: 0 4px;
+          border-radius: 3px;
+          font-size: 9.5px;
+          font-weight: 600;
+          letter-spacing: 0.02em;
+          flex-shrink: 0;
+        }
+        .jk-tl-tip-badge-pov {
+          background: rgba(56, 139, 253, 0.22);
+          color: #79c0ff;
+          border: 1px solid rgba(88, 166, 255, 0.45);
+        }
+        .jk-tl-tip-badge-match {
+          background: rgba(110, 118, 129, 0.2);
+          color: #8b949e;
+          border: 1px solid rgba(110, 118, 129, 0.38);
+        }
+        .jk-tl-tip-row-label {
+          flex: 1 1 auto;
+          min-inline-size: 0;
+          color: #f0f6fc;
+          font-weight: 500;
+          overflow-wrap: anywhere;
+        }
+        .jk-tl-tip-list {
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+          max-block-size: var(--jk-tip-list-max-h, 168px);
+          overflow-y: auto;
+          overscroll-behavior: contain;
+          -webkit-overflow-scrolling: touch;
+          touch-action: pan-y;
+          scrollbar-width: thin;
+          scrollbar-color: #484f58 transparent;
+          padding: 2px;
+          margin: 0 -2px;
+        }
+        #jk-timeline-tooltip[data-touch] .jk-tl-tip-list {
+          gap: 5px;
+        }
+        .jk-tl-tip-row-wrap {
+          display: flex;
+          align-items: stretch;
+          gap: 5px;
+          inline-size: 100%;
+        }
+        button.jk-tl-tip-row {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          inline-size: 100%;
+          min-block-size: 24px;
+          box-sizing: border-box;
+          text-align: left;
+          background: rgba(33, 38, 45, 0.78);
+          color: #e6edf3;
+          border: 1px solid rgba(61, 68, 77, 0.6);
+          border-radius: 4px;
+          padding: 3px 6px;
+          font-size: 11px;
+          cursor: pointer;
+          touch-action: manipulation;
+        }
+        .jk-tl-tip-row-wrap > button.jk-tl-tip-row {
+          flex: 1 1 auto;
+          min-inline-size: 0;
+        }
+        #jk-timeline-tooltip[data-touch] button.jk-tl-tip-row {
+          min-block-size: 40px;
+          padding: 6px 10px;
+          font-size: 12.5px;
+        }
+        button.jk-tl-tip-row:hover {
+          background: #30363d;
+          border-color: #58a6ff;
+        }
+        button.jk-tl-tip-row:active {
+          background: rgba(56, 139, 253, 0.24);
+          border-color: #58a6ff;
+        }
+        button.jk-tl-tip-row:focus-visible {
+          background: #30363d;
+          border-color: #58a6ff;
+          outline: 2px solid #58a6ff;
+          outline-offset: 1px;
+        }
+        button.jk-tl-tip-frame-btn {
+          flex-shrink: 0;
+          min-inline-size: 48px;
+          min-block-size: 40px;
+          padding: 0 8px;
+          border-radius: 4px;
+          background: rgba(46, 160, 67, 0.2);
+          color: #56d364;
+          border: 1px solid rgba(63, 185, 80, 0.48);
+          font-size: 11px;
+          font-weight: 600;
+          cursor: pointer;
+          touch-action: manipulation;
+        }
+        button.jk-tl-tip-frame-btn:hover,
+        button.jk-tl-tip-frame-btn:active {
+          background: rgba(46, 160, 67, 0.34);
+          border-color: #56d364;
+        }
+        button.jk-tl-tip-frame-btn:focus-visible {
+          outline: 2px solid #56d364;
+          outline-offset: 1px;
+        }
+        .jk-tl-tip-dot {
+          inline-size: 6px;
+          block-size: 6px;
+          border-radius: 50%;
+          flex-shrink: 0;
+          background: var(--dot-col, #58a6ff);
+        }
+        .jk-tl-tip-weap {
+          color: #8b949e;
+          font-weight: 400;
+          font-size: 10.5px;
+        }
+        .jk-tl-tip-gold {
+          color: #f5b741;
+          font-weight: 600;
+        }
+        .jk-tl-team-red {
+          color: #ff6b6b;
+          font-weight: 600;
+        }
+        .jk-tl-team-blue {
+          color: #58a6ff;
+          font-weight: 600;
+        }
+        .jk-tl-tip-hint {
+          margin-top: 4px;
+          padding-top: 3px;
+          border-top: 1px solid rgba(48, 54, 61, 0.8);
+          font-size: 10px;
+          color: #8b949e;
+        }
+      `;
+      (document.head || document.documentElement).appendChild(st);
+    }
+
+    function getPinColor(ev) {
+      const key = classifyEventKey(ev);
+      if (key === 'cap_pov' || key === 'cap_other' || key === 'flag_grab') {
+        if (ev.team === 'RED') return '#ff6b6b';
+        if (ev.team === 'BLUE') return '#58a6ff';
+        return '#58a6ff';
+      }
+      if (key === 'nice_shot' || key === 'bookmark') return '#f5b741';
+      if (key === 'fc_kill') return '#3fb950';
+      if (key === 'flag_return') return '#22d3ee';
+      if (key === 'flag_death') return '#fb7185';
+      return '#4ade80';
+    }
+
+    function hasKeyboardFocus(el) {
+      if (!el || typeof el.matches !== 'function') return false;
+      try {
+        return el.matches(':focus-visible');
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function ensureTooltipEl() {
+      const host =
+        document.fullscreenElement ||
+        document.webkitFullscreenElement ||
+        document.body;
+      if (!tooltipEl) {
+        tooltipEl = document.createElement('div');
+        tooltipEl.id = 'jk-timeline-tooltip';
+        tooltipEl.setAttribute('role', 'tooltip');
+        tooltipEl.hidden = true;
+        tooltipEl.addEventListener('pointerdown', (ev) => {
+          ev.stopPropagation();
+        });
+        tooltipEl.addEventListener('pointerenter', (ev) => {
+          if (isTouchPointerEvent(ev) || isTouchPinnedMode) return;
+          isPointerOverTooltip = true;
+          if (hideTimer) {
+            clearTimeout(hideTimer);
+            hideTimer = 0;
+          }
+        });
+        tooltipEl.addEventListener('pointerleave', (ev) => {
+          // Ignore touch pointerleave (which fires mid-scroll right after pointercancel!)
+          if (isTouchPointerEvent(ev) || isTouchPinnedMode) return;
+          isPointerOverTooltip = false;
+          scheduleHideTooltip(110);
+        });
+        tooltipEl.addEventListener('focusin', () => {
+          if (hideTimer) {
+            clearTimeout(hideTimer);
+            hideTimer = 0;
+          }
+        });
+        tooltipEl.addEventListener('focusout', () => {
+          if (isTouchPinnedMode) return;
+          scheduleHideTooltip(110);
+        });
+        origWinAddEventListener.call(
+          window,
+          'pointerdown',
+          (ev) => {
+            if (!tooltipEl || tooltipEl.hidden) return;
+            const t = ev.target;
+            if (
+              t &&
+              (tooltipEl.contains(t) ||
+                (typeof t.closest === 'function' && t.closest('button.jk-tl-pin')))
+            ) {
+              return;
+            }
+            hideTooltipImmediate();
+          },
+          true
+        );
+        origWinAddEventListener.call(
+          window,
+          'keydown',
+          (ev) => {
+            if (ev.key === 'Escape' && tooltipEl && !tooltipEl.hidden) {
+              hideTooltipImmediate();
+            }
+          },
+          true
+        );
+      }
+      if (host && tooltipEl.parentNode !== host) {
+        host.appendChild(tooltipEl);
+      }
+      return tooltipEl;
+    }
+
+    function hideTooltipImmediate() {
+      if (hideTimer) {
+        clearTimeout(hideTimer);
+        hideTimer = 0;
+      }
+      isPointerOverTooltip = false;
+      isTouchPinnedMode = false;
+      if (activeTriggerBtn) {
+        activeTriggerBtn.removeAttribute('aria-describedby');
+        activeTriggerBtn.removeAttribute('aria-expanded');
+        activeTriggerBtn.removeAttribute('data-open');
+        activeTriggerBtn = null;
+      }
+      if (tooltipEl) {
+        tooltipEl.removeAttribute('data-touch');
+        tooltipEl.hidden = true;
+      }
+    }
+
+    function scheduleHideTooltip(delayMs) {
+      if (isTouchPinnedMode) return;
+      if (hideTimer) clearTimeout(hideTimer);
+      hideTimer = setTimeout(() => {
+        hideTimer = 0;
+        if (isTouchPinnedMode) return;
+        const activeEl = document.activeElement;
+        const kbFocusedInside =
+          (activeTriggerBtn && activeTriggerBtn.isConnected && hasKeyboardFocus(activeTriggerBtn)) ||
+          (tooltipEl && activeEl && tooltipEl.contains(activeEl) && hasKeyboardFocus(activeEl));
+        const pointerInside =
+          Boolean(isPointerOverTooltip) ||
+          Boolean(hoveredPinBtn && hoveredPinBtn === activeTriggerBtn && hoveredPinBtn.isConnected);
+        if (kbFocusedInside || pointerInside) {
+          return;
+        }
+        hideTooltipImmediate();
+      }, delayMs);
+    }
+
+    function positionTooltipAbovePin(pinBtn) {
+      if (!tooltipEl || tooltipEl.hidden || !pinBtn) return;
+      const pinRect = pinBtn.getBoundingClientRect();
+      const vv = window.visualViewport;
+      const vw =
+        (vv && vv.width) || window.innerWidth || document.documentElement.clientWidth || 800;
+      const vh =
+        (vv && vv.height) || window.innerHeight || document.documentElement.clientHeight || 600;
+
+      const spaceAbove = Math.max(0, pinRect.top - 14);
+      const spaceBelow = Math.max(0, vh - pinRect.bottom - 14);
+      const preferAbove = spaceAbove >= 120 || spaceAbove >= spaceBelow;
+      const defaultMaxList = isTouchPinnedMode ? 200 : 168;
+      const availForList = (preferAbove ? spaceAbove : spaceBelow) - 52;
+      const clampedListMax = Math.max(76, Math.min(defaultMaxList, Math.floor(availForList)));
+      tooltipEl.style.setProperty('--jk-tip-list-max-h', `${clampedListMax}px`);
+
+      const tipRect = tooltipEl.getBoundingClientRect();
+
+      const containerEl = pinBtn.closest('#jk-pip-card, #jk-controls-bar');
+      const cRect = containerEl ? containerEl.getBoundingClientRect() : null;
+      const minX =
+        cRect && cRect.width >= tipRect.width + 16
+          ? Math.max(8, Math.round(cRect.left + 8))
+          : 8;
+      const maxX =
+        cRect && cRect.width >= tipRect.width + 16
+          ? Math.min(vw - tipRect.width - 8, Math.round(cRect.right - tipRect.width - 8))
+          : vw - tipRect.width - 8;
+
+      let left = Math.round(pinRect.left + pinRect.width * 0.5 - tipRect.width * 0.5);
+      left = Math.max(minX, Math.min(maxX, left));
+
+      let flippedBelow = false;
+      let top = Math.round(pinRect.top - tipRect.height - 6);
+      if (!preferAbove || top < 8) {
+        top = Math.min(vh - tipRect.height - 8, Math.round(pinRect.bottom + 6));
+        flippedBelow = true;
+      }
+      tooltipEl.toggleAttribute('data-flipped', flippedBelow);
+      tooltipEl.style.left = `${left}px`;
+      tooltipEl.style.top = `${top}px`;
+    }
+
+    function showTooltipForCluster(pinBtn, cluster, opts, touchMode) {
+      if (hideTimer) {
+        clearTimeout(hideTimer);
+        hideTimer = 0;
+      }
+      const isTouch = Boolean(touchMode);
+      isTouchPinnedMode = isTouch;
+
+      const tip = ensureTooltipEl();
+      if (isTouch) {
+        tip.setAttribute('data-touch', '1');
+      } else {
+        tip.removeAttribute('data-touch');
+      }
+
+      if (activeTriggerBtn && activeTriggerBtn !== pinBtn) {
+        activeTriggerBtn.removeAttribute('aria-describedby');
+        activeTriggerBtn.removeAttribute('aria-expanded');
+        activeTriggerBtn.removeAttribute('data-open');
+      }
+      activeTriggerBtn = pinBtn;
+      pinBtn.setAttribute('data-open', '1');
+      if (isTouch) {
+        pinBtn.setAttribute('aria-expanded', 'true');
+      } else {
+        pinBtn.removeAttribute('aria-expanded');
+      }
+
+      const isTrim = Boolean(opts && opts.mode === 'trim');
+      const hintText = isTouch
+        ? isTrim
+          ? 'Tap event: seek · Tap Frame: set clip bounds'
+          : 'Tap an event to jump · Tap outside to close'
+        : isTrim
+          ? 'Click: seek · Shift+Click or 2×Click: frame clip'
+          : 'Click to jump · , / . prev/next event';
+
+      let hdrHtml = '';
+      if (isTouch || cluster.events.length > 1) {
+        const firstTs = formatTimeMMSS(cluster.events[0].t);
+        const lastTs = formatTimeMMSS(cluster.events[cluster.events.length - 1].t);
+        const rangeLabel = firstTs === lastTs ? firstTs : `${firstTs}–${lastTs}`;
+        const countLabel =
+          cluster.events.length === 1 ? '1 event' : `${cluster.events.length} events`;
+        const closeBtnHtml = isTouch
+          ? '<button type="button" class="jk-tl-tip-close" aria-label="Close event list">&#x2715;</button>'
+          : '';
+        hdrHtml = `
+          <div class="jk-tl-tip-hdr">
+            <span class="jk-tl-tip-hdr-meta">
+              <span class="jk-tl-tip-time">${escapeHtmlText(rangeLabel)}</span>
+              <span>· ${escapeHtmlText(countLabel)}</span>
+            </span>
+            ${closeBtnHtml}
+          </div>
+        `;
+      }
+
+      const showTouchFrameBtn = Boolean(isTouch && isTrim && opts && typeof opts.onFrameEvent === 'function');
+      const rowsHtml = cluster.events
+        .map((ev, idx) => {
+          const col = getPinColor(ev);
+          const key = classifyEventKey(ev);
+          const badgeHtml =
+            key === 'cap_other'
+              ? '<span class="jk-tl-tip-badge jk-tl-tip-badge-match">Match</span>'
+              : '<span class="jk-tl-tip-badge jk-tl-tip-badge-pov">POV</span>';
+          const rowBtnHtml = `<button type="button" class="jk-tl-tip-row" data-ev-idx="${idx}">
+            <span class="jk-tl-tip-dot" style="--dot-col:${col}" aria-hidden="true"></span>
+            <span class="jk-tl-tip-time">${escapeHtmlText(formatTimeMMSS(ev.t))}</span>
+            <span class="jk-tl-tip-row-label">${renderTimelineEventDetailHtml(ev)}</span>
+            ${badgeHtml}
+          </button>`;
+          if (showTouchFrameBtn) {
+            return `<div class="jk-tl-tip-row-wrap">
+              ${rowBtnHtml}
+              <button type="button" class="jk-tl-tip-frame-btn" data-ev-idx="${idx}" aria-label="Frame clip around ${escapeHtmlText(formatTimeMMSS(ev.t))}">Frame</button>
+            </div>`;
+          }
+          return rowBtnHtml;
+        })
+        .join('');
+
+      tip.innerHTML = `
+        ${hdrHtml}
+        <div class="jk-tl-tip-list">${rowsHtml}</div>
+        <div class="jk-tl-tip-hint" id="jk-timeline-tooltip-hint">${escapeHtmlText(hintText)}</div>
+      `;
+      pinBtn.setAttribute('aria-describedby', 'jk-timeline-tooltip-hint');
+
+      const closeBtnEl = tip.querySelector('button.jk-tl-tip-close');
+      if (closeBtnEl) {
+        closeBtnEl.addEventListener('click', (clickEv) => {
+          clickEv.stopPropagation();
+          hideTooltipImmediate();
+        });
+      }
+
+      const rowBtns = tip.querySelectorAll('button.jk-tl-tip-row');
+      rowBtns.forEach((rBtn) => {
+        const idx = parseInt(rBtn.getAttribute('data-ev-idx') || '0', 10);
+        const ev = cluster.events[idx];
+        if (!ev) return;
+        rBtn.addEventListener('click', (clickEv) => {
+          clickEv.stopPropagation();
+          const shouldCloseAfterPick = isTouchPinnedMode;
+          if (isTrim && clickEv.shiftKey && typeof opts.onFrameEvent === 'function') {
+            opts.onFrameEvent(ev, clickEv);
+          } else if (opts && typeof opts.onSelectEvent === 'function') {
+            opts.onSelectEvent(ev, clickEv);
+          } else {
+            seekToTimelineEvent(ev);
+          }
+          if (shouldCloseAfterPick) {
+            hideTooltipImmediate();
+          }
+        });
+        if (isTrim && typeof opts.onFrameEvent === 'function') {
+          rBtn.addEventListener('dblclick', (dblEv) => {
+            dblEv.stopPropagation();
+            dblEv.preventDefault();
+            opts.onFrameEvent(ev, dblEv);
+            if (isTouchPinnedMode) {
+              hideTooltipImmediate();
+            }
+          });
+        }
+      });
+
+      if (showTouchFrameBtn) {
+        const frameBtns = tip.querySelectorAll('button.jk-tl-tip-frame-btn');
+        frameBtns.forEach((fBtn) => {
+          const idx = parseInt(fBtn.getAttribute('data-ev-idx') || '0', 10);
+          const ev = cluster.events[idx];
+          if (!ev) return;
+          fBtn.addEventListener('click', (clickEv) => {
+            clickEv.stopPropagation();
+            opts.onFrameEvent(ev, clickEv);
+            hideTooltipImmediate();
+          });
+        });
+      }
+
+      tip.hidden = false;
+      positionTooltipAbovePin(pinBtn);
+    }
+
+    function clusterWindowEvents(events, viewStartMs, viewEndMs, widthPx, minClusterPx) {
+      const span = viewEndMs - viewStartMs;
+      if (!Array.isArray(events) || events.length === 0 || span <= 0) return [];
+      const usablePx = Math.max(48, Number(widthPx) || 280);
+      const defaultClusterPx = isCoarsePointerDevice() ? 6.5 : 5.5;
+      const pxThreshold = typeof minClusterPx === 'number' ? minClusterPx : defaultClusterPx;
+      const msThreshold = (pxThreshold / usablePx) * span;
+      const maxSpanMs = msThreshold * 1.4;
+
+      const visible = events.filter((ev) => ev.t >= viewStartMs && ev.t <= viewEndMs);
+      if (visible.length === 0) return [];
+
+      const clusters = [];
+      for (let i = 0; i < visible.length; i++) {
+        const ev = visible[i];
+        const prev = clusters.length > 0 ? clusters[clusters.length - 1] : null;
+        if (prev && ev.t - prev.lastMs <= msThreshold && ev.t - prev.firstMs <= maxSpanMs) {
+          prev.events.push(ev);
+          prev.lastMs = ev.t;
+          const prevKey = classifyEventKey(prev.primaryEvent);
+          const curKey = classifyEventKey(ev);
+          const prevPrio = (TIMELINE_EVENT_META[prevKey] || { priority: 99 }).priority;
+          const curPrio = (TIMELINE_EVENT_META[curKey] || { priority: 99 }).priority;
+          if (curPrio < prevPrio) {
+            prev.primaryEvent = ev;
+          }
+        } else {
+          clusters.push({
+            primaryEvent: ev,
+            events: [ev],
+            firstMs: ev.t,
+            lastMs: ev.t,
+          });
+        }
+      }
+      return clusters;
+    }
+
+    function renderOverlayInto(overlayEl, timeline, viewStartMs, viewEndMs, opts) {
+      injectStyles();
+      if (!overlayEl) return 0;
+
+      let carriesLayer = overlayEl.querySelector(':scope > .jk-tl-carries-layer');
+      let pinsLayer = overlayEl.querySelector(':scope > .jk-tl-pins-layer');
+      if (!carriesLayer) {
+        carriesLayer = document.createElement('div');
+        carriesLayer.className = 'jk-tl-carries-layer';
+        carriesLayer.setAttribute('aria-hidden', 'true');
+        overlayEl.appendChild(carriesLayer);
+      }
+      if (!pinsLayer) {
+        pinsLayer = document.createElement('div');
+        pinsLayer.className = 'jk-tl-pins-layer';
+        overlayEl.appendChild(pinsLayer);
+      }
+
+      const prevOpenEventId =
+        activeTriggerBtn &&
+        tooltipEl &&
+        !tooltipEl.hidden &&
+        pinsLayer.contains(activeTriggerBtn)
+          ? activeTriggerBtn.getAttribute('data-event-id') || ''
+          : '';
+
+      carriesLayer.textContent = '';
+      pinsLayer.textContent = '';
+
+      const span = viewEndMs - viewStartMs;
+      if (!timeline || span <= 0) {
+        return 0;
+      }
+
+      const spans = Array.isArray(timeline.carrySpans) ? timeline.carrySpans : [];
+      for (let i = 0; i < spans.length; i++) {
+        const sp = spans[i];
+        if (sp.endMs <= viewStartMs || sp.startMs >= viewEndMs) continue;
+        const sClamped = Math.max(viewStartMs, sp.startMs);
+        const eClamped = Math.min(viewEndMs, sp.endMs);
+        const leftPct = ((sClamped - viewStartMs) / span) * 100;
+        const widthPct = Math.max(0.35, ((eClamped - sClamped) / span) * 100);
+        const bar = document.createElement('div');
+        bar.className = 'jk-tl-carry';
+        if (sp.team) bar.setAttribute('data-team', sp.team);
+        if (sp.outcome) bar.setAttribute('data-outcome', sp.outcome);
+        bar.style.insetInlineStart = `${leftPct.toFixed(3)}%`;
+        bar.style.inlineSize = `${widthPct.toFixed(3)}%`;
+        carriesLayer.appendChild(bar);
+      }
+
+      const rect = overlayEl.getBoundingClientRect();
+      const widthPx = rect.width > 0 ? rect.width : (opts && opts.fallbackWidthPx) || 300;
+      const clusters = clusterWindowEvents(
+        timeline.events || [],
+        viewStartMs,
+        viewEndMs,
+        widthPx,
+        opts && opts.clusterPx
+      );
+
+      const isTrim = Boolean(opts && opts.mode === 'trim');
+
+      for (let i = 0; i < clusters.length; i++) {
+        const cl = clusters[i];
+        const primary = cl.primaryEvent;
+        const kind = classifyEventKey(primary);
+        const pct = Math.max(0, Math.min(100, ((primary.t - viewStartMs) / span) * 100));
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'jk-tl-pin';
+        btn.setAttribute('data-kind', kind);
+        btn.setAttribute('data-event-id', primary.id || '');
+        if (cl.events.length > 1) {
+          btn.setAttribute('data-cluster', '1');
+          btn.setAttribute('data-cluster-count', String(cl.events.length));
+        }
+        btn.style.insetInlineStart = `${pct.toFixed(3)}%`;
+        btn.style.setProperty('--pin-color', getPinColor(primary));
+
+        const ariaLabel =
+          cl.events.length === 1
+            ? describeTimelineEventPlain(primary)
+            : `${formatTimeMMSS(primary.t)} — ${cl.events.length} events: ` +
+              cl.events.map((e) => describeTimelineEventPlain(e)).join('; ');
+        btn.setAttribute('aria-label', ariaLabel);
+
+        const glyph = document.createElement('span');
+        glyph.className = 'jk-tl-glyph';
+        glyph.setAttribute('aria-hidden', 'true');
+        const stem = document.createElement('span');
+        stem.className = 'jk-tl-stem';
+        stem.setAttribute('aria-hidden', 'true');
+        btn.appendChild(glyph);
+        btn.appendChild(stem);
+
+        btn.addEventListener('pointerdown', (ev) => {
+          ev.stopPropagation();
+          lastPinPointerType = ev.pointerType || '';
+          if (isTouchPointerEvent(ev)) {
+            lastTouchPinTime = Date.now();
+          }
+        });
+        btn.addEventListener('pointerenter', (ev) => {
+          if (isTouchPointerEvent(ev) || isTouchPinnedMode) return;
+          hoveredPinBtn = btn;
+          showTooltipForCluster(btn, cl, opts || {}, false);
+        });
+        btn.addEventListener('pointerleave', (ev) => {
+          if (isTouchPointerEvent(ev) || isTouchPinnedMode) return;
+          if (hoveredPinBtn === btn) {
+            hoveredPinBtn = null;
+          }
+          scheduleHideTooltip(130);
+        });
+        btn.addEventListener('focus', () => {
+          if (isTouchPinnedMode || !hasKeyboardFocus(btn)) return;
+          showTooltipForCluster(btn, cl, opts || {}, false);
+        });
+        btn.addEventListener('blur', () => {
+          if (isTouchPinnedMode) return;
+          scheduleHideTooltip(100);
+        });
+        btn.addEventListener('click', (clickEv) => {
+          clickEv.stopPropagation();
+          const isKeyboardClick = clickEv.detail === 0;
+          const isTouchTap =
+            !isKeyboardClick &&
+            (clickEv.pointerType === 'touch' ||
+              (lastPinPointerType === 'touch' && Date.now() - lastTouchPinTime < 1500) ||
+              (clickEv.pointerType !== 'mouse' &&
+                lastPinPointerType !== 'mouse' &&
+                isCoarsePointerDevice()));
+          if (isTouchTap) {
+            if (isTouchPinnedMode && tooltipEl && !tooltipEl.hidden && activeTriggerBtn === btn) {
+              hideTooltipImmediate();
+            } else {
+              showTooltipForCluster(btn, cl, opts || {}, true);
+            }
+            return;
+          }
+          if (isTrim && clickEv.shiftKey && typeof opts.onFrameEvent === 'function') {
+            opts.onFrameEvent(primary, clickEv);
+            return;
+          }
+          // Seek to earliest play in cluster on click so pre-roll covers the whole sequence
+          const targetEv = cl.events[0] || primary;
+          if (opts && typeof opts.onSelectEvent === 'function') {
+            opts.onSelectEvent(targetEv, clickEv);
+          } else {
+            seekToTimelineEvent(targetEv);
+          }
+        });
+        if (isTrim && typeof opts.onFrameEvent === 'function') {
+          btn.addEventListener('dblclick', (dblEv) => {
+            dblEv.stopPropagation();
+            dblEv.preventDefault();
+            opts.onFrameEvent(primary, dblEv);
+          });
+        }
+
+        if (prevOpenEventId && (primary.id || '') === prevOpenEventId) {
+          activeTriggerBtn = btn;
+          btn.setAttribute('data-open', '1');
+          btn.setAttribute('aria-describedby', 'jk-timeline-tooltip-hint');
+          if (isTouchPinnedMode) {
+            btn.setAttribute('aria-expanded', 'true');
+          }
+        }
+
+        pinsLayer.appendChild(btn);
+      }
+
+      if (prevOpenEventId && activeTriggerBtn && pinsLayer.contains(activeTriggerBtn)) {
+        positionTooltipAbovePin(activeTriggerBtn);
+      }
+
+      return clusters.length + spans.length;
+    }
+
+    function syncRangeInputCss(rangeEl, curMs, durMs) {
+      if (!rangeEl) return;
+      const maxVal = durMs > 0 ? Math.round(durMs) : 1000;
+      const clampedVal = Math.min(maxVal, Math.max(0, Math.round(curMs || 0)));
+      rangeEl.style.setProperty('--attr-min', '0');
+      rangeEl.style.setProperty('--attr-max', String(maxVal));
+      rangeEl.style.setProperty('--control-value', String(clampedVal));
+      const ariaText = `${formatTimeMMSS(clampedVal)} of ${formatTimeMMSS(durMs > 0 ? durMs : 0)}`;
+      if (rangeEl.__jkLastAriaValuetext !== ariaText) {
+        rangeEl.__jkLastAriaValuetext = ariaText;
+        rangeEl.setAttribute('aria-valuetext', ariaText);
+      }
+    }
+
+    function attachRangeScrubber(rangeEl, options) {
+      injectStyles();
+      if (!rangeEl) return null;
+      let shell = rangeEl.closest('.jk-tl-shell');
+      if (!shell && rangeEl.parentNode) {
+        shell = document.createElement('div');
+        shell.className = 'jk-tl-shell jk-tl-empty';
+        rangeEl.parentNode.insertBefore(shell, rangeEl);
+        shell.appendChild(rangeEl);
+      }
+      rangeEl.classList.add('jk-tl-range');
+
+      let overlay = shell ? shell.querySelector(':scope > .jk-tl-rail-overlay') : null;
+      if (shell && !overlay) {
+        overlay = document.createElement('div');
+        overlay.className = 'jk-tl-rail-overlay';
+        shell.appendChild(overlay);
+      }
+
+      let lastRenderedKey = '';
+      let lastWidthBucket = 0;
+
+      function refresh(force) {
+        if (!shell || !overlay) return;
+        const tl = getTimeline();
+        const dur = Math.max(
+          getDurationMs() || 0,
+          tl && tl.durationMs ? tl.durationMs : 0
+        );
+        const hasData = Boolean(
+          tl &&
+            dur > 0 &&
+            ((Array.isArray(tl.events) && tl.events.length > 0) ||
+              (Array.isArray(tl.carrySpans) && tl.carrySpans.length > 0))
+        );
+        shell.classList.toggle('jk-tl-empty', !hasData);
+        if (!hasData) {
+          if (lastRenderedKey !== 'empty') {
+            overlay.textContent = '';
+            lastRenderedKey = 'empty';
+          }
+          return;
+        }
+        const rectW = Math.round((overlay.getBoundingClientRect().width || 0) / 8);
+        const key = `${tl.events.length}:${tl.carrySpans.length}:${dur}:${rectW}`;
+        if (!force && key === lastRenderedKey && rectW === lastWidthBucket) {
+          return;
+        }
+        lastRenderedKey = key;
+        lastWidthBucket = rectW;
+        renderOverlayInto(overlay, tl, 0, dur, {
+          mode: 'playback',
+          onSelectEvent: (ev) => {
+            if (options && typeof options.onSelectEvent === 'function') {
+              options.onSelectEvent(ev);
+            } else {
+              seekToTimelineEvent(ev);
+            }
+          },
+        });
+      }
+
+      const onTlUpdated = () => refresh(true);
+      window.addEventListener('jk-timeline-updated', onTlUpdated);
+
+      let ro = null;
+      if (typeof ResizeObserver === 'function' && shell) {
+        ro = new ResizeObserver(() => refresh(false));
+        ro.observe(shell);
+      }
+
+      refresh(true);
+
+      return {
+        shell,
+        overlay,
+        refresh: () => refresh(true),
+        syncProgress: (curMs, durMs) => {
+          syncRangeInputCss(rangeEl, curMs, durMs);
+          refresh(false);
+        },
+        destroy: () => {
+          window.removeEventListener('jk-timeline-updated', onTlUpdated);
+          if (ro) ro.disconnect();
+        },
+      };
+    }
+
+    return {
+      injectStyles,
+      attachRangeScrubber,
+      renderOverlayInto,
+      syncRangeInputCss,
+      getPinColor,
+      classifyEventKey,
+      getEventPreRollMs,
+      computeEventClipBounds,
+      hideTooltip: hideTooltipImmediate,
+    };
+  }
+
+  const JKTimelineUI = createTimelineUIManager();
+  window.JKTimelineUI = JKTimelineUI;
+  let standaloneTimelineMount = null;
+
+  function isTextEntryElement(el) {
+    if (!el || typeof el !== 'object') return false;
+    if (el.isContentEditable) return true;
+    const tag = String(el.tagName || '').toUpperCase();
+    if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (tag === 'INPUT') {
+      const t = String(el.type || 'text').toLowerCase();
+      return t !== 'range' && t !== 'button' && t !== 'checkbox' && t !== 'radio';
+    }
+    return false;
+  }
+
+  // Bind ',' and '.' Prev / Next Timeline Event hotkeys
+  origWinAddEventListener.call(
+    window,
+    'keydown',
+    (ev) => {
+      if (ev.defaultPrevented || ev.isComposing) return;
+      if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+      if (ev.key !== ',' && ev.key !== '.') return;
+      if (state.interactiveMode) return;
+      if (isTextEntryElement(ev.target) || isTextEntryElement(document.activeElement)) return;
+      const dlg = document.getElementById('jk-export-dialog');
+      if (dlg && dlg.hasAttribute('open')) return;
+      const pipCard = document.getElementById('jk-pip-card');
+      if (pipCard && (pipCard.hidden || pipCard.style.display === 'none')) return;
+      if (!state.timeline || !Array.isArray(state.timeline.events) || state.timeline.events.length === 0) {
+        return;
+      }
+      const stepped = stepTimelineEvent(ev.key === '.' ? 1 : -1);
+      if (stepped) {
+        ev.preventDefault();
+      }
+    },
+    true
+  );
+
   const playerAPI = {
     pause,
     resume,
@@ -5999,6 +7700,10 @@
     setLighting,
     getLighting,
     formatTimeMMSS,
+    getTimeline,
+    seekToTimelineEvent,
+    stepTimelineEvent,
+    computeEventClipBounds,
     init: function () {
       return prewarmEngineInBackground();
     },
@@ -6092,9 +7797,19 @@
     if (sliderSeek || timeDisplay) {
       const dur = getDurationMs();
       const cur = getCurrentTimeMs();
-      if (sliderSeek && !isScrubbingTimeline) {
-        sliderSeek.max = String(dur > 0 ? dur : 1000);
-        sliderSeek.value = String(Math.min(cur, dur > 0 ? dur : 1000));
+      if (sliderSeek) {
+        if (!isScrubbingTimeline) {
+          sliderSeek.max = String(dur > 0 ? dur : 1000);
+          sliderSeek.value = String(Math.min(cur, dur > 0 ? dur : 1000));
+        }
+        JKTimelineUI.syncRangeInputCss(
+          sliderSeek,
+          parseFloat(sliderSeek.value) || cur,
+          dur
+        );
+        if (standaloneTimelineMount) {
+          standaloneTimelineMount.syncProgress(cur, dur);
+        }
       }
       if (timeDisplay) {
         timeDisplay.textContent = formatTimeMMSS(cur) + ' / ' + formatTimeMMSS(dur);
@@ -6135,6 +7850,7 @@
     }
     const sliderSeek = document.getElementById('slider-seek');
     if (sliderSeek) {
+      standaloneTimelineMount = JKTimelineUI.attachRangeScrubber(sliderSeek);
       sliderSeek.addEventListener('pointerdown', () => {
         isScrubbingTimeline = true;
       });
@@ -6143,6 +7859,7 @@
       });
       sliderSeek.addEventListener('input', (e) => {
         const target = parseFloat(e.target.value);
+        JKTimelineUI.syncRangeInputCss(sliderSeek, target, getDurationMs());
         if (Number.isFinite(target)) {
           seekToMs(target);
         }
@@ -6150,6 +7867,7 @@
       sliderSeek.addEventListener('change', (e) => {
         isScrubbingTimeline = false;
         const target = parseFloat(e.target.value);
+        JKTimelineUI.syncRangeInputCss(sliderSeek, target, getDurationMs());
         if (Number.isFinite(target)) {
           seekToMs(target);
         }

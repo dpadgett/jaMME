@@ -5,7 +5,7 @@
     return;
   }
 
-  const ASSET_VERSION = '20261113a';
+  const ASSET_VERSION = '20261115a';
   const MIN_CLIP_MS = 500;
   const MIN_VIEW_SPAN_MS = 5000;
   const DEFAULT_PRE_MS = 10000;
@@ -347,6 +347,35 @@
         pointer-events: none;
         z-index: 2;
       }
+      .jk-trim-ov-events {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        z-index: 1;
+      }
+      .jk-trim-ov-carry {
+        position: absolute;
+        bottom: 0;
+        block-size: 3px;
+        pointer-events: none;
+        opacity: 0.72;
+      }
+      .jk-trim-ov-tick {
+        position: absolute;
+        top: 1px;
+        bottom: 1px;
+        inline-size: 1.5px;
+        transform: translateX(-0.75px);
+        border-radius: 1px;
+        pointer-events: none;
+        opacity: 0.9;
+      }
+      .jk-trim-ov-tick[data-major="1"] {
+        inline-size: 2px;
+        top: 0;
+        bottom: 0;
+        opacity: 1;
+      }
       .jk-trim-overview-cur {
         position: absolute;
         inset-block: 0;
@@ -419,6 +448,29 @@
         box-sizing: border-box;
         cursor: pointer;
         touch-action: none;
+      }
+      #jk-trim-bar.jk-trim-has-events .jk-trim-track-wrap {
+        block-size: calc(32px * var(--jk-ui-scale, 1));
+        padding-top: calc(6px * var(--jk-ui-scale, 1));
+      }
+      #jk-trim-bar.jk-trim-has-events .jk-trim-range-fill {
+        top: calc(13px * var(--jk-ui-scale, 1));
+        bottom: calc(7px * var(--jk-ui-scale, 1));
+      }
+      #jk-trim-bar.jk-trim-has-events .jk-trim-playhead {
+        top: calc(8px * var(--jk-ui-scale, 1));
+      }
+      #jk-trim-bar.jk-trim-has-events input[type="range"].jk-trim-range {
+        top: calc(6px * var(--jk-ui-scale, 1));
+        block-size: calc(26px * var(--jk-ui-scale, 1));
+      }
+      #jk-trim-tl-overlay {
+        --tl-edge-inset: calc(5px * var(--jk-ui-scale, 1));
+        z-index: 7;
+      }
+      #jk-trim-tl-overlay .jk-tl-carries-layer {
+        bottom: calc(9px * var(--jk-ui-scale, 1));
+        block-size: calc(4px * var(--jk-ui-scale, 1));
       }
       .jk-trim-bounds-row {
         display: flex;
@@ -1326,6 +1378,7 @@
       bar.innerHTML = `
         <div class="jk-trim-overview-row">
           <div id="jk-trim-overview" class="jk-trim-overview" title="Full demo overview — click or drag to pan zoomed region, double-click to toggle Fit / Full">
+            <div id="jk-trim-ov-events" class="jk-trim-ov-events" aria-hidden="true"></div>
             <div class="jk-trim-overview-sel"></div>
             <div class="jk-trim-overview-cur"></div>
             <div id="jk-trim-overview-win" class="jk-trim-overview-win"></div>
@@ -1342,6 +1395,7 @@
           <div id="jk-trim-playhead" class="jk-trim-playhead"></div>
           <input type="range" id="jk-trim-start" class="jk-trim-range" min="0" max="1000" step="10" value="0" aria-label="Clip start time" />
           <input type="range" id="jk-trim-end" class="jk-trim-range jk-trim-top" min="0" max="1000" step="10" value="1000" aria-label="Clip end time" />
+          <div id="jk-trim-tl-overlay" class="jk-tl-rail-overlay"></div>
         </div>
         <div class="jk-trim-bounds-row" aria-hidden="true">
           <span id="jk-trim-view-start">0:00.0</span>
@@ -2262,6 +2316,7 @@
 
     syncTrimPlayheadOnly();
     syncTrimHandleStacking();
+    syncTrimTimelineMarkers(bar, dur, vStart, vEnd);
 
     const viewStartEl = bar.querySelector('#jk-trim-view-start');
     const viewEndEl = bar.querySelector('#jk-trim-view-end');
@@ -2293,6 +2348,145 @@
       prevBtn.textContent = trimState.previewing ? 'Stop' : 'Preview';
     }
   }
+
+  let lastTrimOvRenderKey = '';
+  let lastTrimZoomRenderKey = '';
+
+  function frameClipAroundTimelineEvent(ev) {
+    if (!ev || typeof ev.t !== 'number') return;
+    const dur = Math.max(MIN_CLIP_MS, trimState.durationMs || 1000);
+    const tlUI = window.JKTimelineUI;
+    const player = getPlayer();
+    let bounds = null;
+    if (tlUI && typeof tlUI.computeEventClipBounds === 'function') {
+      bounds = tlUI.computeEventClipBounds(ev, dur);
+    } else if (player && typeof player.computeEventClipBounds === 'function') {
+      bounds = player.computeEventClipBounds(ev, dur);
+    } else {
+      const s = Math.max(0, Math.round(ev.t - 9000));
+      const e = Math.min(dur, Math.max(s + MIN_CLIP_MS, Math.round(ev.t + 5000)));
+      bounds = { startMs: s, endMs: e };
+    }
+    stopTrimPreview(true);
+    trimState.startMs = bounds.startMs;
+    trimState.endMs = bounds.endMs;
+    if (tlUI && typeof tlUI.hideTooltip === 'function') {
+      tlUI.hideTooltip();
+    }
+    fitTrimToSelection(false);
+    syncTrimBarUI(true);
+    throttledLiveSeek(trimState.startMs, 0, false);
+  }
+
+  function syncTrimTimelineMarkers(bar, dur, vStart, vEnd) {
+    if (!bar) return;
+    const player = getPlayer();
+    const tlUI = window.JKTimelineUI;
+    const tl =
+      player && typeof player.getTimeline === 'function' ? player.getTimeline() : null;
+    const ovEventsEl = bar.querySelector('#jk-trim-ov-events');
+    const zoomOverlayEl = bar.querySelector('#jk-trim-tl-overlay');
+    const fineHintEl = bar.querySelector('.jk-trim-fine-hint');
+
+    const hasEvents = Boolean(
+      tl &&
+        tlUI &&
+        dur > 0 &&
+        ((Array.isArray(tl.events) && tl.events.length > 0) ||
+          (Array.isArray(tl.carrySpans) && tl.carrySpans.length > 0))
+    );
+    bar.classList.toggle('jk-trim-has-events', hasEvents);
+    if (fineHintEl) {
+      const wantHint = hasEvents
+        ? 'Wheel: zoom \u00B7 Shift+drag: fine \u00B7 2\u00D7Click pin: frame event'
+        : 'Wheel: zoom \u00B7 Shift+drag: fine \u00B7 [ / ]: mark playhead';
+      if (fineHintEl.textContent !== wantHint) {
+        fineHintEl.textContent = wantHint;
+      }
+    }
+
+    if (!hasEvents) {
+      if (ovEventsEl && lastTrimOvRenderKey !== 'empty') {
+        ovEventsEl.textContent = '';
+        lastTrimOvRenderKey = 'empty';
+      }
+      if (zoomOverlayEl && lastTrimZoomRenderKey !== 'empty') {
+        zoomOverlayEl.textContent = '';
+        lastTrimZoomRenderKey = 'empty';
+      }
+      return;
+    }
+
+    // 1. Overview minimap ticks & carry spans across [0, dur]
+    if (ovEventsEl) {
+      const ovKey = `${dur}:${(tl.events || []).length}:${(tl.carrySpans || []).length}`;
+      if (ovKey !== lastTrimOvRenderKey) {
+        lastTrimOvRenderKey = ovKey;
+        ovEventsEl.textContent = '';
+        const spans = tl.carrySpans || [];
+        for (let i = 0; i < spans.length; i++) {
+          const sp = spans[i];
+          const sPct = Math.max(0, Math.min(100, (sp.startMs / dur) * 100));
+          const wPct = Math.max(0.3, Math.min(100 - sPct, ((sp.endMs - sp.startMs) / dur) * 100));
+          const cEl = document.createElement('div');
+          cEl.className = 'jk-trim-ov-carry';
+          cEl.style.insetInlineStart = `${sPct.toFixed(3)}%`;
+          cEl.style.inlineSize = `${wPct.toFixed(3)}%`;
+          cEl.style.background =
+            sp.team === 'RED'
+              ? 'rgba(255, 107, 107, 0.72)'
+              : sp.team === 'BLUE'
+              ? 'rgba(88, 166, 255, 0.72)'
+              : 'rgba(88, 166, 255, 0.55)';
+          ovEventsEl.appendChild(cEl);
+        }
+        const evs = tl.events || [];
+        for (let i = 0; i < evs.length; i++) {
+          const ev = evs[i];
+          const pct = Math.max(0, Math.min(100, (ev.t / dur) * 100));
+          const tEl = document.createElement('div');
+          tEl.className = 'jk-trim-ov-tick';
+          const kind = tlUI.classifyEventKey(ev);
+          if (kind === 'cap_pov' || kind === 'nice_shot' || kind === 'bookmark') {
+            tEl.setAttribute('data-major', '1');
+          }
+          tEl.style.insetInlineStart = `${pct.toFixed(3)}%`;
+          tEl.style.background = tlUI.getPinColor(ev);
+          ovEventsEl.appendChild(tEl);
+        }
+      }
+    }
+
+    // 2. Zoomed precision track pins & carry spans across [vStart, vEnd]
+    if (zoomOverlayEl) {
+      const wBucket = Math.round((zoomOverlayEl.getBoundingClientRect().width || 0) / 8);
+      const zKey = `${dur}:${vStart}:${vEnd}:${wBucket}:${(tl.events || []).length}`;
+      if (zKey !== lastTrimZoomRenderKey) {
+        lastTrimZoomRenderKey = zKey;
+        tlUI.renderOverlayInto(zoomOverlayEl, tl, vStart, vEnd, {
+          mode: 'trim',
+          onSelectEvent: (ev) => {
+            stopTrimPreview(true);
+            const pre =
+              typeof tlUI.getEventPreRollMs === 'function' ? tlUI.getEventPreRollMs(ev) : 3000;
+            const seekTarget = Math.max(0, Math.min(dur, ev.t - pre));
+            throttledLiveSeek(seekTarget, 0, false);
+          },
+          onFrameEvent: (ev) => {
+            frameClipAroundTimelineEvent(ev);
+          },
+        });
+      }
+    }
+  }
+
+  window.addEventListener('jk-timeline-updated', () => {
+    lastTrimOvRenderKey = '';
+    lastTrimZoomRenderKey = '';
+    if (trimState.active) {
+      syncTrimBarUI();
+    }
+  });
 
   function stopTrimPreview(pausePlayer) {
     if (trimState.previewRaf) {
@@ -2513,6 +2707,9 @@
 
   function exitTrimMode(restorePlayState) {
     if (!trimState.active) return;
+    if (window.JKTimelineUI && typeof window.JKTimelineUI.hideTooltip === 'function') {
+      window.JKTimelineUI.hideTooltip();
+    }
     stopTrimPreview(false);
     stopTrimPlayheadTicker();
     stopEdgeAutoPan();
