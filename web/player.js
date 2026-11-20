@@ -19,7 +19,7 @@
 
   const BOOT_START_MS = typeof performance !== 'undefined' ? performance.now() : Date.now();
   const DEFAULT_ENGINE_VERSION = '20261113a';
-  const DEFAULT_PLAYER_VERSION = '20261115a';
+  const DEFAULT_PLAYER_VERSION = '20261120b';
 
   function installDocumentTitleGuard() {
     if (typeof document === 'undefined' || document.__jkTitleGuardInstalled) return;
@@ -78,6 +78,7 @@
     overbright: 0,
     speed: 1.0,
     muted: false,
+    hostSuspended: false,
     musicEnabled: true,
     volume: 0.8,
     savedVolume: 0.8,
@@ -336,6 +337,7 @@
       demo,
       speed,
       muted,
+      hostSuspended: Boolean(cfg.hostSuspended),
       musicEnabled,
       hasExplicitMusic,
       volume,
@@ -375,6 +377,7 @@
   state.demoName = normalizeDemoFileName(initialCfg.demo) || '1.51ef9.dm_26';
   state.speed = initialCfg.speed;
   state.muted = initialCfg.muted;
+  state.hostSuspended = Boolean(initialCfg.hostSuspended);
   state.musicEnabled = Boolean(initialCfg.musicEnabled);
   state.volume = initialCfg.volume;
   state.thirdPerson = Boolean(initialCfg.thirdPerson);
@@ -662,6 +665,7 @@
     }
 
     function executeDraw(numTris, getTriIndices) {
+      if (state.hostSuspended) return;
       const prog = gl.currentProgram;
       if (!prog) return;
       if (prog.mvpDirty) {
@@ -1759,7 +1763,7 @@
         try {
           if (typeof ctx.createGain === 'function' && !ctx.__jkMasterGain) {
             const masterGain = ctx.createGain();
-            masterGain.gain.value = state.muted ? 0.0 : state.volume;
+            masterGain.gain.value = state.muted || state.hostSuspended ? 0.0 : state.volume;
             ctx.__jkMasterGain = masterGain;
             masterGain.connect(ctx.destination);
             state.masterGains.push(masterGain);
@@ -1803,6 +1807,7 @@
                       }
                     }
                     if (
+                      state.hostSuspended ||
                       state.paused ||
                       state.seeking ||
                       isPageHidden() ||
@@ -1834,8 +1839,16 @@
           ctx.__jkStateListenerAttached = true;
           let lastCtxState = ctx.state;
           ctx.addEventListener('statechange', () => {
-            if (lastCtxState !== 'running' && ctx.state === 'running' && !state.muted) {
+            if (
+              lastCtxState !== 'running' &&
+              ctx.state === 'running' &&
+              !state.muted &&
+              !state.hostSuspended
+            ) {
               window.__jkAudioJustUnlockedAt = Date.now();
+            }
+            if (state.hostSuspended && ctx.state === 'running' && typeof ctx.suspend === 'function') {
+              ctx.suspend().catch(() => {});
             }
             lastCtxState = ctx.state;
             try {
@@ -1848,10 +1861,14 @@
       }
       if (ctx.__jkMasterGain) {
         try {
-          ctx.__jkMasterGain.gain.value = state.muted ? 0.0 : state.volume;
+          ctx.__jkMasterGain.gain.value = state.muted || state.hostSuspended ? 0.0 : state.volume;
         } catch (_) {}
       }
-      if (!state.muted && typeof ctx.resume === 'function' && ctx.state !== 'running') {
+      if (state.hostSuspended) {
+        if (typeof ctx.suspend === 'function' && ctx.state === 'running') {
+          ctx.suspend().catch(() => {});
+        }
+      } else if (!state.muted && typeof ctx.resume === 'function' && ctx.state !== 'running') {
         ctx.resume().catch(() => {});
       }
       return ctx;
@@ -3789,6 +3806,7 @@
   }
 
   function unlockAudio() {
+    if (state.hostSuspended) return;
     const targets = state.audioContexts.slice();
     if (window.__jkSharedAudioCtx && !targets.includes(window.__jkSharedAudioCtx)) {
       targets.push(window.__jkSharedAudioCtx);
@@ -3812,20 +3830,88 @@
   }
 
   function syncAudioContextGain() {
-    const effectiveGain = state.muted ? 0.0 : state.volume;
+    const silenced = Boolean(state.muted || state.hostSuspended);
+    const effectiveGain = silenced ? 0.0 : state.volume;
     for (const g of state.masterGains) {
       try {
         g.gain.value = effectiveGain;
       } catch (_) {}
     }
-    for (const ctx of state.audioContexts) {
-      if (!ctx) continue;
+    const targets = state.audioContexts.slice();
+    if (window.__jkSharedAudioCtx && !targets.includes(window.__jkSharedAudioCtx)) {
+      targets.push(window.__jkSharedAudioCtx);
+    }
+    for (const ctx of targets) {
+      if (!ctx || ctx.state === 'closed') continue;
       try {
-        if (!state.muted && typeof ctx.resume === 'function') {
+        if (state.hostSuspended) {
+          if (typeof ctx.suspend === 'function' && ctx.state === 'running') {
+            ctx.suspend().catch(() => {});
+          }
+        } else if (!state.muted && typeof ctx.resume === 'function' && ctx.state !== 'running') {
           ctx.resume().catch(() => {});
         }
       } catch (_) {}
     }
+  }
+
+  function cancelLoad() {
+    const hadActiveLoad =
+      (state.activeDemoLoadCount || 0) > 0 || (state.pendingDemoLoads || 0) > 0;
+    state.currentLoadSeq = (state.currentLoadSeq || 0) + 1;
+    if (state.activeLoadAbortCtrl) {
+      try {
+        state.activeLoadAbortCtrl.abort();
+      } catch (_) {}
+      state.activeLoadAbortCtrl = null;
+    }
+    state.pendingDemoLoads = 0;
+    stopMmeBackgroundStream();
+    abortBackgroundPrefetch();
+    if (hadActiveLoad && state.engineStarted) {
+      callWasm('JK_DemoAbortPrepare', null, [], []);
+    }
+    emitLoadProgress('idle', '', 0, 0, 0);
+    return true;
+  }
+
+  function stop() {
+    cancelLoad();
+    state.autoPausedByVisibility = false;
+    state.paused = true;
+    if (state.engineStarted) {
+      callWasm('JK_DemoPause', 'number', [], []);
+      callWasm('JK_DemoMute', 'number', [], []);
+    }
+    updateUIControls();
+    return true;
+  }
+
+  function setHostSuspended(flag) {
+    const next = Boolean(flag);
+    state.hostSuspended = next;
+    if (next) {
+      stop();
+      syncAudioContextGain();
+    } else {
+      if (state.engineStarted) {
+        if (state.muted) {
+          callWasm('JK_DemoMute', 'number', [], []);
+        } else {
+          callWasm('JK_DemoUnmute', 'number', [], []);
+          if (state.volume > 0) {
+            callWasm('JK_DemoSetVolume', 'number', ['number'], [state.volume]);
+          }
+        }
+        syncMusicToEngine();
+      }
+      syncAudioContextGain();
+    }
+    return state.hostSuspended;
+  }
+
+  function isHostSuspended() {
+    return Boolean(state.hostSuspended);
   }
 
   function mute() {
@@ -4297,7 +4383,18 @@
     return prewarmPromise;
   }
 
-  async function executePlanPass(shortName, labelPrefix, basePct, spanPct, silentProgress, includeCommonChunks) {
+  async function executePlanPass(
+    shortName,
+    labelPrefix,
+    basePct,
+    spanPct,
+    silentProgress,
+    includeCommonChunks,
+    shouldCancel
+  ) {
+    if (shouldCancel && shouldCancel()) {
+      return { bspReady: 0, fetchedSpans: 0, fetchedBytes: 0, hydratedFromIdb: 0, mapName: '' };
+    }
     const rawPlan = callWasm('JK_DemoPlanLoadChunks', 'string', ['string'], [shortName]);
     if (!rawPlan && !includeCommonChunks) {
       return { bspReady: 1, fetchedSpans: 0, fetchedBytes: 0, hydratedFromIdb: 0, mapName: '' };
@@ -4351,6 +4448,9 @@
     const toHydrateFromIdb = Array.from(toHydrateSet);
     const hydratedFromIdb =
       toHydrateFromIdb.length > 0 ? await loadChunksFromIdb(toHydrateFromIdb) : 0;
+    if (shouldCancel && shouldCancel()) {
+      return { bspReady: 0, fetchedSpans: 0, fetchedBytes: 0, hydratedFromIdb, mapName };
+    }
 
     // Only issue HTTP Range requests for chunks still absent from pk3ChunkCache
     const byArchive = new Map();
@@ -4421,7 +4521,7 @@
     for (let w = 0; w < Math.min(CONCURRENCY, spans.length); w++) {
       workers.push(
         (async () => {
-          while (cursor < spans.length) {
+          while (cursor < spans.length && !(shouldCancel && shouldCancel())) {
             const item = spans[cursor++];
             const got = await fetchPk3SpanIntoCache(
               item.pk3Name,
@@ -4429,6 +4529,7 @@
               item.cEnd,
               item.archSize
             );
+            if (shouldCancel && shouldCancel()) break;
             loadedBytes += got > 0 ? got : item.estBytes;
             if (!silentProgress && totalEstimatedBytes > 0) {
               const clampedLoaded = Math.min(loadedBytes, totalEstimatedBytes);
@@ -4459,17 +4560,19 @@
     };
   }
 
-  async function planAndPrefetchDemoChunks(shortName) {
+  async function planAndPrefetchDemoChunks(shortName, shouldCancel) {
     if (!state.engineStarted) return;
     // Up to 4 passes:
     // Pass 1: Exact MP-common assets + custom PK3s + BSP header & lumps + configstring models/sounds/player skins
     // Pass 2: BSP textures/shaders & static models (once BSP chunks & player .skin/.cfg files are in cache)
     // Pass 3+: Any textures referenced by static .md3 models or custom PK3s mounted in earlier passes
     for (let pass = 0; pass < 5; pass++) {
+      if (shouldCancel && shouldCancel()) return;
       const label = pass === 0 ? 'Loading map & models' : 'Loading map textures & sounds';
       const basePct = pass === 0 ? 35 : 58;
       const spanPct = pass === 0 ? 23 : 20;
-      const res = await executePlanPass(shortName, label, basePct, spanPct, false, false);
+      const res = await executePlanPass(shortName, label, basePct, spanPct, false, false, shouldCancel);
+      if (shouldCancel && shouldCancel()) return;
       if (res.bspReady === 1 && res.fetchedSpans === 0 && res.hydratedFromIdb === 0) {
         break;
       }
@@ -4575,7 +4678,9 @@
       state.activeLoadAbortCtrl = loadAbortCtrl;
       const loadSignal = loadAbortCtrl ? loadAbortCtrl.signal : null;
       const isSuperseded = () =>
-        myLoadSeq !== state.currentLoadSeq || Boolean(loadSignal && loadSignal.aborted);
+        myLoadSeq !== state.currentLoadSeq ||
+        Boolean(state.hostSuspended) ||
+        Boolean(loadSignal && loadSignal.aborted);
 
       state.activeDemoLoadCount = (state.activeDemoLoadCount || 0) + 1;
       abortBackgroundPrefetch();
@@ -4593,6 +4698,7 @@
 
         const onFirstMessageReady = (headBytes) => {
           if (
+            isSuperseded() ||
             !state.engineStarted ||
             callWasm('JK_DemoIsReady', 'number', [], []) !== 1
           ) {
@@ -4605,7 +4711,9 @@
               'Prefetching map',
               20,
               15,
-              true
+              true,
+              false,
+              isSuperseded
             ).catch(() => {});
           } catch (_) {}
         };
@@ -4771,6 +4879,9 @@
             !(state.engineStarted && callWasm('JK_DemoIsReady', 'number', [], []) === 1) &&
             stallVisibleMs < MAX_STALL_VISIBLE_MS
           ) {
+            if (isSuperseded()) {
+              return false;
+            }
             if (!state.engineStarted && !engineBootPromise) {
               break;
             }
@@ -4876,7 +4987,7 @@
             index: [[15, 0, 0]],
           });
           // Plan & download map/model PK3 chunks immediately while mme_meta finishes on the server!
-          await planAndPrefetchDemoChunks(demoData.shortName);
+          await planAndPrefetchDemoChunks(demoData.shortName, isSuperseded);
           if (isSuperseded()) return false;
           emitLoadProgress('demo', 'Finalizing demo keyframe index...', 0, 0, 76);
           const meta = mmeMetaPromise ? await mmeMetaPromise.catch(() => null) : null;
@@ -4900,7 +5011,7 @@
               await earlyPeekPromise;
             } catch (_) {}
           }
-          await planAndPrefetchDemoChunks(demoData.shortName);
+          await planAndPrefetchDemoChunks(demoData.shortName, isSuperseded);
           if (isSuperseded()) return false;
         }
 
@@ -5675,6 +5786,10 @@
           updateUIControls();
         }
       } else {
+        if (state.hostSuspended) {
+          syncAudioContextGain();
+          return;
+        }
         if (state.autoPausedByVisibility) {
           state.autoPausedByVisibility = false;
           resume();
@@ -5693,7 +5808,7 @@
     origWinAddEventListener.call(window, 'focus', handleVisibilityOrFocusChange);
 
     const unlockOnGesture = () => {
-      if (!state.muted && !isPageHidden()) {
+      if (!state.muted && !state.hostSuspended && !isPageHidden()) {
         unlockAudio();
       }
     };
@@ -7647,6 +7762,10 @@
     pause,
     resume,
     play,
+    stop,
+    cancelLoad,
+    setHostSuspended,
+    isHostSuspended,
     togglePause,
     setPaused,
     isPaused,
@@ -8240,8 +8359,8 @@
         '+set', 'in_nograb', '1',
         '+set', 'timescale', String(state.speed),
         '+set', 's_khz', '22',
-        '+set', 's_volume', String(state.muted ? 0.0 : state.volume),
-        '+set', 's_musicvolume', String(state.muted || !state.musicEnabled ? 0.0 : state.volume * 0.5),
+        '+set', 's_volume', String(state.muted || state.hostSuspended ? 0.0 : state.volume),
+        '+set', 's_musicvolume', String(state.muted || state.hostSuspended || !state.musicEnabled ? 0.0 : state.volume * 0.5),
       ];
 
       if (willUseSoftwareWebGL) {
@@ -8393,21 +8512,35 @@
             syncLightingToEngine();
             applyCanvasGammaFilter();
             syncMusicToEngine();
-            if (state.muted) mute();
-            else setVolume(state.volume);
+            if (state.hostSuspended) {
+              callWasm('JK_DemoMute', 'number', [], []);
+              callWasm('JK_DemoPause', 'number', [], []);
+              syncAudioContextGain();
+            } else if (state.muted) {
+              mute();
+            } else {
+              setVolume(state.volume);
+            }
             flushPendingCommands();
             resize();
             if (state.preloadOnly && !state.demoLoadedOnce && state.activeDemoLoadCount === 0) {
               prewarmEngineInBackground();
-            } else if (!state.preloadOnly && !state.demoLoadedOnce) {
+            } else if (!state.preloadOnly && !state.demoLoadedOnce && !state.hostSuspended) {
               loadDemo(state.lastDemoSource || state.demoName);
             }
             setTimeout(() => {
               resize();
               if (state.speed !== 1.0) setSpeed(state.speed);
               syncMusicToEngine();
-              if (state.muted) mute();
-              else setVolume(state.volume);
+              if (state.hostSuspended) {
+                callWasm('JK_DemoMute', 'number', [], []);
+                callWasm('JK_DemoPause', 'number', [], []);
+                syncAudioContextGain();
+              } else if (state.muted) {
+                mute();
+              } else {
+                setVolume(state.volume);
+              }
             }, 100);
           },
           print: function (text) {

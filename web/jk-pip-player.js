@@ -185,6 +185,7 @@
 
   const pipState = {
     open: false,
+    openSessionSeq: 0,
     hasSavedLayout: false,
     preset: 'default',
     thirdPerson: readPersistedThirdPersonPref(),
@@ -2746,7 +2747,7 @@
   function renderOverlayProgress(message, percent, stage) {
     const overlay = document.getElementById('jk-pip-status-overlay');
     if (!overlay) return;
-    if (stage === 'ready') {
+    if (stage === 'ready' || stage === 'idle' || !pipState.open) {
       overlay.style.display = 'none';
       return;
     }
@@ -2938,6 +2939,7 @@
   }
 
   function updateControlState() {
+    if (!pipState.open) return;
     const card = document.getElementById('jk-pip-card');
     if (!card) return;
     const player = getPlayer();
@@ -3138,7 +3140,7 @@
       return Promise.resolve(window.JKVideoExport);
     }
     if (videoExportScriptPromise) return videoExportScriptPromise;
-    const PLAYER_ASSET_VERSION = '20261115a';
+    const PLAYER_ASSET_VERSION = '20261120b';
     videoExportScriptPromise = new Promise((resolve, reject) => {
       const existing = document.querySelector('script[src*="/jkplayer/jk-video-export.js"]');
       if (existing) {
@@ -3184,7 +3186,7 @@
 
     // Separate engine vs wrapper versions so UI/JS updates do not invalidate cached openjk.wasm
     const ENGINE_ASSET_VERSION = '20261113a';
-    const PLAYER_ASSET_VERSION = '20261115a';
+    const PLAYER_ASSET_VERSION = '20261120b';
     ensureVideoExportScriptLoaded().catch(() => {});
     window.JKDemoConfig = Object.assign(
       {
@@ -3192,6 +3194,7 @@
         preloadOnly: true,
         autoPlay: false,
         muted: true,
+        hostSuspended: !pipState.open,
         gamma: pipState.gamma,
         overbright: pipState.overbright,
         preserveDocumentTitle: true,
@@ -3199,7 +3202,8 @@
         wasmUrl: `/jkplayer/openjk.wasm?v=${ENGINE_ASSET_VERSION}`,
         autoexecUrl: `/jkplayer/autoexec.cfg?v=${PLAYER_ASSET_VERSION}`,
       },
-      window.JKDemoConfig || {}
+      window.JKDemoConfig || {},
+      { hostSuspended: !pipState.open }
     );
 
     const loadScriptOnce = () =>
@@ -3275,7 +3279,7 @@
           await player.init();
         }
       }
-      if (!pipState.uiSyncInterval) {
+      if (pipState.open && !pipState.uiSyncInterval) {
         pipState.uiSyncInterval = setInterval(updateControlState, 200);
       }
     } catch (err) {
@@ -3599,6 +3603,30 @@
     });
   }
 
+  function silenceAndStopPlayer(playerInstance) {
+    window.JKDemoConfig = Object.assign(window.JKDemoConfig || {}, {
+      hostSuspended: true,
+    });
+    const player = playerInstance || getPlayer();
+    if (player) {
+      if (typeof player.setHostSuspended === 'function') {
+        player.setHostSuspended(true);
+      } else {
+        if (typeof player.cancelLoad === 'function') player.cancelLoad();
+        if (typeof player.stop === 'function') player.stop();
+        if (typeof player.pause === 'function') player.pause();
+        if (typeof player.setMuted === 'function') player.setMuted(true);
+      }
+    }
+    if (
+      window.__jkSharedAudioCtx &&
+      typeof window.__jkSharedAudioCtx.suspend === 'function' &&
+      window.__jkSharedAudioCtx.state === 'running'
+    ) {
+      window.__jkSharedAudioCtx.suspend().catch(() => {});
+    }
+  }
+
   async function openAndPlay(demoUrl, titleOrOpts) {
     let resolvedTitle = '';
     let unmuteOnUserGesture = false;
@@ -3619,19 +3647,8 @@
     }
     if (!demoUrl || typeof demoUrl !== 'string') return false;
 
-    if (unmuteOnUserGesture) {
-      window.JKDemoConfig = Object.assign(window.JKDemoConfig || {}, { muted: false });
-      primeSharedAudioOnUserGesture();
-      const existingPlayer = getPlayer();
-      if (existingPlayer) {
-        if (typeof existingPlayer.unlockAudio === 'function') {
-          existingPlayer.unlockAudio();
-        }
-        if (typeof existingPlayer.setMuted === 'function') {
-          existingPlayer.setMuted(false);
-        }
-      }
-    }
+    const myOpenSeq = (pipState.openSessionSeq = (pipState.openSessionSeq || 0) + 1);
+    const isStaleOpen = () => !pipState.open || pipState.openSessionSeq !== myOpenSeq;
 
     const card = createPiPDOM();
     if (isExportTrimActive() && window.JKVideoExport) {
@@ -3642,6 +3659,27 @@
     pipState.loadFailed = false;
     pipState.currentDemoUrl = demoUrl;
     pipState.currentDemoTitle = resolvedTitle || deriveDemoTitle(demoUrl);
+
+    window.JKDemoConfig = Object.assign(
+      window.JKDemoConfig || {},
+      { hostSuspended: false },
+      unmuteOnUserGesture ? { muted: false } : {}
+    );
+    const preExistingPlayer = getPlayer();
+    if (preExistingPlayer && typeof preExistingPlayer.setHostSuspended === 'function') {
+      preExistingPlayer.setHostSuspended(false);
+    }
+    if (unmuteOnUserGesture) {
+      primeSharedAudioOnUserGesture();
+      if (preExistingPlayer) {
+        if (typeof preExistingPlayer.unlockAudio === 'function') {
+          preExistingPlayer.unlockAudio();
+        }
+        if (typeof preExistingPlayer.setMuted === 'function') {
+          preExistingPlayer.setMuted(false);
+        }
+      }
+    }
 
     card.hidden = false;
     card.classList.add('jk-pip-open');
@@ -3673,8 +3711,15 @@
 
     try {
       const player = getPlayer() || (await ensurePlayerScriptLoaded());
+      if (isStaleOpen()) {
+        if (!pipState.open) silenceAndStopPlayer(player);
+        return false;
+      }
       if (!player || typeof player.loadDemo !== 'function') {
         throw new Error('Network error loading player');
+      }
+      if (typeof player.setHostSuspended === 'function') {
+        player.setHostSuspended(false);
       }
       if (!pipState.uiSyncInterval) {
         pipState.uiSyncInterval = setInterval(updateControlState, 200);
@@ -3690,6 +3735,10 @@
         title: pipState.currentDemoTitle,
         label: pipState.currentDemoTitle,
       });
+      if (isStaleOpen()) {
+        if (!pipState.open) silenceAndStopPlayer(player);
+        return false;
+      }
       if (unmuteOnUserGesture && typeof player.setMuted === 'function') {
         player.setMuted(false);
       }
@@ -3724,6 +3773,10 @@
       updateControlState();
       return Boolean(ok);
     } catch (err) {
+      if (isStaleOpen()) {
+        if (!pipState.open) silenceAndStopPlayer(getPlayer());
+        return false;
+      }
       pipState.loadFailed = true;
       console.error('[JKPiPPlayer] Failed to load demo:', err);
       if (overlay) {
@@ -3735,6 +3788,7 @@
   }
 
   function closePiP() {
+    pipState.openSessionSeq = (pipState.openSessionSeq || 0) + 1;
     const card = document.getElementById('jk-pip-card');
     if (window.JKTimelineUI && typeof window.JKTimelineUI.hideTooltip === 'function') {
       window.JKTimelineUI.hideTooltip();
@@ -3744,6 +3798,14 @@
     }
     pipState.open = false;
     pipState.lightingOpen = false;
+    if (pipState.uiSyncInterval) {
+      clearInterval(pipState.uiSyncInterval);
+      pipState.uiSyncInterval = null;
+    }
+    const overlay = document.getElementById('jk-pip-status-overlay');
+    if (overlay) {
+      overlay.style.display = 'none';
+    }
     syncLightingUI();
     clearFullscreenControlsTimer();
     unlockOrientationIfSupported();
@@ -3767,11 +3829,7 @@
       card.hidden = true;
     }
     syncFullscreenUI();
-    const player = getPlayer();
-    if (player) {
-      if (typeof player.pause === 'function') player.pause();
-      if (typeof player.setMuted === 'function') player.setMuted(true);
-    }
+    silenceAndStopPlayer(getPlayer());
   }
 
   function setSizePreset(presetName) {
